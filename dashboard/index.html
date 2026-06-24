@@ -1,0 +1,1411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PENROSE — research engine</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#08111f; --panel:#0a1525; --card:#0d1b2e; --card-hover:#0f2138;
+    --border:#1c3350; --border-sub:#15263d; --border-hover:#2b5580;
+    --tx:#e6edf3; --tx-bright:#f2f5f8; --tx2:#8aa0b4; --muted:#6b7c8c; --muted2:#5b7488;
+    --cyan:#22d3ee; --blue:#3b82f6; --green:#34d399; --amber:#fbbf24; --red:#f87171;
+    --mono:'IBM Plex Mono',ui-monospace,monospace; --sans:'IBM Plex Sans',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{background:var(--bg);color:var(--tx);font-family:var(--sans);font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-track{background:var(--panel)}
+  ::-webkit-scrollbar-thumb{background:var(--border);border-radius:6px}
+  ::-webkit-scrollbar-thumb:hover{background:#294a6e}
+  a{color:var(--cyan);text-decoration:none}
+  a:hover{text-decoration:underline}
+
+  .bh-backdrop{position:fixed;inset:0;z-index:0;pointer-events:none}
+  .bh-backdrop .img{position:absolute;inset:0;background:url('assets/blackhole.jpg') center 80%/cover}
+  .bh-backdrop .scrim{position:absolute;inset:0;background:linear-gradient(180deg,rgba(5,9,18,.88) 0%,rgba(5,9,18,.74) 40%,rgba(5,9,18,.66) 66%,rgba(5,9,18,.9) 100%)}
+  .bh-backdrop .glow{position:absolute;inset:0;background:radial-gradient(72% 56% at 62% 84%,rgba(109,75,255,.13),transparent 60%)}
+  .app{display:flex;height:100vh;overflow:hidden;position:relative;z-index:1}
+
+  /* sidebar */
+  .sidebar{width:236px;flex:0 0 236px;background:rgba(8,17,31,.80);backdrop-filter:blur(7px);border-right:1px solid var(--border-sub);display:flex;flex-direction:column;padding:18px 14px}
+  .brand{display:flex;align-items:center;gap:10px;padding:4px 6px 18px}
+  .logochip{width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#22d3ee,#3b82f6);display:flex;align-items:center;justify-content:center;font-family:var(--mono);font-weight:700;color:#03121f;font-size:15px}
+  .wordmark{font-family:var(--mono);font-weight:600;letter-spacing:1px;font-size:15px;color:var(--tx-bright)}
+  .wordmark small{display:block;font-size:9px;letter-spacing:1.5px;color:var(--muted2);font-weight:500}
+  .nav{display:flex;flex-direction:column;gap:3px;margin-top:6px}
+  .navrow{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;color:var(--tx2);font-weight:500;border-left:2px solid transparent;transition:background .12s}
+  .navrow:hover{background:var(--card)}
+  .navrow.active{background:rgba(34,211,238,.10);border-left-color:var(--cyan);color:var(--tx-bright);font-weight:600}
+  .navrow .lab{flex:1}
+  .navrow .ct{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 8px}
+  .dot.g{background:var(--green);box-shadow:0 0 8px var(--green)}
+  .dot.a{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+  .dot.r{background:var(--red);box-shadow:0 0 8px var(--red)}
+  .dot.n{background:var(--muted2);box-shadow:none}
+  .dot.slot{background:transparent;box-shadow:none}  /* invisible placeholder: keeps nav labels aligned */
+  .pulse{animation:glowpulse 2.4s infinite}
+  @keyframes glowpulse{0%,100%{opacity:1}50%{opacity:.45}}
+  .spacer{flex:1}
+  .health{border-top:1px solid var(--border-sub);padding-top:12px;margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--tx2)}
+  .health .hl{display:flex;justify-content:space-between;padding:3px 6px}
+  .health .hl b{color:var(--tx)}
+  .health .flag{margin-top:6px;padding:6px 8px;border-radius:6px;background:rgba(251,191,36,.10);border:1px solid rgba(251,191,36,.3);color:var(--amber);font-size:10px;line-height:1.4}
+
+  /* main */
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;background:rgba(10,21,37,.72)}
+  .topbar{display:flex;align-items:center;justify-content:space-between;padding:16px 26px;background:linear-gradient(180deg,#0c1a2e,#0a1525);border-bottom:1px solid var(--border-sub)}
+  .topbar h1{margin:0;font-size:17px;font-weight:600;color:var(--tx-bright)}
+  .topbar .sub{font-size:12px;color:var(--tx2);margin-top:2px}
+  .badge{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;letter-spacing:1px;color:var(--tx2);padding:7px 13px;border:1px solid var(--border);border-radius:20px;background:var(--card);white-space:nowrap}
+  .addbtn{font-family:var(--mono);font-size:11px;letter-spacing:.5px;color:var(--cyan);padding:7px 13px;border:1px solid rgba(34,211,238,.35);border-radius:20px;background:rgba(34,211,238,.07);cursor:pointer;white-space:nowrap;transition:background .12s}
+  .addbtn:hover{background:rgba(34,211,238,.16)}
+  .addbtn:disabled{opacity:.5;cursor:wait}
+  .scroll{flex:1;overflow-y:auto;padding:24px 26px 60px}
+
+  .eyebrow{font-family:var(--mono);font-size:10.5px;letter-spacing:1.5px;text-transform:uppercase;color:var(--muted2);margin:26px 0 11px}
+  .eyebrow:first-child{margin-top:0}
+
+  /* stat grid */
+  .statgrid{display:grid;grid-template-columns:repeat(5,1fr);gap:14px}
+  .stat{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:15px}
+  .stat .v{font-family:var(--mono);font-size:28px;font-weight:600;color:var(--tx-bright);line-height:1}
+  .stat .l{font-size:11px;color:var(--tx2);margin-top:8px;letter-spacing:.3px}
+  .stat .s{font-family:var(--mono);font-size:10.5px;color:var(--muted);margin-top:3px}
+  .stat.k .v{color:var(--red)} .stat.w .v{color:var(--amber)} .stat.su .v{color:var(--green)}
+
+  /* cards */
+  .card{background:var(--card);border:1px solid var(--border);border-radius:11px;padding:16px 18px;margin-bottom:14px;transition:border-color .12s,background .12s}
+  .card:hover{border-color:var(--border-hover)}
+  .card h3{margin:0 0 3px;font-size:15px;color:var(--tx-bright);font-weight:600}
+  .card .meta{font-family:var(--mono);font-size:11px;color:var(--tx2)}
+
+  .vbadge{font-family:var(--mono);font-size:10px;font-weight:600;letter-spacing:.5px;padding:3px 8px;border-radius:5px;text-transform:uppercase}
+  .vbadge.kill{background:rgba(248,113,113,.13);color:var(--red);border:1px solid rgba(248,113,113,.35)}
+  .vbadge.watch{background:rgba(251,191,36,.13);color:var(--amber);border:1px solid rgba(251,191,36,.35)}
+  .vbadge.support{background:rgba(52,211,153,.13);color:var(--green);border:1px solid rgba(52,211,153,.35)}
+  .vbadge.pending{background:rgba(138,160,180,.12);color:var(--tx2);border:1px solid var(--border)}
+  .vbadge.data{background:rgba(34,211,238,.12);color:var(--cyan);border:1px solid rgba(34,211,238,.35)}
+
+  .claimstmt{color:var(--tx);font-size:13.5px;margin:10px 0;padding-left:11px;border-left:2px solid var(--border)}
+  .rationale{font-size:12.5px;color:var(--tx2);margin:8px 0}
+  .killtag{font-family:var(--mono);font-size:11px;color:var(--red);background:rgba(248,113,113,.08);padding:2px 6px;border-radius:4px}
+
+  /* metric blocks — paired honest siblings */
+  .metrics{display:grep;display:grid;grid-template-columns:repeat(4,1fr);gap:9px;margin-top:13px}
+  .mblock{background:var(--panel);border:1px solid var(--border-sub);border-radius:8px;padding:9px 11px}
+  .mblock .mv{font-family:var(--mono);font-size:16px;font-weight:600;color:var(--tx)}
+  .mblock .ml{font-size:10px;color:var(--tx2);text-transform:uppercase;letter-spacing:.5px;margin-top:2px}
+  .mblock .ms{font-family:var(--mono);font-size:10px;color:var(--muted);margin-top:3px}
+  .mblock.good .mv{color:var(--green)} .mblock.bad .mv{color:var(--red)} .mblock.mid .mv{color:var(--amber)}
+
+  /* table */
+  table.dt{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+  table.dt th{text-align:left;text-transform:uppercase;font-size:10px;letter-spacing:1px;color:var(--muted2);font-weight:500;padding:8px 10px;border-bottom:1px solid var(--border)}
+  table.dt td{padding:8px 10px;border-bottom:1px solid var(--border-sub);color:var(--tx)}
+  table.dt td.num{text-align:right}
+  table.dt tr:last-child td{border-bottom:none}
+  .prov-syn{color:var(--amber)} .prov-live{color:var(--green)} .prov-derived{color:var(--cyan)}
+
+  /* banners */
+  .warnbanner{display:flex;gap:12px;align-items:flex-start;background:rgba(251,191,36,.08);border:1px solid rgba(251,191,36,.35);border-radius:10px;padding:14px 16px;margin-bottom:16px}
+  .warnbanner .ic{font-size:18px;line-height:1.2}
+  .warnbanner .t{font-weight:600;color:var(--amber);margin-bottom:2px}
+  .warnbanner .d{font-size:12.5px;color:var(--tx2)}
+
+  .expandbtn{font-family:var(--mono);font-size:11px;color:var(--cyan);cursor:pointer;background:none;border:1px solid var(--border);padding:5px 11px;border-radius:6px;margin-top:11px}
+  .expandbtn:hover{border-color:var(--border-hover);background:var(--card-hover)}
+  .report{margin-top:14px;border-top:1px solid var(--border-sub);padding-top:14px;display:none}
+  .report.open{display:block}
+  .report h1{font-size:17px;color:var(--tx-bright)} .report h2{font-size:14px;color:var(--cyan);border-bottom:1px solid var(--border-sub);padding-bottom:4px;margin-top:22px}
+  .report h3{font-size:13px;color:var(--tx-bright)}
+  .report table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px;margin:10px 0}
+  .report th,.report td{border:1px solid var(--border-sub);padding:5px 8px;text-align:left}
+  .report th{color:var(--muted2);text-transform:uppercase;font-size:10px}
+  .report blockquote{margin:8px 0;padding-left:11px;border-left:2px solid var(--border);color:var(--tx2);font-size:12.5px}
+  .report code{font-family:var(--mono);background:var(--panel);padding:1px 5px;border-radius:4px;font-size:11.5px;color:var(--cyan)}
+  .report ul{padding-left:20px} .report li{font-size:12.5px;color:var(--tx2);margin:3px 0}
+
+  /* chat */
+  .chatwrap{max-width:820px}
+  .stubtag{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:1px;color:var(--muted);border:1px dashed var(--border);padding:3px 9px;border-radius:5px;margin-bottom:12px}
+  .phase{display:flex;gap:10px;margin-bottom:16px}
+  .phasepill{flex:1;text-align:center;font-family:var(--mono);font-size:11px;padding:8px;border-radius:8px;border:1px solid var(--border);color:var(--tx2)}
+  .phasepill.active{border-color:var(--cyan);color:var(--cyan);background:rgba(34,211,238,.07)}
+  .chatbox{width:100%;background:var(--panel);border:1px solid var(--border);border-radius:10px;color:var(--tx);font-family:var(--sans);font-size:13.5px;padding:13px;resize:vertical;min-height:90px}
+  .chatbox:focus{outline:none;border-color:var(--border-hover)}
+  .preflight{margin-top:16px}
+  .pfcheck{display:flex;align-items:center;gap:11px;padding:11px 13px;background:var(--card);border:1px solid var(--border-sub);border-radius:9px;margin-bottom:9px}
+  .pfcheck .ct{flex:1}
+  .pfcheck .nm{font-weight:600;font-size:13px;color:var(--tx)}
+  .pfcheck .ds{font-size:11.5px;color:var(--tx2);margin-top:1px}
+  .pfcheck .verdict{font-family:var(--mono);font-size:10px;letter-spacing:.5px;padding:3px 8px;border-radius:5px}
+  .verdict.pass{background:rgba(52,211,153,.13);color:var(--green)}
+  .verdict.warn{background:rgba(251,191,36,.13);color:var(--amber)}
+  .submitbtn{margin-top:14px;font-family:var(--mono);font-size:12px;background:var(--card);border:1px solid var(--border);color:var(--muted);padding:10px 18px;border-radius:8px;cursor:not-allowed}
+  .disclaimer{margin-top:11px;font-size:11.5px;color:var(--muted);font-family:var(--mono)}
+  /* conversational chat */
+  .chatlog{display:flex;flex-direction:column;gap:10px;max-height:48vh;overflow-y:auto;padding:4px 2px 8px}
+  .chatturn{max-width:88%;padding:10px 13px;border-radius:11px;font-size:13.5px;line-height:1.5;white-space:pre-wrap;word-wrap:break-word}
+  .chatturn.user{align-self:flex-end;background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.28);color:var(--tx)}
+  .chatturn.assistant{align-self:flex-start;background:var(--card);border:1px solid var(--border);color:var(--tx)}
+  .chatturn .who{display:block;font-family:var(--mono);font-size:10px;letter-spacing:.5px;text-transform:uppercase;margin-bottom:4px;color:var(--tx2)}
+  .chatturn.user .who{color:var(--cyan)}
+  .chatempty{color:var(--muted);font-size:12.5px;padding:8px 2px}
+  .attachchip{display:inline-block;background:rgba(34,211,238,.1);border:1px solid var(--border);border-radius:6px;padding:4px 9px;font-size:12px;color:var(--cyan)}
+  .chatactbtn{font-family:var(--mono);font-size:12px;padding:10px 16px;border-radius:8px;cursor:pointer;transition:border-color .12s,background .12s}
+  .chatactbtn.send{background:rgba(34,211,238,.1);border:1px solid rgba(34,211,238,.4);color:var(--cyan)}
+  .chatactbtn.prep{background:var(--card);border:1px solid var(--border);color:var(--tx2)}
+  .chatactbtn:hover{border-color:var(--border-hover)}
+  .chatactbtn:disabled{opacity:.5;cursor:wait}
+  .hypopanel{margin-top:14px;border:1px solid rgba(52,211,153,.32);border-radius:10px;padding:14px;background:rgba(52,211,153,.05)}
+
+  .screen{display:none} .screen.active{display:block}
+  .empty{font-family:var(--mono);font-size:12px;color:var(--muted);padding:18px}
+</style>
+</head>
+<body>
+<div class="bh-backdrop" aria-hidden="true">
+  <div class="img"></div>
+  <div class="scrim"></div>
+  <div class="glow"></div>
+</div>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logochip">P</div>
+      <div class="wordmark">PENROSE<small>RESEARCH ENGINE</small></div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="spacer"></div>
+    <div class="health" id="health"></div>
+  </aside>
+
+  <main class="main">
+    <div class="topbar">
+      <div>
+        <h1 id="scr-title">Home</h1>
+        <div class="sub" id="scr-sub">Pipeline health, kill-rate funnel, latest run summary</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <div class="badge"><span class="dot n" id="status-dot" title="system status"></span><span id="badge-text">SYSTEM STATUS</span></div>
+      </div>
+    </div>
+    <div class="scroll">
+      <section class="screen active" id="screen-overview"></section>
+      <section class="screen" id="screen-sources"></section>
+      <section class="screen" id="screen-chat"></section>
+      <section class="screen" id="screen-action"></section>
+      <section class="screen" id="screen-reports"></section>
+      <section class="screen" id="screen-connections"></section>
+      <section class="screen" id="screen-calibration"></section>
+      <section class="screen" id="screen-guide"></section>
+      <section class="screen" id="screen-support"></section>
+    </div>
+  </main>
+</div>
+
+<script>
+/* ============================ placeholder data ============================ */
+/* These render standalone (open file:// → full believable UI). The server
+   overlays window.__LIVE__ one key at a time (per-key fallback). */
+const PLACEHOLDER = {
+  updated_at: "—",
+  status_badge: "RESEARCH ENGINE — NO LIVE TRADING",
+  synthetic_warning: false,
+  data_provenance: {
+    btc_price: {provenance:"coinbase-live", from:"2023-01-01", to:"2026-03-31", n:1186, note:"sample"}
+  },
+  stats: {sources:1, claims:2, kills:1, watch:1, supported:0, pending_module:0, needs_data:0, principles:0, modules:1},
+  decisions: [
+    {claim_id:"sample-claim", verdict:"watch", kill_reason:"", rationale:"placeholder rationale.",
+     metrics:{psr:0.5, dsr:0.5, edge_t:0.0, oos_sharpe:0.0, capacity_usd:null, three_fold:[0,0,0], n_trades:0, holdout:{}, synthetic_signal:false}}
+  ],
+  data_requests: [],
+  connections: {stats:{n_records:0,n_structural_kills:0,n_underpowered:0,verdicts:{},domains:{}},
+    failure_clusters:[], cross_domain:[], principles:[], similarity_links:[]}
+};
+
+const _lv = (typeof window!=='undefined' && window.__LIVE__) ? window.__LIVE__ : {};
+const DATA = {
+  updated_at:       _lv.updated_at       || PLACEHOLDER.updated_at,
+  status_badge:     _lv.status_badge     || PLACEHOLDER.status_badge,
+  synthetic_warning:(typeof _lv.synthetic_warning==='boolean') ? _lv.synthetic_warning : PLACEHOLDER.synthetic_warning,
+  data_provenance:  _lv.data_provenance  || PLACEHOLDER.data_provenance,
+  stats:            _lv.stats            || PLACEHOLDER.stats,
+  decisions:        _lv.decisions        || PLACEHOLDER.decisions,
+  data_requests:    _lv.data_requests    || PLACEHOLDER.data_requests,
+  notice:           _lv.notice           || "",
+  progress:         _lv.progress         || null,
+  recent_runs:      _lv.recent_runs      || [],
+  analysis_reports: _lv.analysis_reports || [],
+  review_queue:     _lv.review_queue     || [],
+  report_md:        _lv.report_md        || "_No report available._",
+  source_title:     _lv.source_title     || "2604.01431v1 — source",
+  connections:      _lv.connections      || PLACEHOLDER.connections,
+};
+
+/* ============================ helpers ============================ */
+const $ = (id)=>document.getElementById(id);
+
+/* friendly names for cryptic data-series keys; everything else gets underscores/dots -> SPACES, CAPS */
+const VAR_NAMES = {
+  'polymarket_clob_lob_l2_snapshots':'POLYMARKET ORDER-BOOK (L2) SNAPSHOTS',
+  'polymarket_order_book_l2':'POLYMARKET ORDER BOOK (L2)',
+  'polymarket.price.tick.l2':'POLYMARKET PRICE TICKS (L2)',
+  'polymarket.margin.call_event':'POLYMARKET MARGIN-CALL EVENTS',
+  'polymarket.resolution.outcome':'POLYMARKET RESOLUTION OUTCOMES',
+  'polymarket.replay.e2.events':'POLYMARKET REPLAY EVENTS (E2)',
+  'polymarket.replay.e3.events':'POLYMARKET REPLAY EVENTS (E3)',
+  'btc_perp_close_1d':'BTC PERP CLOSE (DAILY)',
+  'btc_spot_volume_1d':'BTC SPOT VOLUME (DAILY)',
+  'btc_perp_volume_1d':'BTC PERP VOLUME (DAILY)'
+};
+function prettyVar(s){
+  s = String(s==null?'':s);
+  const k = s.toLowerCase();
+  if(VAR_NAMES[k]) return VAR_NAMES[k];
+  return s.replace(/[_.]+/g,' ').replace(/\s+/g,' ').trim().toUpperCase() || s;
+}
+function shortClaim(t, n){
+  t = String(t==null?'':t).trim(); if(!t) return '';
+  const w = t.split(/\s+/); n = n||10;
+  return w.length<=n ? t : w.slice(0,n).join(' ')+'…';
+}
+const esc = (s)=>String(s==null?"":s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtNum = (v,d=3)=> (v==null||v===""||Number.isNaN(v)) ? "—" : (typeof v==='number'? v.toFixed(d) : esc(v));
+const fmtUsd = (v)=> (v==null) ? "—" : "$"+Number(v).toLocaleString('en-US');
+const fmt3f  = (a)=> Array.isArray(a)&&a.length ? "["+a.map(x=>(+x).toFixed(2)).join(", ")+"]" : "—";
+const verdictClass = (v)=> v==='kill'?'kill': v==='watch'?'watch': v==='support'||v==='supported'?'support': v==='needs_data'?'data': v==='cannot_replicate'?'kill':'pending';
+const provClass = (p)=> /synthetic/i.test(p)?'prov-syn': /derived/i.test(p)?'prov-derived':'prov-live';
+
+/* metric stat-block: pair each flattering metric with its deflating sibling */
+function metricBlocks(m){
+  m = m||{};
+  // no empty metric grid for non-backtested claims (pending_module, cheap kills, etc.)
+  const hasBacktest = (m.dsr!=null || m.psr!=null || m.oos_sharpe!=null || m.edge_t!=null
+    || (Array.isArray(m.three_fold) && m.three_fold.length));
+  if(!hasBacktest) return '';
+  const tone = (cond)=> cond===true?'good':cond===false?'bad':'mid';
+  const blocks = [
+    {l:"DSR", v:fmtNum(m.dsr,4), s:"vs "+(m.n_trades||0)+" trials",
+      t: tone(m.dsr!=null && m.dsr>=0.95)},
+    {l:"OOS Sharpe", v:fmtNum(m.oos_sharpe,3), s:"cap "+fmtUsd(m.capacity_usd),
+      t: tone(m.oos_sharpe!=null && m.oos_sharpe>0 ? (m.oos_sharpe>0.5) : false)},
+    {l:"edge_t", v:fmtNum(m.edge_t,3), s:"PSR "+fmtNum(m.psr,4),
+      t: tone(m.edge_t!=null ? (Math.abs(m.edge_t)>=2) : null)},
+    {l:"3-fold Sharpe", v:fmt3f(m.three_fold), s: signStable(m.three_fold)?"sign-stable":"sign-unstable",
+      t: signStable(m.three_fold)},
+  ];
+  return '<div class="metrics">'+blocks.map(b=>
+    '<div class="mblock '+b.t+'"><div class="mv">'+b.v+'</div><div class="ml">'+esc(b.l)+'</div><div class="ms">'+esc(b.s)+'</div></div>'
+  ).join('')+'</div>';
+}
+function signStable(a){
+  if(!Array.isArray(a)||!a.length) return null;
+  const signs = a.map(x=>Math.sign(x)).filter(s=>s!==0);
+  return signs.every(s=>s===signs[0]);
+}
+
+/* tiny markdown → html (headings, tables, blockquote, lists, bold/italic/code) */
+function md2html(md){
+  const lines = String(md).split('\n');
+  let out=[], i=0;
+  const inline = (t)=> esc(t)
+    .replace(/`([^`]+)`/g,'<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*]+)\*/g,'$1<em>$2</em>')
+    .replace(/_([^_]+)_/g,'<em>$1</em>');
+  while(i<lines.length){
+    let l=lines[i];
+    if(/^\s*\|.*\|\s*$/.test(l) && i+1<lines.length && /^\s*\|[\s:|-]+\|\s*$/.test(lines[i+1])){
+      const head=l.split('|').slice(1,-1).map(c=>c.trim());
+      i+=2; let rows=[];
+      while(i<lines.length && /^\s*\|.*\|\s*$/.test(lines[i])){ rows.push(lines[i].split('|').slice(1,-1).map(c=>c.trim())); i++; }
+      out.push('<table><thead><tr>'+head.map(h=>'<th>'+inline(h)+'</th>').join('')+'</tr></thead><tbody>'+
+        rows.map(r=>'<tr>'+r.map(c=>'<td>'+inline(c)+'</td>').join('')+'</tr>').join('')+'</tbody></table>');
+      continue;
+    }
+    if(/^### /.test(l)){ out.push('<h3>'+inline(l.slice(4))+'</h3>'); i++; continue; }
+    if(/^## /.test(l)){ out.push('<h2>'+inline(l.slice(3))+'</h2>'); i++; continue; }
+    if(/^# /.test(l)){ out.push('<h1>'+inline(l.slice(2))+'</h1>'); i++; continue; }
+    if(/^> /.test(l)){
+      let buf=[]; while(i<lines.length && /^> /.test(lines[i])){ buf.push(lines[i].slice(2)); i++; }
+      out.push('<blockquote>'+inline(buf.join(' '))+'</blockquote>'); continue;
+    }
+    if(/^[-*] /.test(l)){
+      let buf=[]; while(i<lines.length && /^[-*] /.test(lines[i])){ buf.push('<li>'+inline(lines[i].slice(2))+'</li>'); i++; }
+      out.push('<ul>'+buf.join('')+'</ul>'); continue;
+    }
+    if(/^\s*$/.test(l)){ i++; continue; }
+    out.push('<p>'+inline(l)+'</p>'); i++;
+  }
+  return out.join('\n');
+}
+
+/* ============================ render: sidebar ============================ */
+const SCREENS = [
+  {key:'overview', title:'Dashboard',  sub:'Pipeline health, latest run, and a chat with Pennie', dot:'a'},
+  {key:'action',   title:'Action Required', sub:'Pending proposals from the review queue', dot:'a'},
+  {key:'reports',  title:'Analysis Reports', sub:'Backtested outcomes with equity-curve charts', dot:'a'},
+  {key:'connections', title:'Connections', sub:'What the brain has connected across the verdict corpus — advisory, never gating', dot:null},
+  {key:'calibration', title:'Self-Calibration', sub:'Does the detector reject noise and find real edges? The controls behind every verdict', dot:null},
+  {key:'sources',  title:'Data Sources',   sub:'Ingested papers, per-claim verdicts & data provenance', dot:'a'},
+  {key:'guide',    title:'Documentation',    sub:'What Penrose is, how it works, glossary', dot:null},
+  {key:'support',  title:'Support',          sub:'Suggest an enhancement or report an issue', dot:null},
+];
+function renderNav(){
+  const s = DATA.stats;
+  const pending = (DATA.review_queue||[]).filter(r=>r.status==='pending').length;
+  const running = !!(DATA.progress && DATA.progress.running);
+  const counts = {sources:s.sources, action:pending};
+  // A tab shows a LIGHT only when it needs attention; otherwise an invisible slot keeps
+  // every label indented equally. action -> amber when proposals wait; home -> green while running.
+  const lightFor = (k)=>{
+    if(k==='action' && pending>0) return 'a';
+    if(k==='overview' && running)  return 'g pulse';
+    return 'slot';
+  };
+  $('nav').innerHTML = SCREENS.map(sc=>
+    '<div class="navrow'+(sc.key==='overview'?' active':'')+'" data-scr="'+sc.key+'">'+
+      '<span class="dot '+lightFor(sc.key)+'"></span><span class="lab">'+esc(sc.title)+'</span>'+
+      '<span class="ct">'+esc(counts[sc.key]||'')+'</span></div>'
+  ).join('');
+  document.querySelectorAll('.navrow').forEach(r=> r.onclick=()=>switchScreen(r.dataset.scr));
+}
+function renderHealth(){
+  const s = DATA.stats;
+  const pend = (DATA.review_queue||[]).filter(r=>r.status==='pending').length;
+  let h = '<div class="hl"><span>sources</span><b>'+s.sources+'</b></div>'+
+          '<div class="hl"><span>claims tested</span><b>'+s.claims+'</b></div>'+
+          '<div class="hl"><span>kills / supported</span><b>'+s.kills+' / '+s.supported+'</b></div>'+
+          '<div class="hl"><span>pending review</span><b>'+pend+'</b></div>'+
+          '<div class="hl"><span>updated</span><b style="font-size:9px">'+esc(String(DATA.updated_at).replace('T',' ').replace('+00:00','Z'))+'</b></div>';
+  if(DATA.synthetic_warning){
+    h += '<div class="flag">⚠ SYNTHETIC INPUTS — verdicts provisional, pending live Kalshi macro-signal collection.</div>';
+  }
+  $('health').innerHTML = h;
+}
+
+/* ============================ render: Overview (landing) ============================ */
+/* live "what's running right now" panel — fed by progress.json every poll, no reload */
+function renderActivity(p){
+  if(p && p.running){
+    const no = p.stage_no||0, tot = p.stage_total||5;
+    const pct = tot ? Math.round((no/tot)*100) : 0;
+    const claim = (p.claim_i && p.claim_n) ? ' · claim '+p.claim_i+'/'+p.claim_n : '';
+    return '<div class="card" style="border-color:rgba(52,211,153,.35)">'+
+      '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">'+
+        '<span class="dot g pulse"></span>'+
+        '<span style="font-weight:600;color:var(--tx-bright)">Running</span>'+
+        '<span class="meta" style="color:var(--muted)">'+esc(p.paper||'')+'</span></div>'+
+      '<div style="display:flex;justify-content:space-between;align-items:baseline">'+
+        '<div style="font-family:var(--mono);font-size:13px;color:var(--green)">'+
+          esc(p.stage_label||p.stage||'working')+claim+'</div>'+
+        '<div class="meta" style="color:var(--muted)">stage '+no+'/'+tot+'</div></div>'+
+      (p.detail?'<div class="meta" style="color:var(--tx2);margin-top:4px">'+esc(p.detail)+'</div>':'')+
+      '<div style="height:6px;border-radius:3px;background:var(--card2,rgba(255,255,255,.06));margin-top:10px;overflow:hidden">'+
+        '<div style="height:100%;width:'+pct+'%;background:var(--green);transition:width .4s"></div></div>'+
+    '</div>';
+  }
+  return '<div class="card" style="display:flex;align-items:center;gap:10px;color:var(--tx2)">'+
+    '<span class="dot n"></span><span>Idle — no run in progress.</span></div>';
+}
+
+function renderOverview(){
+  const s = DATA.stats;
+  const decs = DATA.decisions || [];
+  const pendingMod = s.pending_module || 0;
+  // kill rate is over BACKTESTED claims only — pending_module claims were never tested,
+  // so counting them would understate the rate and mislabel the funnel.
+  const backtested = (s.kills||0) + (s.watch||0) + (s.supported||0);
+  const noBacktests = backtested === 0;
+  const killRate = noBacktests ? null : (s.kills / backtested) * 100;
+  const funnelHealth = noBacktests ? 'mid' : killRate >= 70 ? 'good' : killRate >= 50 ? 'mid' : 'bad';
+  const funnelLabel = noBacktests ? 'no verdicts yet'
+                    : killRate >= 70 ? 'on-target (≥70%)'
+                    : killRate >= 50 ? 'loose (<70%)'
+                    : 'very loose (<50%)';
+
+  let html = '';
+
+  // chat at the top — the primary way to talk to the knowledge base
+  html += chatSectionHtml();
+
+  // A. WHAT'S RUNNING — live activity panel (updated every poll, no reload)
+  html += '<div class="eyebrow">Activity</div>';
+  html += '<div id="activity-panel">'+renderActivity(DATA.progress)+'</div>';
+
+  // B. WHAT NEEDS YOUR ATTENTION — the researcher's action list
+  const pendingReview = (DATA.review_queue||[]).filter(r=>r.status==='pending').length;
+  const dataReqCount  = (DATA.data_requests||[]).length;
+  const needsData     = s.needs_data||0;
+  const attn = [];
+  if(pendingReview) attn.push({n:pendingReview, label:pendingReview+' proposal'+(pendingReview>1?'s':'')+' awaiting your review', tab:'action', cls:'watch'});
+  if(dataReqCount)  attn.push({n:dataReqCount, label:dataReqCount+' claim'+(dataReqCount>1?'s':'')+' blocked on missing data', tab:'action', cls:'data'});
+  if(pendingMod)    attn.push({n:pendingMod, label:pendingMod+' module'+(pendingMod>1?'s':'')+' awaiting implementation', tab:'action', cls:'pending'});
+  html += '<div class="eyebrow">Needs your attention</div>';
+  if(attn.length){
+    html += '<div class="card" style="display:flex;flex-direction:column;gap:8px">'+
+      attn.map(a=>'<div style="display:flex;align-items:center;gap:10px;cursor:pointer" onclick="location.hash=\''+a.tab+'\'">'+
+        '<span class="vbadge '+a.cls+'">'+a.n+'</span>'+
+        '<span style="color:var(--tx)">'+esc(a.label)+'</span>'+
+        '<span style="margin-left:auto;color:var(--muted);font-size:11px">view →</span></div>').join('')+
+    '</div>';
+  } else {
+    html += '<div class="card" style="display:flex;align-items:center;gap:10px;color:var(--tx2)">'+
+      '<span class="dot g"></span><span>All clear — nothing waiting on you right now.</span></div>';
+  }
+
+  // 0. off-domain / pipeline notice (if any)
+  if(DATA.notice){
+    html += '<div class="warnbanner"><div class="ic">⏭️</div><div>'+
+      '<div class="t">Paper skipped</div><div class="d">'+esc(DATA.notice)+'</div></div></div>';
+  }
+
+  // 1. synthetic warning (if any)
+  if(DATA.synthetic_warning){
+    html += '<div class="warnbanner"><div class="ic">⚠️</div><div>'+
+      '<div class="t">Synthetic data in latest run</div>'+
+      '<div class="d">All verdicts below are <strong>provisional</strong> — pending live data collection. '+
+        'Treat kills as draft, not final.</div></div></div>';
+  }
+
+  // 2. Big stat tiles — pair flattering with deflating per HUB_DESIGN_SPEC §4.2
+  html += '<div class="eyebrow">Verdict tally</div>';
+  html += '<div class="meta" style="color:var(--muted);margin:-4px 0 10px">How every tested claim has been judged so far.</div>';
+  html += '<div class="statgrid">'+
+    statCard('k','killed', s.kills, 'failed the gauntlet'+(killRate!=null?' · '+killRate.toFixed(0)+'%':''))+
+    statCard('w','pending module', pendingMod, 'awaiting an implementation')+
+    statCard('','needs data', s.needs_data||0, 'parked — data not available yet')+
+    statCard('','watch', s.watch, "couldn't confirm or kill")+
+    statCard('su','supported', s.supported, 'survived every check')+
+    statCard('','principles', s.principles, 'reusable lessons (≥3 kills)')+
+    '</div>';
+
+  // 3. Kill rate — for a falsifier, killing most claims is the goal, not a bug
+  html += '<div class="eyebrow">Kill rate</div>';
+  html += '<div class="card">'+
+    '<div style="display:flex;justify-content:space-between;align-items:center;gap:14px">'+
+      '<div><div class="meta">share of evaluated claims that were killed</div>'+
+        '<div style="font-size:28px;font-family:var(--mono);color:var(--tx)">'+
+          (noBacktests?'—':killRate.toFixed(1)+'<span style="font-size:14px;color:var(--tx2)">%</span>')+'</div></div>'+
+      '<span class="vbadge '+(funnelHealth==='good'?'support':funnelHealth==='mid'?'watch':'kill')+'">'+
+        funnelLabel+'</span>'+
+    '</div>'+
+    '<div class="meta" style="margin-top:10px;color:var(--muted)">'+
+      (noBacktests
+        ? pendingMod+' claim(s) awaiting an implementation — none evaluated yet. '
+        : 'Penrose is supposed to reject most claims, so a HIGH kill rate is healthy — it means the filter is working, not failing. We watch that it stays ≥70%; a low rate would suggest the engine is rubber-stamping. ')+
+      'Sources: '+s.sources+' · Claims: '+s.claims+' · Modules: '+s.modules+
+    '</div></div>';
+
+  // 4. Data requests backlog (F7b) — what the catalog must gain to test blocked claims
+  const reqs = DATA.data_requests || [];
+  if(reqs.length){
+    const series = {};
+    reqs.forEach(r => (r.missing_series||[]).forEach(x => { series[x] = (series[x]||0)+1; }));
+    const ranked = Object.keys(series).sort((a,b)=>series[b]-series[a]);
+    html += '<div class="eyebrow">Data requests · '+reqs.length+' blocked claim(s)</div>';
+    const showN = 12, extra = ranked.length - showN;
+    html += '<div class="card">'+
+      '<div class="meta" style="color:var(--muted);margin-bottom:8px">A claim needed a data series Penrose doesn\'t have yet. Rather than fake a verdict, '+
+        'the claim is parked here — it re-runs automatically once that data is added to the catalog.</div>'+
+      '<div style="display:flex;flex-wrap:wrap;gap:6px">'+
+        ranked.map((k,i)=>'<span class="vbadge data dr-item'+(i>=showN?' dr-extra':'')+'" title="'+esc(k)+'" style="text-transform:none'+(i>=showN?';display:none':'')+'">'+esc(prettyVar(k))+
+          (series[k]>1?' ×'+series[k]:'')+'</span>').join('')+
+        (extra>0?'<span class="vbadge pending dr-toggle" style="text-transform:none;cursor:pointer" onclick="toggleDataReq(this)">+'+extra+' more</span>':'')+
+      '</div></div>';
+  }
+
+  // 5. Latest verdicts (compact)
+  if(decs.length){
+    html += '<div class="eyebrow">Latest verdicts · '+decs.length+'</div>';
+    html += '<div class="card" style="padding:0">'+
+      '<table class="dt"><thead><tr>'+
+        '<th>claim</th><th>verdict</th><th class="num">OOS Sharpe</th>'+
+        '<th class="num">DSR</th><th>3-fold</th>'+
+      '</tr></thead><tbody>';
+    decs.forEach(d=>{
+      const m = d.metrics || {};
+      html += '<tr>'+
+        '<td><div title="'+esc(d.statement||d.claim_id)+'" style="max-width:300px">'+
+          esc(shortClaim(d.statement,10)||d.claim_id)+
+          '<div class="meta" style="font-family:var(--mono);font-size:10px;color:var(--muted)">'+esc(d.claim_id)+'</div></div></td>'+
+        '<td><span class="vbadge '+verdictClass(d.verdict)+'">'+esc(d.verdict)+
+          (d.kill_reason?' · '+esc(String(d.kill_reason).replace(/_/g,' ')):'')+'</span></td>'+
+        '<td class="num">'+fmtNum(m.oos_sharpe,3)+'</td>'+
+        '<td class="num">'+fmtNum(m.dsr,3)+'</td>'+
+        '<td style="font-family:var(--mono);font-size:11px">'+fmt3f(m.three_fold)+'</td>'+
+      '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  // 4b. Recent runs — every paper processed, newest first (the research log)
+  const runs = DATA.recent_runs || [];
+  if(runs.length){
+    const cls = {kill:'kill', watch:'watch', 'research-supported':'support', supported:'support',
+                 needs_data:'data', pending_module:'pending'};
+    html += '<div class="eyebrow">Recent runs · '+runs.length+'</div>';
+    html += '<div class="card" style="display:flex;flex-direction:column;gap:0;padding:0">';
+    runs.forEach((r,i)=>{
+      const when = String(r.run_at||'').replace('T',' ').replace(/(\+|Z).*/,'').slice(5,16);
+      const chips = r.off_domain
+        ? '<span class="vbadge pending" style="text-transform:none">off-domain · skipped</span>'
+        : Object.keys(r.counts||{}).map(v=>'<span class="vbadge '+(cls[v]||'pending')+'">'+(r.counts[v])+' '+esc(v)+'</span>').join(' ');
+      html += '<div class="runrow" onclick="openRun('+JSON.stringify(r.source_id||'')+')" title="'+esc(r.title||'')+' — click for the full run report" style="cursor:pointer;display:flex;align-items:center;gap:10px;padding:10px 14px'+(i?';border-top:1px solid var(--border-sub)':'')+'">'+
+        '<div style="flex:1;min-width:0"><div style="color:var(--tx);font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(r.source_id||r.title||'run')+'</div>'+
+          '<div class="meta" style="font-family:var(--mono);color:var(--muted);font-size:10px">run · '+esc(when)+' · '+(r.claims||0)+' claims</div></div>'+
+        '<div style="display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;max-width:50%">'+chips+'</div>'+
+        '<span style="color:var(--muted);font-size:15px">›</span></div>';
+    });
+    html += '</div>';
+  }
+
+  // 5. Provenance snapshot (compact; full table on Sources tab)
+  const prov = DATA.data_provenance || {};
+  const provKeys = Object.keys(prov);
+  if(provKeys.length){
+    const synCount = provKeys.filter(k => /synthetic/i.test(prov[k].provenance || '')).length;
+    const liveCount = provKeys.filter(k => /live|derived/i.test(prov[k].provenance || '')).length;
+    html += '<div class="eyebrow">Data provenance snapshot</div>';
+    html += '<div class="card">'+
+      '<div class="statgrid" style="grid-template-columns:repeat(3,1fr)">'+
+        statCard('', 'live / derived', liveCount, 'of '+provKeys.length+' series')+
+        statCard('w', 'synthetic', synCount, 'verdicts provisional')+
+        statCard('', 'updated',
+          '<span style="font-size:18px">'+esc(String(DATA.updated_at).replace('T',' ').replace('+00:00','Z').slice(5,16))+'</span>',
+          'last pipeline run')+
+      '</div>'+
+      '<div class="meta" style="margin-top:8px;color:var(--muted)">'+
+        'Full per-series table on the Sources tab.</div></div>';
+  }
+
+  $('screen-overview').innerHTML = html;
+}
+
+/* ============================ render: Sources ============================ */
+function renderSources(){
+  const s = DATA.stats;
+  let html = '';
+  if(DATA.synthetic_warning){
+    html += '<div class="warnbanner"><div class="ic">⚠️</div><div>'+
+      '<div class="t">Synthetic data in this run</div>'+
+      '<div class="d">One or more model inputs are <strong>synthetic</strong>. All verdicts below are <strong>provisional</strong>, pending live Kalshi macro-signal collection. Do not treat kills as final.</div>'+
+      '</div></div>';
+  }
+
+  html += '<div class="eyebrow">Pipeline overview</div>';
+  html += '<div class="statgrid">'+
+    statCard('k','kills', s.kills, 'claims falsified')+
+    statCard('w','watch', s.watch, 'inconclusive')+
+    statCard('su','supported', s.supported, 'survived OOS')+
+    statCard('','principles', s.principles, 'extracted (N≥3)')+
+    statCard('','modules', s.modules, 'analysis modules')+
+    '</div>';
+
+  // source card
+  html += '<div class="eyebrow">Ingested source</div>';
+  const decs = DATA.decisions||[];
+  html += '<div class="card">'+
+    '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:14px">'+
+      '<div><h3>'+esc(DATA.source_title)+'</h3>'+
+      '<div class="meta">'+(s.claims)+' claims tested · '+decs.filter(d=>d.verdict==='kill').length+' killed</div></div>'+
+      '<button class="expandbtn" onclick="toggleReport()">⤢ view report markdown</button>'+
+    '</div>';
+  // per-claim verdicts
+  decs.forEach(d=>{
+    const m = d.metrics||{};
+    html += '<div class="card" style="margin:14px 0 0;background:var(--panel)">'+
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:10px">'+
+        '<div class="meta" style="color:var(--tx)">'+esc(d.claim_id)+'</div>'+
+        '<span class="vbadge '+verdictClass(d.verdict)+'">'+esc(d.verdict)+
+          (d.kill_reason?' · '+esc(d.kill_reason):'')+'</span>'+
+      '</div>'+
+      (m.synthetic_signal?'<div style="margin-top:7px"><span class="killtag" style="color:var(--amber);background:rgba(251,191,36,.08)">synthetic signal</span></div>':'')+
+      '<div class="rationale">'+esc(d.rationale)+'</div>'+
+      metricBlocks(m)+
+    '</div>';
+  });
+  html += '<div class="report" id="reportbox">'+md2html(DATA.report_md)+'</div>';
+  html += '</div>';
+
+  // provenance table
+  html += '<div class="eyebrow">Data provenance</div>';
+  html += '<div class="card"><table class="dt"><thead><tr>'+
+    '<th>series</th><th>provenance</th><th>from</th><th>to</th><th class="num">n</th><th>note</th>'+
+    '</tr></thead><tbody>';
+  const prov = DATA.data_provenance||{};
+  const keys = Object.keys(prov);
+  if(!keys.length){ html += '<tr><td colspan="6" class="empty">no provenance data</td></tr>'; }
+  keys.forEach(k=>{
+    const p = prov[k];
+    html += '<tr><td>'+esc(k)+'</td>'+
+      '<td class="'+provClass(p.provenance)+'">'+esc(p.provenance)+'</td>'+
+      '<td>'+esc(p.from)+'</td><td>'+esc(p.to)+'</td>'+
+      '<td class="num">'+esc(p.n)+'</td>'+
+      '<td style="color:var(--tx2);white-space:normal">'+esc(p.note||'')+'</td></tr>';
+  });
+  html += '</tbody></table></div>';
+
+  $('screen-sources').innerHTML = html;
+}
+function statCard(cls,label,val,sub){
+  return '<div class="stat '+cls+'"><div class="v">'+(val==null?'—':val)+'</div>'+
+    '<div class="l">'+esc(label)+'</div><div class="s">'+esc(sub)+'</div></div>';
+}
+window.toggleReport = ()=> $('reportbox').classList.toggle('open');
+
+/* ============================ render: Chat (two-phase) ============================ */
+let _dashToken = null;
+async function _fetchToken(){
+  if(_dashToken) return _dashToken;
+  try {
+    const r = await fetch('/dash-token');
+    const j = await r.json();
+    _dashToken = j.token;
+  } catch(e){ _dashToken = null; }
+  return _dashToken;
+}
+
+/* conversation state (module scope) */
+let chatMessages = [];     // [{role:'user'|'assistant', content:string, attachment?, title?, chars?}]
+let chatSession = 'chat-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);
+
+function chatSectionHtml(){
+  return '<div class="chatwrap">'+
+      '<div class="eyebrow">Talk to Pennie, your research assistant</div>'+
+      '<div class="meta" style="margin:-4px 0 12px;color:var(--tx2)">Discuss a trading idea with Pennie. She\'ll steer you towards a single falsifiable hypothesis until you\'re ready to submit your idea for analysis.</div>'+
+      '<div class="card">'+
+        '<div id="chat-log" class="chatlog"></div>'+
+        '<div style="margin-top:10px">'+
+          '<textarea id="chat-input" class="chatbox" style="min-height:64px" placeholder="e.g. I think rising BTC funding rates predict negative next-day spot returns…" onkeydown="if(event.key===\'Enter\'&&!event.shiftKey){event.preventDefault();chatSend();}"></textarea>'+
+        '</div>'+
+        '<div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">'+
+          '<button id="chat-send-btn" class="chatactbtn send" onclick="chatSend()">Send</button>'+
+          '<button id="chat-prep-btn" class="chatactbtn prep" onclick="chatPrepare()">Prepare hypothesis →</button>'+
+          '<label class="chatactbtn prep" id="attach-btn" style="cursor:pointer">📎 Attach paper<input type="file" accept="application/pdf,.pdf,.md,.txt" onchange="attachPaper(this)" style="display:none"></label>'+
+          '<span style="flex:1"></span>'+
+          '<span style="font-size:11px;color:var(--muted)">Enter sends · Shift+Enter newline</span>'+
+        '</div>'+
+        '<div id="chat-status" class="meta" style="margin-top:8px;color:var(--muted)"></div>'+
+        '<div id="chat-hypo" class="hypopanel" style="display:none"></div>'+
+      '</div>'+
+      '<div class="disclaimer">The conversation runs in your browser. Only a confirmed hypothesis is written to <code>inbox/</code> as a .txt file for the next scan to ingest through P1→P9. Read-only until ingest — no brain/state mutations from this surface.</div>'+
+    '</div>';
+}
+
+function renderChat(){
+  const log = $('chat-log');
+  if(!log) return;
+  if(!chatMessages.length){
+    log.innerHTML = '<div class="chatempty">No messages yet. Describe a signal or a trading idea and Pennie will help sharpen it into something Penrose can test.</div>';
+    return;
+  }
+  log.innerHTML = chatMessages.map(m=>{
+    if(m.attachment){
+      return '<div class="chatturn user"><span class="who">you</span><span class="attachchip">📎 '+esc(m.title||'paper')+' · '+(m.chars||0)+' chars'+(m.truncated?' (truncated to 6k)':'')+' attached</span></div>';
+    }
+    const who = m.role==='user' ? 'you' : 'Pennie';
+    return '<div class="chatturn '+esc(m.role)+'"><span class="who">'+who+'</span>'+esc(m.content)+'</div>';
+  }).join('');
+  log.scrollTop = log.scrollHeight;
+}
+
+function _chatStatus(html){ const s=$('chat-status'); if(s) s.innerHTML = html; }
+function _chatBusy(busy){
+  const sb=$('chat-send-btn'), pb=$('chat-prep-btn');
+  if(sb) sb.disabled = busy; if(pb) pb.disabled = busy;
+}
+
+window.chatSend = async () => {
+  const inp = $('chat-input');
+  const text = ((inp||{}).value || '').trim();
+  if(!text) return;
+  chatMessages.push({role:'user', content:text});
+  if(inp) inp.value = '';
+  renderChat();
+  _chatStatus('<span style="color:var(--tx2)">thinking…</span>');
+  _chatBusy(true);
+  try {
+    const token = await _fetchToken();
+    const r = await fetch('/chat', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Penrose-Token':token||''},
+      body: JSON.stringify({messages: chatMessages.map(m=>({role:m.role, content:m.content})), session_id: chatSession})
+    });
+    const j = await r.json();
+    if(j.ok){
+      chatMessages.push({role:'assistant', content:j.reply});
+      renderChat();
+      _chatStatus('');
+    } else {
+      _chatStatus('<span style="color:var(--red)">Assistant error: '+esc(j.error||'unknown')+'</span>');
+    }
+  } catch(e){
+    _chatStatus('<span style="color:var(--red)">Request failed: '+esc(String(e))+'</span>');
+  } finally {
+    _chatBusy(false);
+  }
+};
+
+window.chatPrepare = async () => {
+  if(!chatMessages.length){ _chatStatus('<span style="color:var(--red)">Discuss an idea first, then prepare the hypothesis.</span>'); return; }
+  _chatStatus('<span style="color:var(--tx2)">drafting a falsifiable hypothesis from the discussion…</span>');
+  _chatBusy(true);
+  try {
+    const token = await _fetchToken();
+    const r = await fetch('/prepare-hypothesis', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Penrose-Token':token||''},
+      body: JSON.stringify({messages: chatMessages})
+    });
+    const j = await r.json();
+    if(j.ok){
+      _chatStatus('');
+      const panel = $('chat-hypo');
+      if(panel){
+        panel.style.display = 'block';
+        panel.innerHTML =
+          '<div class="eyebrow" style="margin-bottom:8px">Proposed hypothesis · review &amp; edit before submitting</div>'+
+          '<textarea id="hypo-text" class="chatbox" style="min-height:200px"></textarea>'+
+          '<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'+
+            '<button class="chatactbtn send" onclick="submitClaim()">→ Submit to pipeline</button>'+
+            '<button class="chatactbtn prep" onclick="document.getElementById(\'chat-hypo\').style.display=\'none\'">Cancel</button>'+
+          '</div>';
+        $('hypo-text').value = j.hypothesis;
+      }
+    } else {
+      _chatStatus('<span style="color:var(--red)">Prepare failed: '+esc(j.error||'unknown')+'</span>');
+    }
+  } catch(e){
+    _chatStatus('<span style="color:var(--red)">Request failed: '+esc(String(e))+'</span>');
+  } finally {
+    _chatBusy(false);
+  }
+};
+
+window.submitClaim = async () => {
+  const ta = $('hypo-text');
+  const text = ((ta||{}).value || '').trim();
+  if(text.length < 20){ _chatStatus('<span style="color:var(--red)">Hypothesis too short (need at least 20 chars).</span>'); return; }
+  if(!confirm('Submit this hypothesis to inbox/? The next scan will ingest it through P1→P9.')) return;
+  try {
+    const token = await _fetchToken();
+    const r = await fetch('/submit-claim', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Penrose-Token': token||''},
+      body: JSON.stringify({thesis: text, source: 'chat'})
+    });
+    const j = await r.json();
+    if(j.ok){
+      const panel = $('chat-hypo'); if(panel) panel.style.display = 'none';
+      _chatStatus('<span style="color:var(--green)">✓ Queued in inbox/ ('+esc(j.path||'')+'). '+
+        'Run <code>make scan</code> to ingest now, or wait for the next scan.</span>');
+    } else {
+      _chatStatus('<span style="color:var(--red)">Submit failed: '+esc(j.error||'unknown')+'</span>');
+    }
+  } catch(e){
+    _chatStatus('<span style="color:var(--red)">Submit failed: '+esc(String(e))+'</span>');
+  }
+};
+
+window.uploadPaper = async (input) => {
+  const file = input.files && input.files[0];
+  if(!file) return;
+  const btn = document.getElementById('add-paper-btn');
+  if(file.type && file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)){
+    alert('Please choose a PDF.'); input.value=''; return;
+  }
+  if(btn){ btn.disabled = true; btn.textContent = 'uploading…'; }
+  try {
+    const buf = await file.arrayBuffer();
+    let bin=''; const bytes=new Uint8Array(buf);
+    for(let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+    const b64 = btoa(bin);
+    const token = await _fetchToken();
+    const r = await fetch('/upload-paper', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Penrose-Token':token||''},
+      body: JSON.stringify({filename:file.name, content_b64:b64})
+    });
+    const j = await r.json();
+    if(j.ok){
+      alert('Added '+j.path+'\\n\\nIt will be processed on the next scan (or run `make run`).');
+    } else {
+      alert('Upload failed: '+(j.error||'unknown'));
+    }
+  } catch(e){
+    alert('Upload failed: '+e);
+  } finally {
+    if(btn){ btn.disabled = false; btn.textContent = '+ Add paper'; }
+    input.value='';
+  }
+};
+
+// Claude-style attach: pull the paper's TEXT into the conversation so the assistant can discuss it.
+window.attachPaper = async (input) => {
+  const file = input.files && input.files[0];
+  if(!file) return;
+  const label = document.getElementById('attach-btn');
+  if(label) label.style.opacity = '.55';
+  _chatStatus('<span style="color:var(--tx2)">reading paper…</span>');
+  try {
+    const buf = await file.arrayBuffer();
+    let bin=''; const bytes=new Uint8Array(buf);
+    for(let i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+    const token = await _fetchToken();
+    const r = await fetch('/attach-paper', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Penrose-Token':token||''},
+      body: JSON.stringify({filename:file.name, content_b64:btoa(bin)})
+    });
+    const j = await r.json();
+    if(j.ok){
+      chatMessages.push({role:'user', attachment:true, title:j.title, chars:j.chars, truncated:j.truncated,
+        content:'Attached paper "'+j.title+'" (for discussion):\n\n'+j.text});
+      renderChat();
+      _chatStatus('<span style="color:var(--green)">✓ Attached '+esc(j.title)+'. Ask a question about it, then Send.</span>');
+    } else {
+      _chatStatus('<span style="color:var(--red)">Attach failed: '+esc(j.error||'unknown')+'</span>');
+    }
+  } catch(e){
+    _chatStatus('<span style="color:var(--red)">Attach failed: '+esc(String(e))+'</span>');
+  } finally {
+    if(label) label.style.opacity='';
+    input.value='';
+  }
+};
+
+/* ============================ render: Action Required ============================ */
+function renderAction(){
+  const q = (DATA.review_queue||[]);
+  const pending = q.filter(r=>r.status==='pending');
+  let html = '';
+  html += '<div class="eyebrow">Pending proposals · '+pending.length+'</div>';
+  html += '<div class="warnbanner" style="background:rgba(59,130,246,.06);border-color:rgba(59,130,246,.3)">'+
+    '<div class="ic" style="color:var(--blue)">ℹ️</div><div>'+
+    '<div class="t" style="color:var(--blue)">Read-only review</div>'+
+    '<div class="d">These proposals are queued from the research pipeline. Approvals / rejections happen via a separate CLI — this dashboard never writes to the queue.</div>'+
+    '</div></div>';
+
+  if(!pending.length){ html += '<div class="card"><div class="empty">No pending proposals.</div></div>'; }
+
+  const meaningLine = (txt)=> txt ? '<div class="rationale"><span style="color:var(--muted2);text-transform:uppercase;font-size:10px;letter-spacing:.5px">meaning · </span>'+esc(txt)+'</div>' : '';
+  const idLine = (pid, extra)=> '<div class="meta" style="font-family:var(--mono)"><span style="color:var(--cyan)">'+esc(pid)+'</span>'+(extra?' · '+extra:'')+'</div>';
+
+  pending.forEach(r=>{
+    const pid = r.proposal_id || r.decision_id || r.claim_id || '—';
+
+    // ModuleSpec proposal (cold-start: novel strategy class awaiting implementation)
+    if(r.type==='module_spec'){
+      html += '<div class="card">'+
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'+
+          '<div><h3 style="font-size:14px">'+esc(r.name||r.strategy_class||'ModuleSpec')+'</h3>'+
+          idLine(pid, r.strategy_class?esc(r.strategy_class):'')+'</div>'+
+          '<span class="vbadge pending">pending module</span>'+
+        '</div>'+
+        '<div class="claimstmt">'+esc(r.statement||'')+'</div>'+
+        meaningLine(r.meaning)+
+        (r.spec_path?'<div class="meta" style="margin-top:9px;color:var(--muted)">spec generated → <code>'+esc(r.spec_path)+'</code> · implement the module to backtest this claim</div>':'')+
+      '</div>';
+      return;
+    }
+
+    // Principle proposal
+    if(r.type==='principle'){
+      html += '<div class="card">'+
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'+
+          '<div><h3>Principle proposal</h3>'+idLine(pid,'')+'</div>'+
+          '<span class="vbadge support">principle</span></div>'+
+        '<div class="claimstmt">'+esc(r.statement||r.claim_statement||r.rationale||'')+'</div>'+
+      '</div>';
+      return;
+    }
+
+    // Decision proposal (backtested: kill / watch / research-supported)
+    const m = r.metrics||{};
+    html += '<div class="card">'+
+      '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'+
+        '<div><h3 style="font-size:14px">'+esc(r.name||r.claim_id||'decision')+'</h3>'+
+        idLine(pid, 'queued '+esc(String(r.queued_at||'').replace('T',' ').slice(0,16))+
+          (r.revisit_at?' · revisit '+esc(r.revisit_at):''))+'</div>'+
+        '<span class="vbadge '+verdictClass(r.verdict)+'">'+esc(r.verdict)+
+          (r.kill_reason?' · '+esc(r.kill_reason):'')+'</span>'+
+      '</div>'+
+      '<div class="claimstmt">'+esc(r.claim_statement||r.statement||'')+'</div>'+
+      meaningLine(r.meaning)+
+      (m.synthetic_signal?'<div><span class="killtag" style="color:var(--amber);background:rgba(251,191,36,.08)">synthetic signal — provisional</span></div>':'')+
+      (r.rationale?'<div class="rationale">'+esc(r.rationale)+'</div>':'')+
+      metricBlocks(m)+
+    '</div>';
+  });
+
+  // Data requests — claims blocked on data the catalog doesn't yet provide (F7b backlog)
+  const reqs = DATA.data_requests || [];
+  html += '<div class="eyebrow" id="data-requests" style="margin-top:22px">Data requests · '+reqs.length+' blocked claim'+(reqs.length===1?'':'s')+'</div>';
+  if(!reqs.length){
+    html += '<div class="card"><div class="empty">No claims blocked on missing data.</div></div>';
+  } else {
+    reqs.forEach(r=>{
+      html += '<div class="card">'+
+        '<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px">'+
+          '<div><h3 style="font-size:14px">'+esc((r.strategy_class||r.claim_id||'blocked claim'))+'</h3>'+
+          '<div class="meta" style="font-family:var(--mono);color:var(--muted)">'+esc(r.source_id||'')+' · '+esc(r.claim_id||'')+'</div></div>'+
+          '<span class="vbadge data">needs data</span>'+
+        '</div>'+
+        '<div class="claimstmt">'+esc(r.statement||'')+'</div>'+
+        '<div class="meta" style="color:var(--muted);margin:8px 0 4px">missing data — this claim re-runs automatically once these are added to the catalog:</div>'+
+        '<div style="display:flex;flex-wrap:wrap;gap:6px">'+
+          (r.missing_series||[]).map(x=>'<span class="vbadge data" title="'+esc(x)+'" style="text-transform:none">'+esc(prettyVar(x))+'</span>').join('')+
+        '</div></div>';
+    });
+  }
+
+  $('screen-action').innerHTML = html;
+}
+
+/* ============================ render: Analysis Reports ============================ */
+function renderReports(){
+  const reps = DATA.analysis_reports || [];
+  let html = '';
+  html += '<div class="warnbanner" style="background:rgba(34,211,238,.06);border-color:rgba(34,211,238,.3)">'+
+    '<div class="ic">📈</div><div><div class="t" style="color:var(--cyan)">Backtested outcomes</div>'+
+    '<div class="d">Every claim that reached a backtest, newest first, with its strategy equity curve. '+
+      'Charts are matplotlib renders of the per-trade net-return series.</div></div></div>';
+  if(!reps.length){
+    html += '<div class="card" style="color:var(--tx2)">No backtested outcomes yet. '+
+      'Run a paper whose claims route to a module with data — the equity curves land here.</div>';
+    $('screen-reports').innerHTML = html; return;
+  }
+  reps.forEach(r=>{
+    const m = r.metrics||{};
+    const when = String(r.run_at||'').replace('T',' ').replace(/(\+|Z).*/,'').slice(0,16);
+    const tf = Array.isArray(m.three_fold) ? '['+m.three_fold.map(x=>(+x).toFixed(2)).join(', ')+']' : '—';
+    const fd = r.fidelity || {};
+    const fidSuspect = fd && fd.faithful===false && (fd.confidence||0)>=0.6;
+    const fidBadge = (fd && ('faithful' in fd))
+      ? '<span class="vbadge '+(fidSuspect?'kill':'support')+'" title="'+esc(fd.note||'')+'">'+
+          (fidSuspect?'fidelity suspect':'faithful')+'</span>'
+      : '';
+    html += '<div class="card" style="margin-bottom:14px">'+
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin-bottom:8px">'+
+        '<div style="font-weight:600;color:var(--tx-bright)">'+esc(r.statement||r.claim_id)+'</div>'+
+        '<div style="display:flex;gap:6px;flex-shrink:0">'+fidBadge+
+          '<span class="vbadge '+verdictClass(r.verdict)+'">'+esc(r.verdict)+(r.kill_reason?' · '+esc(r.kill_reason):'')+'</span></div>'+
+      '</div>'+
+      '<div class="meta" style="color:var(--muted);margin-bottom:10px">'+esc(r.source_title||r.source_id||'')+' · '+esc(when)+
+        (r.synthetic?' · <span style="color:var(--amber)">synthetic inputs — provisional</span>':'')+'</div>'+
+      (r.chart
+        ? '<img src="/charts/'+esc(r.chart)+'" alt="equity curve" style="width:100%;border-radius:8px;border:1px solid var(--border-sub);display:block">'
+        : '<div class="meta" style="color:var(--muted)">(no chart — net series unavailable)</div>')+
+      '<div class="statgrid" style="grid-template-columns:repeat(5,1fr);margin-top:10px">'+
+        statCard('','DSR', fmtNum(m.dsr,3), 'deflated Sharpe')+
+        statCard('','OOS Sharpe', fmtNum(m.oos_sharpe,2), 'out-of-sample')+
+        statCard('','trades', m.n_trades!=null?m.n_trades:'—', 'non-overlapping')+
+        statCard('','3-fold', '<span style="font-size:13px">'+tf+'</span>', 'sign-stability')+
+        statCard('','capacity', m.capacity_usd!=null?fmtUsd(m.capacity_usd):'—', 'before impact')+
+      '</div></div>';
+  });
+  $('screen-reports').innerHTML = html;
+}
+
+/* ============================ render: Connections (brain) ============================ */
+function renderConnections(){
+  const c = DATA.connections || {};
+  const st = c.stats || {};
+  const fc = c.failure_clusters || [], cd = c.cross_domain || [], pr = c.principles || [], sl = c.similarity_links || [];
+  const domOf = (id)=> esc(String(id).replace(/^cz:/,''));
+  let html = '';
+  // top banner — make the inform-never-gate contract impossible to miss
+  html += '<div class="warnbanner" style="background:rgba(124,154,247,.07);border-color:rgba(124,154,247,.35)">'+
+    '<div class="ic">🧠</div><div><div class="t" style="color:var(--accent,#7c9af7)">Brain connections — advisory, never gating</div>'+
+    '<div class="d">Patterns the brain found across the verdict corpus. These <b>inform</b> a researcher; '+
+      'they never auto-reject a new idea. Every new claim is still tested independently on its own data — '+
+      'the corpus only adds context. Principles draw from <b>structural kills only</b> (not underpowered) and '+
+      'their confidence <b>decays with age</b>.</div></div></div>';
+  // corpus summary
+  const vch = Object.entries(st.verdicts||{}).map(([k,v])=>esc(k)+' '+v).join(' · ') || '—';
+  html += '<div class="statgrid" style="grid-template-columns:repeat(4,1fr);margin-bottom:16px">'+
+    statCard('','corpus', st.n_records||0, 'verdicts analyzed')+
+    statCard('','structural kills', st.n_structural_kills||0, 'inform principles')+
+    statCard('','underpowered', st.n_underpowered||0, 'excluded from priors')+
+    statCard('','domains', Object.keys(st.domains||{}).length, 'research areas')+
+    '</div>';
+  if(!st.n_records){
+    html += '<div class="card" style="color:var(--tx2)">No connections yet — run papers (or '+
+      '<code>make connections</code>) to populate the verdict corpus. The brain connects what it has tested.</div>';
+    $('screen-connections').innerHTML = html; return;
+  }
+  // PRINCIPLES — the headline knowledge
+  html += '<h3 style="margin:18px 0 8px;color:var(--tx-bright)">Principles <span style="color:var(--muted);font-weight:400;font-size:12px">('+pr.length+' — from structural kills, confidence decays with age)</span></h3>';
+  if(!pr.length) html += '<div class="card" style="color:var(--tx2);margin-bottom:10px">No principle yet (needs ≥3 structural kills sharing a failure mode in one domain).</div>';
+  pr.forEach(p=>{
+    const conf = Math.round((p.confidence||0)*100);
+    html += '<div class="card" style="margin-bottom:10px">'+
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:10px">'+
+        '<div style="font-weight:600;color:var(--tx-bright)">'+domOf(p.domain)+' · '+esc(p.kill_reason)+'</div>'+
+        '<span class="vbadge pending" title="advisory prior — decays with age">conf '+conf+'% · '+(p.n_observations||0)+' obs</span></div>'+
+      '<div style="color:var(--tx2);margin:6px 0;font-size:13px">'+esc(p.statement)+'</div>'+
+      '<div class="meta" style="color:var(--muted)">newest evidence '+esc(p.newest_evidence_year||'—')+
+        ' · advisory only — a new claim here is still tested independently</div></div>';
+  });
+  // CROSS-DOMAIN — the surprising connections
+  html += '<h3 style="margin:22px 0 8px;color:var(--tx-bright)">Cross-domain failure modes <span style="color:var(--muted);font-weight:400;font-size:12px">(the same way to die, across different research areas)</span></h3>';
+  if(!cd.length) html += '<div class="card" style="color:var(--tx2);margin-bottom:10px">No cross-domain link yet.</div>';
+  cd.forEach(x=>{
+    html += '<div class="card" style="margin-bottom:10px">'+
+      '<div style="font-weight:600;color:var(--tx-bright)">“'+esc(x.kill_reason)+'” spans '+x.n_domains+' domains</div>'+
+      '<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">'+
+        (x.domains||[]).map(d=>'<span class="vbadge kill" style="opacity:.85">'+domOf(d)+'</span>').join('')+'</div>'+
+      '<div class="meta" style="color:var(--muted);margin-top:6px">'+x.total+' claims total died this way across these areas</div></div>';
+  });
+  // FAILURE CLUSTERS
+  html += '<h3 style="margin:22px 0 8px;color:var(--tx-bright)">Failure-mode clusters <span style="color:var(--muted);font-weight:400;font-size:12px">(structural kills grouped by reason × domain)</span></h3>';
+  html += '<div class="statgrid" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">';
+  fc.forEach(cl=>{
+    html += '<div class="card" style="padding:12px">'+
+      '<div style="font-weight:600;color:var(--tx-bright);font-size:13px">'+domOf(cl.domain)+'</div>'+
+      '<div class="meta" style="color:var(--muted);margin:4px 0 6px">'+esc(cl.kill_reason)+'</div>'+
+      '<div style="font-size:20px;font-weight:700;color:var(--accent,#7c9af7)">'+cl.n+'</div>'+
+      '<div class="meta" style="color:var(--muted)">claims killed</div></div>';
+  });
+  html += '</div>';
+  // SIMILARITY — advisory "related prior verdict"
+  html += '<h3 style="margin:22px 0 8px;color:var(--tx-bright)">Related prior verdicts <span style="color:var(--muted);font-weight:400;font-size:12px">(similar to something already tested — review the difference, don’t skip the test)</span></h3>';
+  if(!sl.length) html += '<div class="card" style="color:var(--tx2)">No similar pairs above threshold.</div>';
+  else { html += '<div class="card" style="padding:0;overflow:hidden">';
+    sl.slice(0,12).forEach((s,i)=>{
+      html += '<div style="display:flex;justify-content:space-between;gap:10px;padding:9px 12px;'+(i?'border-top:1px solid var(--border-sub)':'')+'">'+
+        '<div style="font-size:12px;color:var(--tx2)">'+esc(s.a)+' <span class="vbadge '+verdictClass(s.a_verdict)+'" style="font-size:9px">'+esc(s.a_verdict)+'</span> '+
+          '<span style="color:var(--muted)">~</span> '+esc(s.b)+' <span class="vbadge '+verdictClass(s.b_verdict)+'" style="font-size:9px">'+esc(s.b_verdict)+'</span></div>'+
+        '<div style="color:var(--accent,#7c9af7);font-weight:600;font-size:12px;flex-shrink:0">'+Math.round((s.similarity||0)*100)+'%</div></div>';
+    });
+    html += '</div>'; }
+  $('screen-connections').innerHTML = html;
+}
+
+/* ============================ render: Guide + Glossary ============================ */
+const GLOSSARY = [
+  // Pipeline terms
+  {cat:'pipeline', term:'Atom', def:'The unit of knowledge in the brain. One short statement with provenance, scope, and trust.'},
+  {cat:'pipeline', term:'Backtest', def:'Running a strategy against historical data under DSR + 3-fold + locked holdout + fee + capacity discipline.'},
+  {cat:'pipeline', term:'Capacity', def:'Max notional a strategy can trade before its own market impact erodes the edge. Definition: max notional before impact > fee + slippage + 0.5·edge.'},
+  {cat:'pipeline', term:'Claim', def:'A single falsifiable prediction extracted from a paper. Must carry a verbatim source_span. One paper yields many claims (per-claim decisions).'},
+  {cat:'pipeline', term:'Cold-start registry', def:'The module registry starts empty by design. Every module is created in response to a real paper requiring it.'},
+  {cat:'pipeline', term:'Decision', def:'The verdict on one claim: kill / watch / research-supported. Each has a kill_reason (if killed) and full metrics.'},
+  {cat:'pipeline', term:'DSR', def:'Deflated Sharpe Ratio. Sharpe deflated by trial count (multiple-testing correction). The more candidates screened, the higher the bar.'},
+  {cat:'pipeline', term:'Module spec generation', def:'When P6 finds no registered module, the system generates a ModuleSpec YAML for the operator to implement.'},
+  {cat:'pipeline', term:'Fee curve', def:'Polymarket fee: C·feeRate·p(1−p). Peaks at 50¢ (~1.8% crypto), →0 at tails. Structurally subsidizes structural strategies, penalizes directional coin-flips.'},
+  {cat:'pipeline', term:'Firewall', def:'Backtests author proposals; humans commit; dreaming and chat cannot author at all. Enforced via two-OAuth pattern.'},
+  {cat:'pipeline', term:'Holdout (locked)', def:'A final time window reserved for one-time validation. First call burns the lock; subsequent peeks refused.'},
+  {cat:'pipeline', term:'Kill', def:'A verdict that the claim did not survive the discipline stack. Every kill carries a kill_reason from the enum.'},
+  {cat:'pipeline', term:'Kill reason', def:'Enum tag explaining why a claim was killed: fee_curve, dedup, no_oos_edge, in_sample_only, negative_dsr, capacity_too_small, regime_fragile, data_unavailable, etc.'},
+  {cat:'pipeline', term:'regime_fragile', def:'Kill: a positive edge that collapses (keeps <25% of its per-trade edge) once its single best calendar regime — weekday/weekend, day-of-week, or intraday session — is removed. The signal is real but lives in one regime, so it is fragile in production. Each regime partition is also counted as a trial in the DSR deflation.'},
+  {cat:'pipeline', term:'Module', def:'An implementation of a testable strategy class. Lives at modules/<id>/impl.py. Discovered via __strategy_class__ aliases.'},
+  {cat:'pipeline', term:'ModuleSpec', def:'YAML document describing what a module should do: claim translation, inputs, signal logic, kill criterion, unknowns.'},
+  {cat:'pipeline', term:'Principle', def:'A generalization extracted from N≥3 kills with consistent kill_reason + strategy class. The compounding asset. Backed by supporting_kills.'},
+  {cat:'pipeline', term:'Proposal', def:'A P8 output queued in Action Required. Not yet committed to the brain. Awaits human approval at P9.'},
+  {cat:'pipeline', term:'Provenance', def:'Every atom carries source_id, source_span, model version, reviewer identity, timestamp. Typed-edge chain walkable in both directions.'},
+  {cat:'pipeline', term:'Regime-conditional', def:'(Planned) Splitting backtest results by regime (vol regime, weekday/weekend, trend). Patterns emerge from data — not pre-baked detection.'},
+  {cat:'pipeline', term:'Research-supported', def:'The strongest positive verdict. Survived all gates. Does NOT mean "go trade" — means external paper-trading warranted, out of Penrose scope.'},
+  {cat:'pipeline', term:'3-fold consistency', def:'Sharpe across three contiguous time folds. All must be same-sign to pass. Kills regime-fragile strategies.'},
+  {cat:'pipeline', term:'Watch', def:'Inconclusive verdict. OOS performance in the watch band (DSR 0.90–0.95) — not strong enough to promote, not weak enough to kill.'},
+  // Architecture terms
+  {cat:'architecture', term:'Brain', def:"Penrose's native knowledge store: a local SQLite store of atoms, typed edges, and embeddings. No external service is required."},
+  {cat:'architecture', term:'BrainReader', def:'Read-only brain client. Used by retrieval, dedup, dreaming, chat pre-flight. Cannot write.'},
+  {cat:'architecture', term:'Contract', def:'The data vocabulary Penrose uses to request data. Defines Series, Unavailable, DataBundle with provenance. The boundary between Penrose and the data service.'},
+  {cat:'architecture', term:'Data service', def:'A separate project that implements the data contract. Fetches from venues, stores, serves point-in-time. Penrose never touches venues directly.'},
+  {cat:'architecture', term:'Model layer', def:'LLM abstraction. Named roles map to providers/models via config. Swap by editing config. Budget caps + content-hash cache.'},
+  {cat:'architecture', term:'Write endpoint', def:'Localhost-only POST endpoint for chat submissions. Origin-validated + per-launch token. Writes to inbox/ only — never to brain/state.'},
+  {cat:'architecture', term:'PromotionClient', def:'Read-write brain client. Constructed ONLY after human approval at P9. The single knowledge-write path.'},
+  {cat:'architecture', term:'Sanitization', def:'All source text treated as untrusted data, never instructions. Injection patterns flagged. Never reaches a system-prompt slot.'},
+  {cat:'architecture', term:'Research engine', def:'Penrose is a research engine, not a trading engine. No execution path, no order placement, no live capital.'},
+  {cat:'architecture', term:'Local-first', def:'v1 runs on the operator machine. Docker only for the optional code sandbox; no cloud, no web auth, no billing.'},
+  // Data terms
+  {cat:'data', term:'As-of query', def:'A data request with a point-in-time constraint: "give me what was knowable at time T." Prevents look-ahead leakage.'},
+  {cat:'data', term:'Provenance (data)', def:'Every series carries a tag: coinbase-live, deribit-live, synthetic, kalshi-live. A verdict on synthetic data is tagged provisional.'},
+  {cat:'data', term:'Series', def:'One time series with provenance attached. The basic unit the data contract delivers.'},
+  {cat:'data', term:'Survivorship fix', def:'Recording market CREATION events, not just snapshots. Prevents survivorship bias in calibration and longshot studies.'},
+  {cat:'data', term:'Synthetic', def:'Generated data used when live data is unavailable. Tagged in provenance. Verdicts on synthetic inputs are provisional.'},
+  {cat:'data', term:'Unavailable', def:'Returned instead of a Series when the contract cannot be satisfied. Routed to Action Required. Never silently interpolated.'},
+];
+
+const PIPELINE_STAGES = [
+  {id:'P1', name:'Ingest', desc:'Read the paper. Extract text. Flag injection patterns. Source text is untrusted data.', kills:false},
+  {id:'P2', name:'Claim Extraction', desc:'LLM extracts falsifiable claims. Each MUST carry a verbatim source_span. No span = no claim.', kills:false},
+  {id:'P3', name:'Falsifiability', desc:'LLM routes: deterministic-testable, generated-module-testable, qualitative-only, or unfalsifiable (kill).', kills:true},
+  {id:'P4', name:'Fee-curve Filter', desc:'Computes fee at expected trading price. Kills anything whose edge sits below the fee. Free before any backtest.', kills:true},
+  {id:'P5', name:'Dedup', desc:'Embedding cosine similarity vs kill corpus. >0.92 = auto-kill, 0.75–0.92 = review, <0.75 = novel.', kills:true},
+  {id:'P6', name:'Module Routing', desc:'Check registry for matching module. If none, generate ModuleSpec. Pipeline continues — does not block.', kills:false},
+  {id:'P7', name:'Backtest', desc:'DSR + 3-fold + locked holdout + fee + slippage + capacity. The discipline stack.', kills:false},
+  {id:'P8', name:'Verdict + Principle', desc:'Produces proposed verdict (kill/watch/research-supported). If N≥3 kills with consistent reason → propose principle.', kills:false},
+  {id:'G5', name:'Corpus Advisory', desc:'Post-verdict mechanism-neighbor context from the corpus. Advisory only; it never changes labels.', kills:false},
+  {id:'P9', name:'Human Review', desc:'The COMMIT gate. Proposals sit in Action Required until approved. Only path to committed knowledge.', kills:false},
+];
+
+function renderGuide(){
+  let html = '';
+
+  // What Penrose is
+  html += '<div class="eyebrow">What Penrose is</div>';
+  html += '<div class="card">'+
+    '<p style="margin:0 0 10px;color:var(--tx)"><strong>Penrose</strong> is a research engine that tests falsifiable trading theses '+
+    'against historical data and accumulates the results as a compounding knowledge base.</p>'+
+    '<p style="margin:0;color:var(--tx2)">It is <strong>not</strong> a trading bot, signal service, or portfolio manager. '+
+    'It does not place orders, hold capital, or execute trades. '+
+    'The core thesis: most published strategies don\'t survive realistic costs. '+
+    'The value is in the <strong>principles extracted from why things fail</strong>.</p></div>';
+
+  // Pipeline stages
+  html += '<div class="eyebrow">The pipeline (P1–P9)</div>';
+  html += '<div class="card" style="padding:0">'+
+    '<table class="dt"><thead><tr><th>stage</th><th>name</th><th>what it does</th><th>can kill?</th></tr></thead><tbody>';
+  PIPELINE_STAGES.forEach(s=>{
+    html += '<tr>'+
+      '<td style="font-family:var(--mono);color:var(--cyan)">'+s.id+'</td>'+
+      '<td style="color:var(--tx);font-weight:600">'+esc(s.name)+'</td>'+
+      '<td style="color:var(--tx2);white-space:normal;max-width:400px">'+esc(s.desc)+'</td>'+
+      '<td>'+(s.kills?'<span class="vbadge kill">yes</span>':'<span style="color:var(--muted)">no</span>')+'</td>'+
+    '</tr>';
+  });
+  html += '</tbody></table></div>';
+
+  // Key concepts
+  html += '<div class="eyebrow">Key concepts</div>';
+  html += '<div class="statgrid" style="grid-template-columns:repeat(2,1fr)">'+
+    '<div class="card" style="margin:0"><h3 style="font-size:13px;color:var(--cyan)">Knowledge-write firewall</h3>'+
+    '<p style="margin:4px 0 0;font-size:12px;color:var(--tx2)">Backtests <strong>author</strong> proposals at P8. Humans <strong>commit</strong> at P9. '+
+    'Dreaming and chat <strong>cannot author at all</strong>. No unattended LLM ever writes knowledge.</p></div>'+
+    '<div class="card" style="margin:0"><h3 style="font-size:13px;color:var(--cyan)">Cold-start registry</h3>'+
+    '<p style="margin:4px 0 0;font-size:12px;color:var(--tx2)">Module registry ships empty. Every module is created in response to a real paper requiring it. '+
+    'No speculative modules.</p></div>'+
+    '<div class="card" style="margin:0"><h3 style="font-size:13px;color:var(--cyan)">Principles are the asset</h3>'+
+    '<p style="margin:4px 0 0;font-size:12px;color:var(--tx2)">Individual verdicts are one-off. Principles are generalizations from N≥3 kills '+
+    'with consistent reason + class. They compound and steer future evaluations.</p></div>'+
+    '<div class="card" style="margin:0"><h3 style="font-size:13px;color:var(--cyan)">Fee curve as filter</h3>'+
+    '<p style="margin:4px 0 0;font-size:12px;color:var(--tx2)">Polymarket fee peaks at 50¢ (~1.8%), →0 at tails. '+
+    'Structurally subsidizes structural/tail strategies and kills directional coin-flips for free.</p></div>'+
+  '</div>';
+
+  // Glossary (searchable)
+  html += '<div class="eyebrow">Glossary</div>';
+  html += '<div class="card" style="margin-bottom:10px">'+
+    '<input type="text" id="gloss-search" placeholder="search terms…" '+
+    'style="width:100%;background:var(--panel);border:1px solid var(--border);color:var(--tx);'+
+    'font-family:var(--sans);font-size:13px;padding:8px 12px;border-radius:6px;outline:none" '+
+    'oninput="filterGlossary(this.value)"/>'+
+    '</div>';
+  html += '<div id="gloss-body"></div>';
+
+  $('screen-guide').innerHTML = html;
+  renderGlossaryBody('');
+}
+
+function renderGlossaryBody(filter){
+  const f = (filter||'').toLowerCase().trim();
+  const cats = {pipeline:'Pipeline', architecture:'Architecture', data:'Data'};
+  const catColors = {pipeline:'var(--cyan)', architecture:'var(--blue)', data:'var(--amber)'};
+  let html = '';
+  let lastCat = '';
+  let shown = 0;
+  GLOSSARY.forEach(g=>{
+    if(f && !g.term.toLowerCase().includes(f) && !g.def.toLowerCase().includes(f)) return;
+    if(g.cat !== lastCat){
+      html += '<div class="eyebrow" style="margin-top:14px">'+cats[g.cat]+'</div>';
+      lastCat = g.cat;
+    }
+    html += '<div class="card" style="margin:0 0 6px;padding:10px 14px">'+
+      '<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">'+
+        '<span style="font-weight:600;color:var(--tx);font-size:13px">'+esc(g.term)+'</span>'+
+        '<span style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:'+catColors[g.cat]+';opacity:0.7">'+cats[g.cat]+'</span>'+
+      '</div>'+
+      '<div style="margin-top:3px;color:var(--tx2);font-size:12px;line-height:1.5">'+esc(g.def)+'</div>'+
+    '</div>';
+    shown++;
+  });
+  if(shown === 0){
+    html = '<div class="card"><div class="empty">No terms match "'+esc(filter)+'".</div></div>';
+  }
+  $('gloss-body').innerHTML = html;
+}
+window.filterGlossary = (v)=> renderGlossaryBody(v);
+
+/* ============================ screen switching ============================ */
+function switchScreen(key){
+  if(!SCREENS.some(s=>s.key===key)) return;
+  document.querySelectorAll('.navrow').forEach(r=> r.classList.toggle('active', r.dataset.scr===key));
+  document.querySelectorAll('.screen').forEach(s=> s.classList.remove('active'));
+  $('screen-'+key).classList.add('active');
+  const sc = SCREENS.find(s=>s.key===key);
+  $('scr-title').textContent = sc.title; $('scr-sub').textContent = sc.sub;
+  document.querySelector('.scroll').scrollTop = 0;
+  if(location.hash !== '#'+key) location.hash = key;   // deep-linkable (and screenshot-able) tabs
+}
+
+/* ============================ boot ============================ */
+$('badge-text').textContent = DATA.status_badge;
+renderNav(); renderHealth();
+function renderSupport(){
+  $('screen-support').innerHTML = `
+    <div class="card" style="max-width:680px">
+      <h3 style="margin-top:0">Suggest an enhancement</h3>
+      <p class="sub">Have an idea, a missing feature, or a bug? Tell us. This writes locally to
+        <code>feedback.jsonl</code> — nothing leaves your machine.</p>
+      <div style="margin:10px 0">
+        <select id="support-kind" style="padding:7px 9px;border-radius:8px;background:var(--panel,#111b2e);
+          color:inherit;border:1px solid var(--border,#1f3350)">
+          <option value="enhancement">Enhancement</option>
+          <option value="bug">Bug</option>
+          <option value="question">Question</option>
+        </select>
+      </div>
+      <textarea id="support-input" rows="6" placeholder="Describe your suggestion…"
+        style="width:100%;padding:10px;border-radius:8px;background:var(--panel,#111b2e);color:inherit;
+        border:1px solid var(--border,#1f3350);font:inherit"></textarea>
+      <div style="margin-top:10px">
+        <button class="btn" onclick="submitFeedback()">Submit suggestion</button>
+      </div>
+      <div id="support-status" class="sub" style="margin-top:10px"></div>
+    </div>`;
+}
+window.submitFeedback = async () => {
+  const text = (document.getElementById('support-input')||{}).value || '';
+  const kind = (document.getElementById('support-kind')||{}).value || 'enhancement';
+  const status = document.getElementById('support-status');
+  if(text.trim().length < 8){ if(status) status.textContent = 'Please add a few more words.'; return; }
+  try {
+    const token = await _fetchToken();
+    const r = await fetch('/submit-feedback', {
+      method:'POST',
+      headers:{'Content-Type':'application/json','X-Penrose-Token':token||''},
+      body: JSON.stringify({text, kind})
+    });
+    const j = await r.json();
+    if(j.ok){
+      document.getElementById('support-input').value = '';
+      if(status) status.innerHTML = '<span style="color:var(--green,#34d399)">✓ Thanks — logged to feedback.jsonl.</span>';
+    } else {
+      if(status) status.innerHTML = '<span style="color:var(--red,#f87171)">Failed: '+esc(j.error||'unknown')+'</span>';
+    }
+  } catch(e){
+    if(status) status.innerHTML = '<span style="color:var(--red,#f87171)">Failed: '+esc(String(e))+'</span>';
+  }
+};
+function renderCalibration(){
+  const c = DATA.calibration || {};
+  const ctrls = c.controls || [];
+  const dotFor = (s)=> s==='pass' ? 'var(--green,#34d399)' : (s==='fail' ? 'var(--red,#f87171)' : 'var(--muted,#6c819e)');
+  const cards = ctrls.map(x=>`
+    <div class="card" style="border-left:3px solid ${dotFor(x.status)};margin-bottom:12px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px">
+        <div style="font-weight:600;color:var(--tx,#dbe6f5)">${esc(x.name||'')}
+          <span style="font-size:11px;color:var(--muted,#6c819e);font-weight:400">· ${esc(x.kind||'')}</span></div>
+        <div style="font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:14px;color:${dotFor(x.status)}">${esc(x.metric||'—')}</div>
+      </div>
+      <div style="font-size:13px;color:var(--tx2,#9fb2cd);margin-top:7px;line-height:1.5">${esc(x.detail||'')}</div>
+    </div>`).join('');
+  $('screen-calibration').innerHTML = `
+    <div style="max-width:760px">
+      <div class="eyebrow" style="margin-bottom:6px">SELF-CALIBRATION</div>
+      <p class="sub" style="margin-top:0;color:var(--tx2,#9fb2cd);line-height:1.55">${esc(c.summary||'Penrose measures its own detector before any verdict is trusted.')}</p>
+      <div style="margin:16px 0 4px;font-size:11px;color:var(--muted,#6c819e)">Generated: ${esc(c.generated_at||'—')}</div>
+      ${cards || '<div class="sub">No calibration results yet — run the calibration battery (<code>make calib-placebo</code>, <code>calib-nulls</code>, …) and refresh <code>calibration.json</code>.</div>'}
+      ${c.caveat ? `<div style="font-size:12px;color:var(--muted,#6c819e);border-left:2px solid var(--border,#1f3350);padding:6px 0 6px 12px;margin-top:14px;line-height:1.5">${esc(c.caveat)}</div>` : ''}
+    </div>`;
+}
+// expand/collapse the "+N more" missing-data list
+window.toggleDataReq = (btn)=>{
+  const box = btn.parentElement; const extras = box.querySelectorAll('.dr-extra');
+  if(!extras.length) return;
+  const showing = extras[0].style.display !== 'none';
+  extras.forEach(e=>{ e.style.display = showing ? 'none' : 'inline-block'; });
+  btn.textContent = showing ? ('+'+extras.length+' more') : 'show less';
+};
+// click a run -> modal with its full report (everything about that run)
+function _ensureRunModal(){
+  let m = $('run-modal'); if(m) return m;
+  m = document.createElement('div'); m.id = 'run-modal';
+  m.style.cssText = 'display:none;position:fixed;inset:0;z-index:200;background:rgba(3,8,16,.80);backdrop-filter:blur(4px);align-items:flex-start;justify-content:center;padding:38px 18px;overflow:auto';
+  m.onclick = (e)=>{ if(e.target===m) closeRun(); };
+  m.innerHTML = '<div style="max-width:880px;width:100%;background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px 28px 28px;position:relative">'+
+    '<button onclick="closeRun()" title="close" style="position:absolute;top:12px;right:16px;background:none;border:none;color:var(--tx2);font-size:22px;cursor:pointer;line-height:1">×</button>'+
+    '<div id="run-modal-body" class="report" style="margin-top:6px"></div></div>';
+  document.body.appendChild(m); return m;
+}
+window.openRun = async (sid)=>{
+  if(!sid) return;
+  const m = _ensureRunModal(); const body = $('run-modal-body');
+  body.innerHTML = '<div class="meta" style="color:var(--tx2)">loading run '+esc(sid)+'…</div>';
+  m.style.display = 'flex';
+  try{
+    const r = await fetch('/report/'+encodeURIComponent(sid));
+    if(!r.ok){ body.innerHTML = '<div class="meta">No report on disk for <code>'+esc(sid)+'</code> (HTTP '+r.status+').</div>'; return; }
+    body.innerHTML = md2html(await r.text());
+  }catch(e){ body.innerHTML = '<div class="meta">Failed to load: '+esc(String(e))+'</div>'; }
+};
+window.closeRun = ()=>{ const m = $('run-modal'); if(m) m.style.display = 'none'; };
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeRun(); });
+
+renderOverview(); renderChat(); renderSources(); renderAction(); renderReports(); renderConnections(); renderGuide(); renderSupport(); renderCalibration();
+
+/* status dot: GREEN=a paper is processing · GRAY=nothing running · RED=blocked, needs
+   human intervention. (amber/yellow reserved — not used yet.) */
+/* dot colour conveys platform state:
+   GREEN=processing · YELLOW=needs attention · RED=problem · GRAY=idle */
+function setStatusDot(ps){
+  // The light conveys state by colour; the label is just "System status".
+  let cls = 'n';
+  if(ps === 'running'){ cls = 'g pulse'; }
+  else if(ps === 'error' || ps === 'blocked'){ cls = 'r'; }
+  else if(ps === 'action_required'){ cls = 'a'; }
+  const d = $('status-dot'); if(d){ d.className = 'dot '+cls; d.title = 'system status'; }
+  const t = $('badge-text'); if(t){ t.textContent = 'SYSTEM STATUS'; }
+}
+setStatusDot((window.__LIVE__||{}).pipeline_status);
+
+/* deep-linkable tabs — also lets headless screenshots target any tab via #hash */
+(function(){
+  const initKey = (location.hash||'').replace('#','');
+  if(SCREENS.some(s=>s.key===initKey)) switchScreen(initKey);
+  window.addEventListener('hashchange', ()=>{
+    const k=(location.hash||'').replace('#',''); if(SCREENS.some(s=>s.key===k)) switchScreen(k);
+  });
+})();
+
+/* auto-refresh: poll live.json; reload (preserving the tab via #hash) ONLY when a new
+   run lands. Paused while the tab is hidden, so it's near-zero CPU when you're away. */
+(function(){
+  const seen = DATA.updated_at;
+  setInterval(async ()=>{
+    if(document.visibilityState !== 'visible') return;
+    try{
+      const j = await (await fetch('/live.json',{cache:'no-store'})).json();
+      if(!j) return;
+      const running = !!(j.progress && j.progress.running);
+      setStatusDot(running ? 'running' : j.pipeline_status);   // live light
+      const ap = $('activity-panel');                          // live stage panel, no reload
+      if(ap) ap.innerHTML = renderActivity(j.progress);
+      // live nav lights (update the dot only — never touch the active highlight)
+      const od = document.querySelector('.navrow[data-scr="overview"] .dot');
+      if(od) od.className = 'dot '+(running ? 'g pulse' : 'slot');
+      const pend = (j.review_queue||[]).filter(r=>r.status==='pending').length;
+      const adRow = document.querySelector('.navrow[data-scr="action"]');
+      if(adRow){
+        const ad = adRow.querySelector('.dot'); if(ad) ad.className = 'dot '+(pend>0?'a':'slot');
+        const ac = adRow.querySelector('.ct'); if(ac) ac.textContent = pend||'';
+      }
+      // full reload only when a NEW run COMPLETES (updated_at changes AND nothing running)
+      if(!running && j.updated_at && j.updated_at !== seen) location.reload();
+    }catch(e){}
+  }, 8000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+%%{init: {'theme':'base','flowchart':{'htmlLabels':false},'themeVariables':{'fontFamily':'Helvetica, Arial, sans-serif','lineColor':'#6c819e','edgeLabelBackground':'#0a1525','primaryColor':'#16273f','primaryTextColor':'#e6edf3','primaryBorderColor':'#7c9af7','secondaryColor':'#1f3350','tertiaryColor':'#0a1525'}}}%%
+flowchart TD
+    A1[Paper / PDF]:::src --> B
+    A2[Submitted thesis]:::src --> B
+    A3[Code-complete strategy]:::src --> B
+    A4[Generated hypothesis]:::src --> B
+
+    B[Ingest and grounded extraction]:::proc --> C[Screen: relevance and falsifiability]:::proc
+    C --> D[Economic preflight and dedup]:::proc
+    D --> E{Route the claim}:::dec
+    E -->|known class| F[Trusted module]:::proc
+    E -->|novel| G[Reconstruct in Docker sandbox]:::proc
+    F --> H[Point-in-time data assembly]:::proc
+    G --> H
+    H --> I[Backtest harness]:::proc
+    I --> J["Robustness and power gates<br/>DSR · bootstrap · permutation<br/>regime · walk-forward · cost"]:::gates
+    J --> K{Verdict}:::dec
+
+    K --> KILL[kill]:::kill
+    K --> UP[underpowered]:::under
+    K --> W[watch]:::watch
+    K --> RS[research-supported]:::rs
+
+    RS -.->|confirm once| HO[(Locked holdout)]:::holdout
+    HO -.-> RS
+
+    KILL --> CORP[(Corpus of invalidations)]:::corpus
+    UP --> CORP
+    W --> CORP
+    CORP -.->|prior on new claims| D
+
+    RS --> AUTH[Human authorization]:::proc
+    AUTH --> REP[Report and dashboard]:::proc
+
+    USER([Researcher]):::user <--> PENNIE["Pennie<br/>chat research assistant"]:::pennie
+    CORP -.->|discovery-safe grounding| PENNIE
+    PENNIE -.->|drafts a falsifiable thesis, you confirm| A2
+
+    classDef user fill:#0e1c30,stroke:#9fb2cd,color:#dbe6f5,stroke-width:1px;
+    classDef pennie fill:#1b2350,stroke:#8b9cf0,color:#dfe4ff,stroke-width:1.5px;
+    classDef src fill:#13243d,stroke:#6c819e,color:#dbe6f5,stroke-width:1px;
+    classDef proc fill:#16273f,stroke:#7c9af7,color:#e6edf3,stroke-width:1px;
+    classDef gates fill:#1a2c49,stroke:#22d3ee,color:#eaf6fb,stroke-width:1.5px;
+    classDef dec fill:#1f3350,stroke:#9fb2cd,color:#f2f5f8,stroke-width:1px;
+    classDef kill fill:#3a1620,stroke:#f87171,color:#fecaca,stroke-width:1.5px;
+    classDef under fill:#3a2f12,stroke:#fbbf24,color:#fde68a,stroke-width:1.5px;
+    classDef watch fill:#16273f,stroke:#7c9af7,color:#cdd9f7,stroke-width:1.5px;
+    classDef rs fill:#0f2e22,stroke:#34d399,color:#a7f3d0,stroke-width:1.5px;
+    classDef holdout fill:#0c2c33,stroke:#22d3ee,color:#a5f3fc,stroke-width:1.5px;
+    classDef corpus fill:#241a3a,stroke:#a78bfa,color:#ddd6fe,stroke-width:1.5px;

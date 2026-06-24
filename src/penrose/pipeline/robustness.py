@@ -1,0 +1,367 @@
+"""Empirical robustness tests for P7 (the Monte-Carlo + walk-forward layer).
+
+penrose's analytic guards (DSR, PSR) are asymptotic approximations that are least
+reliable in exactly the regime we now operate in: small samples (tens of trades)
+and fat tails (vol / PM / crypto returns). These functions add the empirical,
+assumption-light complement:
+
+  * block_bootstrap   — stationary-block resample of the OOS per-trade returns.
+                        Gives a Sharpe / edge confidence interval and a drawdown
+                        distribution without assuming normality. The verdict can
+                        then KILL when the edge CI includes zero.
+  * permutation_test  — shuffles the signal-vs-payoff alignment to build the null
+                        of "no predictive relationship" (honest data-snooping
+                        guard; complements DSR's crude trial-count deflation).
+  * walk_forward_vol  — rolling / anchored re-fit of the z-score vol strategy,
+                        instead of one static IS/OOS cut. Catches parameter drift
+                        the single split misses.
+  * capacity_ci       — bootstrap CI on capacity, so it is a range not a point.
+
+Pure numpy / pandas; no harness coupling. Deterministic given a seed.
+"""
+from __future__ import annotations
+
+import math
+
+import numpy as np
+import pandas as pd
+
+
+# --------------------------------------------------------------------------- #
+def _stationary_indices(n: int, block: int, rng: np.random.Generator) -> np.ndarray:
+    """Politis-Romano stationary bootstrap indices (geometric block lengths,
+    wrap-around). Preserves serial dependence; reduces to iid resampling at block=1."""
+    idx = np.empty(n, dtype=int)
+    p = 1.0 / max(1, block)
+    cur = int(rng.integers(n))
+    for t in range(n):
+        idx[t] = cur
+        if rng.random() < p:
+            cur = int(rng.integers(n))
+        else:
+            cur = (cur + 1) % n
+    return idx
+
+
+def _max_drawdown(r: np.ndarray) -> float:
+    """Max peak-to-trough of the additive equity curve (positive magnitude)."""
+    if len(r) == 0:
+        return 0.0
+    eq = np.cumsum(r)
+    peak = np.maximum.accumulate(eq)
+    return float(np.max(peak - eq))
+
+
+# Capped sentinel for a deterministic (zero-variance) edge. A real annualized
+# Sharpe never legitimately reaches this, so it reads as "deterministic edge"
+# downstream while staying finite (no inf/NaN to crash percentiles / JSON).
+_SHARPE_DETERMINISTIC = 1.0e6
+
+
+def _sharpe(r: np.ndarray, bpy: float) -> float:
+    """Annualized Sharpe of a per-bar return series.
+
+    std==0 is NOT "no edge": a deterministic positive series has a real (infinite)
+    Sharpe. We distinguish the cases so a constant-positive regime is not silently
+    treated as zero-edge by the fragility / bootstrap lenses:
+      * len<2            -> 0.0 (undefined)
+      * std==0, mean>0   -> +capped sentinel  (deterministic positive edge)
+      * std==0, mean<0   -> -capped sentinel  (deterministic loss)
+      * std==0, mean==0  -> 0.0 (genuinely no edge)
+    """
+    if len(r) < 2:
+        return 0.0
+    sd = r.std(ddof=1)
+    if sd > 0:
+        return float(r.mean() / sd * math.sqrt(bpy))
+    mean = float(r.mean())
+    if mean > 0:
+        return _SHARPE_DETERMINISTIC
+    if mean < 0:
+        return -_SHARPE_DETERMINISTIC
+    return 0.0
+
+
+# --------------------------------------------------------------------------- #
+def block_bootstrap(net, bars_per_year: float, n_boot: int = 2000,
+                    ci: float = 0.90, block: int | None = None,
+                    seed: int = 0) -> dict:
+    """Stationary-block bootstrap of per-trade net returns.
+
+    Returns the edge (mean) and Sharpe CIs, P(edge>0), and a drawdown
+    distribution. `edge_ci_includes_zero` is the verdict-hardening flag: if the
+    CI straddles zero, the OOS edge is not distinguishable from luck.
+    """
+    net = np.asarray(net, dtype=float)
+    net = net[~np.isnan(net)]
+    n = len(net)
+    if n < 10:
+        return {"note": "too few trades for bootstrap", "n": n,
+                "edge_ci_includes_zero": None}
+    b = block or max(1, round(math.sqrt(n)))
+    rng = np.random.default_rng(seed)
+    sh = np.empty(n_boot)
+    ed = np.empty(n_boot)
+    dd = np.empty(n_boot)
+    for k in range(n_boot):
+        s = net[_stationary_indices(n, b, rng)]
+        sh[k] = _sharpe(s, bars_per_year)
+        ed[k] = s.mean()
+        dd[k] = _max_drawdown(s)
+    lo_q, hi_q = (1 - ci) / 2 * 100, (1 + ci) / 2 * 100
+    edge_lo, edge_hi = np.percentile(ed, [lo_q, hi_q])
+    return {
+        "n_boot": n_boot, "block": b, "ci": ci,
+        "edge_ci": [round(float(edge_lo), 5), round(float(edge_hi), 5)],
+        "edge_ci_includes_zero": bool(edge_lo <= 0.0 <= edge_hi),
+        "p_edge_gt0": round(float((ed > 0).mean()), 4),
+        "sharpe_ci": [round(float(np.percentile(sh, lo_q)), 3),
+                      round(float(np.percentile(sh, hi_q)), 3)],
+        "p_sharpe_gt0": round(float((sh > 0).mean()), 4),
+        "boot_psr": round(float((sh > 0).mean()), 4),     # empirical analog of PSR
+        "drawdown_median": round(float(np.median(dd)), 5),
+        "drawdown_p95": round(float(np.percentile(dd, 95)), 5),
+    }
+
+
+# --------------------------------------------------------------------------- #
+def permutation_test(position_signed, payoff, cost_frac: float,
+                     n_perm: int = 2000, seed: int = 0) -> dict:
+    """Data-snooping null: is the signal->payoff ALIGNMENT better than chance?
+
+    This is a test of SIGNAL-PAYOFF ALIGNMENT SIGNIFICANCE, NOT of post-cost
+    profitability. Profitability (after costs) is the job of DSR / edge / the
+    bootstrap edge CI — not of this test.
+
+    position_signed : per-trade signed position (the signal's directional bet)
+    payoff          : per-trade raw payoff per unit (e.g. realized_vol - implied_vol)
+
+    We measure alignment = mean(position * payoff). The per-trade cost term
+    (|position|*cost_frac) is IDENTICAL under every payoff permutation, so it
+    cancels exactly and cannot move the p-value — including it only created the
+    false impression that this guarded profitability. We therefore omit it.
+    `cost_frac` is accepted for call-site compatibility but is intentionally
+    unused here. We shuffle payoff against position to break any real
+    relationship and recompute the mean alignment; p = fraction of shuffles that
+    match or beat the observed alignment. High p => the signal's direction is
+    indistinguishable from betting randomly relative to outcomes.
+    """
+    del cost_frac  # intentionally unused: cost is inert under permutation (see docstring)
+    pos = np.asarray(position_signed, dtype=float)
+    pay = np.asarray(payoff, dtype=float)
+    m = ~(np.isnan(pos) | np.isnan(pay))
+    pos, pay = pos[m], pay[m]
+    n = len(pos)
+    if n < 10:
+        return {"note": "too few trades for permutation", "n": n, "p_value": None}
+    observed = float((pos * pay).mean())
+    rng = np.random.default_rng(seed)
+    ge = 0
+    for _ in range(n_perm):
+        align = float((pos * pay[rng.permutation(n)]).mean())
+        if align >= observed:
+            ge += 1
+    return {"n_perm": n_perm,
+            "tests": "signal-payoff alignment significance (NOT post-cost "
+                     "profitability; DSR/edge/bootstrap cover that)",
+            "observed_alignment": round(observed, 6),
+            "p_value": round((ge + 1) / (n_perm + 1), 4)}   # +1 smoothing
+
+
+# --------------------------------------------------------------------------- #
+def capacity_ci(net, positions: pd.DataFrame, bars_per_year: float,
+                impact_bps_per_1m: float, n_boot: int = 500, ci: float = 0.90,
+                seed: int = 1) -> dict | None:
+    """Bootstrap CI on capacity (notional where linear impact erases the edge),
+    so the principle records a range, not a single fragile point."""
+    net = np.asarray(net, dtype=float)
+    net = net[~np.isnan(net)]
+    n = len(net)
+    if n < 10 or impact_bps_per_1m <= 0:
+        return None
+    turn_bar = positions.diff().abs().sum(axis=1).dropna().mean()
+    if not turn_bar or turn_bar <= 0:
+        return None
+    impact_per_dollar = (impact_bps_per_1m / 1e4) / 1e6
+    turn_ann = turn_bar * bars_per_year
+    b = max(1, round(math.sqrt(n)))
+    rng = np.random.default_rng(seed)
+    caps = []
+    for _ in range(n_boot):
+        ann = net[_stationary_indices(n, b, rng)].mean() * bars_per_year
+        if ann > 0:
+            caps.append(ann / (turn_ann * impact_per_dollar))
+    p_positive_edge = round(len(caps) / n_boot, 3)
+    if not caps:
+        return {"note": "edge non-positive in ALL resamples; capacity undefined",
+                "p_positive_edge": p_positive_edge,
+                "conditional_on_positive_edge": True}
+    lo_q, hi_q = (1 - ci) / 2 * 100, (1 + ci) / 2 * 100
+    out = {"ci": ci, "p_positive_edge": p_positive_edge,
+           "capacity_lo": int(round(np.percentile(caps, lo_q), -3)),
+           "capacity_median": int(round(np.median(caps), -3)),
+           "capacity_hi": int(round(np.percentile(caps, hi_q), -3))}
+    # The CI is computed ONLY over positive-edge resamples. When a meaningful
+    # fraction of resamples had no capacity at all (negative/zero edge), the
+    # reported range is CONDITIONAL on the edge being positive and overstates
+    # robustness. Flag it rather than fabricating capacity for those resamples.
+    if p_positive_edge < 0.90:
+        out["conditional_on_positive_edge"] = True
+        out["note"] = (f"capacity CI is CONDITIONAL on a positive edge: only "
+                       f"{p_positive_edge:.0%} of resamples had any capacity "
+                       f"(the rest had non-positive edge and zero capacity)")
+    else:
+        out["conditional_on_positive_edge"] = False
+    return out
+
+
+# --------------------------------------------------------------------------- #
+def walk_forward_vol(frame: pd.DataFrame, hold_days: int = 5, cost_frac: float = 0.0008,
+                     n_windows: int = 4, scheme: str = "anchored",
+                     is_min: float = 0.30) -> dict:
+    """Rolling / anchored walk-forward of the z-score vol strategy.
+
+    Mirrors the macro_vol module's logic (standardize signal on the TRAIN window,
+    trade non-overlapping `hold_days` entries on the TEST window), but re-fits the
+    (mu, sigma) standardization as the window rolls instead of fitting once. Frame
+    columns: `signal`, `fut_rv` (realized vol over the next hold_days), `iv`
+    (implied vol at entry). Returns per-window and aggregate OOS Sharpe.
+    """
+    cols = {"signal", "fut_rv", "iv"}
+    if not cols.issubset(frame.columns):
+        return {"note": f"frame needs columns {cols}", "consistent": False}
+    df = frame.dropna(subset=list(cols)).reset_index(drop=True)
+    n = len(df)
+    entries = np.arange(0, n - hold_days, hold_days)
+    cut0 = int(n * is_min)
+    test_entries = [int(e) for e in entries if e >= cut0]
+    if len(test_entries) < n_windows * 3:
+        return {"note": "too few non-overlapping trades for walk-forward",
+                "n_trades": len(test_entries), "consistent": False}
+    sig = df["signal"].to_numpy()
+    rv = df["fut_rv"].to_numpy()
+    iv = df["iv"].to_numpy()
+    segs = [s for s in np.array_split(test_entries, n_windows) if len(s)]
+    oos, per = [], []
+    for seg in segs:
+        train_end = int(seg[0])
+        if scheme == "rolling":
+            train_start = max(0, train_end - cut0)
+        else:                                   # anchored / expanding
+            train_start = 0
+        tr = sig[train_start:train_end]
+        if len(tr) < 5 or tr.std(ddof=1) == 0:
+            per.append(None); continue
+        mu, sd = tr.mean(), tr.std(ddof=1)
+        seg_net = []
+        for e in seg:
+            z = float(np.clip((sig[e] - mu) / sd, -1, 1))
+            seg_net.append(z * (rv[e] - iv[e]) - abs(z) * cost_frac)
+        seg_net = np.asarray(seg_net)
+        oos.extend(seg_net.tolist())
+        per.append(round(_sharpe(seg_net, 365 / hold_days), 3) if len(seg_net) > 1 else None)
+    oos = np.asarray(oos)
+    valid = [p for p in per if p is not None]
+    return {
+        "scheme": scheme, "n_windows": len(segs), "hold_days": hold_days,
+        "per_window_sharpe": per,
+        "oos_sharpe": round(_sharpe(oos, 365 / hold_days), 3) if len(oos) > 1 else None,
+        "consistent": bool(valid) and all(p > 0 for p in valid),
+        "n_trades": int(len(oos)),
+    }
+
+
+# --------------------------------------------------------------------------- #
+def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=None) -> dict:
+    """STRICT regime kill-lens (Punisher's lesson: most bots die to regime, not signal).
+
+    Partition the per-trade net series by EXOGENOUS calendar regime (weekday/weekend,
+    day-of-week — derived from the trade timestamps, never from the returns) and ask
+    one question: does the edge survive when its single best regime is removed? If a
+    positive overall edge collapses to <= 0 without one bucket, the edge is concentrated
+    in a regime and is fragile -> a KILL.
+
+    `extra_schemes` (optional): dict[name -> date->label pd.Series] of PRE-REGISTERED, point-in-time
+    MARKET-regime labels (e.g. vol_regime / trend_regime from penrose.regime). Aligned to the trade
+    dates and added as partition schemes — so the lens also catches edges concentrated in one VOL or
+    TREND regime, a fragility the calendar-only partition is blind to. These labels are trailing-only
+    (no look-ahead) and exogenous, so partitioning by them is not data-snooping; each populated bucket
+    still inflates n_partitions (the DSR trial count), so surfacing them is never a free pass.
+
+    This is deliberately falsification-only: it never SELECTS a regime to trade (that
+    would be data snooping — exactly how 500 backtested bots died live). `n_partitions`
+    is the count of populated buckets examined; P7 folds it into the DSR trial count so
+    surfacing per-regime Sharpes can never become a free pass.
+
+    Granularity scales with the data: daily series -> weekday/weekend + day-of-week.
+    Intraday session regimes activate automatically once the index carries intraday
+    timestamps (more buckets, same logic).
+    """
+    s = pd.Series(net).dropna()
+    if not isinstance(s.index, pd.DatetimeIndex) or len(s) < max(20, 3 * min_bucket):
+        return {"applicable": False, "n_partitions": 0, "fragile": False}
+    vals = s.values.astype(float)
+    overall = float(vals.mean())
+    dow = np.asarray(s.index.dayofweek)
+    has_intraday = bool((np.asarray(s.index.hour) != 0).any())
+    schemes_def = {
+        "weekend": np.where(dow >= 5, "weekend", "weekday"),
+        "day_of_week": np.array(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])[dow],
+    }
+    if has_intraday:                              # only meaningful with intraday stamps
+        hr = np.asarray(s.index.hour)
+        schemes_def["session"] = np.select(
+            [hr < 8, hr < 16], ["asia", "europe"], default="us")
+    # Pre-registered point-in-time MARKET-regime labels (vol/trend), aligned to the trade dates.
+    # Trades whose date has no label become "unknown" (its own bucket; min_bucket gates it out if thin).
+    # H-001: normalize BOTH the trade index and each label index to tz-aware UTC before reindex. A
+    # tz-naive trade index vs tz-aware UTC labels (or vice-versa) reindexes to ALL-NaN -> every trade
+    # falls to "unknown" -> the vol/trend partition is silently dropped (degraded falsification, no
+    # error). Normalizing both first makes the lens fire whenever the dates actually overlap.
+    def _utc(idx):
+        idx = pd.DatetimeIndex(idx)
+        return idx.tz_localize("UTC") if idx.tz is None else idx.tz_convert("UTC")
+    trade_idx = _utc(s.index)
+    for name, lab_series in (extra_schemes or {}).items():
+        try:
+            lab = pd.Series(lab_series)
+            lab.index = _utc(lab.index)
+            aligned = lab.reindex(trade_idx)
+            schemes_def[name] = aligned.where(aligned.notna(), "unknown").astype(str).values
+        except Exception:  # noqa: BLE001
+            continue
+
+    # Fragile if removing the single best regime leaves < SURVIVAL_FRAC of the per-trade
+    # edge (i.e. the edge was carried by one regime). Strict, but trial-count deflation
+    # is a second independent layer, so this only needs to catch clear concentration.
+    SURVIVAL_FRAC = 0.25
+    schemes, n_partitions, fragile, reason = {}, 0, False, None
+    for name, labels in schemes_def.items():
+        buckets = {}
+        for lab in pd.unique(labels):
+            r = vals[labels == lab]
+            # NOTE: do NOT require std>0. A zero-variance bucket (e.g. a weekend
+            # bucket of constant positive returns) is EXACTLY the concentration
+            # this fragility lens exists to catch; dropping it made that
+            # concentration invisible. _sharpe handles std==0 via a capped
+            # sentinel, so no div-by-zero arises.
+            if len(r) >= min_bucket:
+                buckets[str(lab)] = {"n": int(len(r)),
+                                     "sharpe": round(_sharpe(r, bars_per_year), 3),
+                                     "edge": round(float(r.mean()), 6)}
+        if len(buckets) >= 2:
+            schemes[name] = buckets
+            n_partitions += len(buckets)
+            if overall > 0 and not fragile:       # drop-the-best fragility test
+                contrib = {lab: float(vals[labels == lab].sum()) for lab in buckets}
+                best = max(contrib, key=contrib.get)
+                rest = vals[labels != best]
+                rest_edge = float(rest.mean()) if len(rest) >= min_bucket else 0.0
+                if rest_edge <= SURVIVAL_FRAC * overall:
+                    fragile = True
+                    reason = (f"edge concentrated in '{best}' ({name}): only "
+                              f"{rest_edge:.5f}/trade survives without it "
+                              f"({rest_edge / overall * 100:.0f}% of {overall:.5f})")
+    return {"applicable": True, "overall_edge": round(overall, 6),
+            "schemes": schemes, "n_partitions": int(n_partitions),
+            "fragile": bool(fragile), "fragile_reason": reason}

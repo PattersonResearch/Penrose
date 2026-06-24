@@ -1,0 +1,12 @@
+{
+  "generated_at": "2026-06-22 (live run)",
+  "summary": "Penrose measures its own detector before any verdict is trusted: specificity (does it reject noise?) and sensitivity (can it find a real edge, and how strong must it be?), on real BTC returns.",
+  "controls": [
+    {"key": "placebo", "name": "Placebo · negative control", "kind": "specificity", "status": "pass", "metric": "0 / 100 certified", "detail": "No-edge AR(1) signals on real returns at zero cost; DSR-over-noise p95 = 0.91 (below the 0.95 bar). 4/100 reached soft 'watch'. A pass can only come from the statistical gates rejecting noise."},
+    {"key": "nulls", "name": "5-null battery", "kind": "specificity", "status": "pass", "metric": "0 / 300 certified", "detail": "white-noise · regime-vol · bid-ask-bounce · zero-alpha · GARCH — each strips signal but keeps a data mechanic naive backtests mistake for edge. None certified."},
+    {"key": "injection", "name": "Injection · positive control", "kind": "sensitivity", "status": "pass", "metric": "certify ≈ IC 0.15 (single-asset)", "detail": "IC=0 certifies 0% (specificity holds); the certify path is reachable under measured costs. The output is a detection curve, not a pass/fail."},
+    {"key": "breadth", "name": "Native breadth", "kind": "sensitivity", "status": "pass", "metric": "floor 0.18 (N=1) → 0.02 (N=100)", "detail": "IR = IC·√breadth. The certify-IC floor falls ~1/√N cross-sectionally, pulling realistic 0.03–0.05 edges from 'underpowered' into testable — why 'underpowered' is a power artifact, not a blind spot."},
+    {"key": "sensitivity", "name": "Sensitivity sweep", "kind": "sensitivity", "status": "pass", "metric": "1yr 0.20 → 11yr 0.08; ≥20bps → 0.20", "detail": "The single-asset detection floor as a function of the power levers: it falls with sample size and rises with cost — a defensible curve, not a single number."}
+  ],
+  "caveat": "Preliminary engineering controls, not yet field-level calibrated error rates. The null battery is finite and partly synthetic; the injection/breadth thresholds use a specific injected data-generating process; some results are cost-assumption dependent. Reruns from a frozen artifact are on the roadmap before publication."
+}

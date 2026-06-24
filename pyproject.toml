@@ -1,0 +1,47 @@
+# Packaging manifest. Enables `pip install -e .` (editable, from a clone) and, once published,
+# `pip install penrose`. Declares dependencies so pip pulls them automatically, defines optional
+# extras, and is where the future `penrose` CLI command will be wired.
+#
+# OPEN DECISIONS (flagged, not assumed): PyPI distribution name (`penrose` may be taken), the
+# license string below, and author metadata.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "penrose"
+version = "0.1.0"
+description = "Falsification-first research pipeline: ingest trading-strategy papers, test their claims under a robustness stack (deflated Sharpe, 3-fold, locked holdout, fee curve), and emit trustworthy verdicts."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Charles Patterson", email = "charles.s.patterson@gmail.com" }]
+
+# REQUIRED core — the minimal set penrose needs to import and run on synthetic data with no key.
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.9",           # norm.cdf/ppf for the deflated/probabilistic Sharpe (vendored stats)
+    "pyarrow>=10",          # parquet: sandbox IPC + catalog series reads
+    "pypdf>=4.0",           # P1: extract text from a paper PDF
+    "pyyaml>=6.0",          # module specs / catalog yaml
+]
+
+# OPTIONAL extras — e.g. `pip install "penrose[charts]"`. Each feature degrades gracefully if
+# absent (no key -> no-LLM stub; no matplotlib -> charts skipped; no databento -> adapter absent).
+[project.optional-dependencies]
+charts = ["matplotlib>=3.6"]         # equity-curve PNGs for the dashboard
+databento = ["databento>=0.30"]      # BYO point-in-time market-data adapter
+embed = ["fastembed>=0.3"]           # optional in-process corpus/vector retrieval
+test = ["pytest>=7"]
+
+# The `penrose` command (penrose/cli.py).
+[project.scripts]
+penrose = "penrose.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]                      # penrose lives under src/penrose
+
+[tool.setuptools.package-dir]
+"" = "src"
