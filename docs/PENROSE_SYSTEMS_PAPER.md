@@ -20,7 +20,7 @@ This paper focuses on the complete system rather than proposing the underlying e
 
 **JEL classification:** C12, C18, C52, C63, G11, G12
 
-**Code and artifact availability.** The reference implementation is open source at https://github.com/PattersonResearch/Penrose; all results in this paper were prepared against the v0.1.0 release. The keyless core (`pip install -e .`) reproduces the evaluation-invariant suite (`python scripts/eval_suite.py`, 82/82), the unit tests (`python -m pytest`, 77 passed / 1 skipped in the public distribution), and the deterministic process-conditional worked example (`scripts/worked_example_process_conditional.py`) — none of which require an API key, network access, or external data. The application studies (published-anomaly and machine-generated-factor referee runs) additionally require external datasets and credentials documented in the release. The companion paper, *A Power-Aware Evidence Standard for Empirical Investment-Performance Claims* (FPES), specifies the implementation-neutral evidence protocol that this system operationalizes.
+**Code and artifact availability.** The reference implementation is open source at https://github.com/PattersonResearch/Penrose. The reproducible core of this paper — the evaluation-invariant suite, the calibration controls, and the deterministic process-conditional worked example — is current as of the v0.2.0 release and was re-measured against it. The keyless core (`pip install -e .`) reproduces the evaluation-invariant suite (`python scripts/eval_suite.py`, 93/93), the unit tests (`python -m pytest`, 137 passed / 2 skipped in the public distribution), and the deterministic process-conditional worked example (`scripts/worked_example_process_conditional.py`) — none of which require an API key, network access, or external data. The application studies (the published-anomaly and machine-generated-factor referee runs) were prepared against the v0.1.0 release and additionally require external datasets and credentials documented in the release; they were not re-run under v0.2.0. The v0.2.0 changes only tighten verdicts (stricter, order-independent deflation plus added robustness gates), so those reported kills stand. The companion paper, *A Power-Aware Evidence Standard for Empirical Investment-Performance Claims* (FPES), specifies the implementation-neutral evidence protocol that this system operationalizes.
 
 ## 1. Introduction
 
@@ -101,7 +101,7 @@ The implementation follows seven principles.
 
 ### 3.1 Local-first deployment
 
-Penrose 0.1 is a Python 3.9+ local application packaged through `pyproject.toml`. Its core dependencies are NumPy, pandas, SciPy, PyArrow, pypdf, and PyYAML. Matplotlib, Databento, Docker, and LLM access are feature-specific dependencies. The knowledge store is a native SQLite component of the standard library and requires no external service, runtime, or network. The installed `penrose` command exposes paper evaluation, verdict inspection, data-blocker inspection, status, calibration, planted-strategy evaluation, and registered hypothesis generation.
+Penrose 0.2 is a Python 3.9+ local application packaged through `pyproject.toml`. Its core dependencies are NumPy, pandas, SciPy, PyArrow, pypdf, and PyYAML. Matplotlib, Databento, Docker, and LLM access are feature-specific dependencies. The knowledge store is a native SQLite component of the standard library and requires no external service, runtime, or network. The installed `penrose` command exposes paper evaluation, verdict inspection, data-blocker inspection, status, calibration, planted-strategy evaluation, and registered hypothesis generation.
 
 The current system is optimized for a single researcher operating a local workspace. State is stored in files:
 
@@ -230,6 +230,8 @@ Optional outputs activate additional tests:
 - `prices` or `regime_schemes` can supply additional point-in-time regime partitions.
 
 If required data are absent, the module must return a structured `data_unavailable` result. It is instructed not to invent data or access undeclared resources.
+
+As of v0.2.0, module generation is faithful to claim type: claims are routed by type — descriptive, trading-strategy, or structural — so that a descriptive claim is implemented as a statistic test rather than forced into a trading backtest, and only claims that are genuinely about a tradeable rule are evaluated as one. An optional independent fidelity verifier, routed to a second model provider, can additionally check that the generated module matches the claim type and proposition (see §5.8).
 
 ### 5.3 Static checks
 
@@ -376,11 +378,15 @@ The ledger:
 - counts duplicates, conceptual candidates, data blockers, and failed implementations through the cohort denominator;
 - adds populated regime partitions as additional looks.
 
+As of v0.2.0 the DSR multiple-testing denominator is pre-registered as a per-family cohort before evaluation rather than accumulated from a running trial count during the run. This is an order-independent correctness fix: the deflation a claim faces no longer depends on the order in which siblings happened to be evaluated. The change only tightens — it removes a path by which an early-evaluated claim could be deflated against a smaller denominator than its later-evaluated family members.
+
 Family scoping avoids making an unrelated weather claim pay for every crypto experiment. It also introduces a policy choice: the correct family is not identifiable from code alone. Reports should therefore disclose the chosen scope and, for research use, include sensitivity to narrower and wider denominators.
 
 ### 7.3 Three-fold sign stability
 
 The non-holdout sample is divided into three contiguous folds. All three must have positive Sharpe. This detects effects concentrated in one temporal segment and is treated as a structural failure rather than a low-power null.
+
+As of v0.2.0 the engine adds combinatorial purged cross-validation (CPCV, López de Prado) as an independent robustness axis: the non-holdout sample is split into multiple groups whose train/test combinations are evaluated with purging and embargoing between adjacent observations, so an apparent edge must survive across many recombined train/test partitions rather than a single chronological fold ordering.
 
 ### 7.4 Stationary block bootstrap
 
@@ -413,6 +419,8 @@ The regime lens partitions the non-holdout stream by exogenous calendar buckets 
 - preregistered volatility and trend states when available.
 
 It then drops the single best bucket. If less than 25% of the overall per-trade edge remains, the strategy is marked regime-fragile. The lens does not select a preferred regime for trading; it is a falsification test. Each populated bucket increases the trial count.
+
+As of v0.2.0 a claim may also pre-register a declared regime scope: rather than being penalized for not working in every state, a claim can declare the regime within which it is asserted to hold and be tested inside that declared scope. This is adherence-gated — the declaration is honored only when the strategy actually confines its activity to the declared regime, so a claim cannot quietly trade outside its stated scope while still receiving the narrower test.
 
 One known issue remains in the repository roadmap: timezone mismatch between a naive trade index and UTC regime labels can silently prevent some optional regime partitions from being applied. Calendar partitions remain available, but this degradation should be fixed and tested before relying on all advertised market-state cuts.
 
@@ -635,7 +643,7 @@ The experimental scripts are included with the repository, but not every reporte
 
 ### 13.1 Planted-strategy evaluation
 
-`scripts/eval_suite.py` supplies strategies with known qualitative behavior to test system invariants and discrimination. Repository records report 82/82 evaluation invariants passing (June 2026), together with 77 passing pytest tests (1 skipped, requiring optional dependencies) in the public distribution. These checks cover pipeline and security invariants as well as statistical behavior; they are not 82 independent scientific experiments.
+`scripts/eval_suite.py` supplies strategies with known qualitative behavior to test system invariants and discrimination. Repository records report 93/93 evaluation invariants passing (June 2026), together with 137 passing pytest tests (2 skipped, requiring optional dependencies) in the public distribution. These checks cover pipeline and security invariants as well as statistical behavior; they are not 93 independent scientific experiments.
 
 ### 13.2 Placebo specificity
 

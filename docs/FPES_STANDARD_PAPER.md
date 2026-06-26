@@ -19,7 +19,7 @@ We define evidence levels for reproduced, statistically supported, economically 
 
 **JEL classification:** C12, C18, C52, G11, G12, G14
 
-**Code and artifact availability.** A conforming reference implementation, Penrose, is open source at https://github.com/PattersonResearch/Penrose (v0.1.0). The keyless core reproduces its calibration controls and a deterministic process-conditional worked example without an API key or external data; the application figures cited in §9 additionally require external datasets documented in the release and should be rerun from a frozen public artifact.
+**Code and artifact availability.** A conforming reference implementation, Penrose, is open source at https://github.com/PattersonResearch/Penrose (v0.2.0). The keyless core reproduces its calibration controls and a deterministic process-conditional worked example without an API key or external data; the application figures cited in §9 additionally require external datasets documented in the release and should be rerun from a frozen public artifact.
 
 ---
 
