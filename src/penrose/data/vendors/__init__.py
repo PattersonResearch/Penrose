@@ -33,7 +33,8 @@ EXPERIMENTAL skeletons until verified against a live key.
 """
 from __future__ import annotations
 
-from . import alpaca, alphavantage, fred, polygon, tiingo
+from ..contract import _norm_key, _unique_alias_hit
+from . import alpaca, alphavantage, fred, polygon, stooq, tiingo
 
 # Adapter registry: NAME -> module. Each module implements the protocol above.
 ADAPTERS = {
@@ -42,6 +43,7 @@ ADAPTERS = {
     tiingo.NAME: tiingo,
     alpaca.NAME: alpaca,
     alphavantage.NAME: alphavantage,
+    stooq.NAME: stooq,
 }
 
 # Logical bundle key -> {"vendor": <NAME>, ...vendor-specific spec}.
@@ -67,6 +69,26 @@ DEFAULT_SERIES: dict[str, dict] = {
         "symbol": "SPY",
         "field": "4. close",
         "outputsize": "compact",
+        "unit": "usd",
+    },
+    # Stooq keyless long-history ETF closes. These are additive and never override
+    # the Alpha Vantage SPY logical key above.
+    "us_equity_spy_stooq": {
+        "vendor": "stooq",
+        "symbol": "spy.us",
+        "field": "close",
+        "unit": "usd",
+    },
+    "us_equity_qqq_stooq": {
+        "vendor": "stooq",
+        "symbol": "qqq.us",
+        "field": "close",
+        "unit": "usd",
+    },
+    "us_equity_iwm_stooq": {
+        "vendor": "stooq",
+        "symbol": "iwm.us",
+        "field": "close",
         "unit": "usd",
     },
 }
@@ -128,3 +150,36 @@ def add_vendor_series(bundle) -> None:
                 note=f"vendor:{mod.NAME}:{key}")
         except Exception:  # noqa: BLE001 — one bad series never breaks the rest
             continue
+
+
+def resolve_vendor_spec(series_name: str) -> tuple[str, dict] | None:
+    """Resolve a requested logical series name to one enabled vendor spec.
+
+    This is deliberately conservative: it only resolves through the same exact
+    normalized-key alias rules used by DataBundle, over the registered
+    DEFAULT_SERIES keys, and only when the target vendor is enabled. Unknown,
+    ambiguous, disabled, or malformed names return None so the caller preserves
+    the existing honest needs_data behavior.
+    """
+    try:
+        target = _norm_key(series_name)
+        if not target:
+            return None
+        specs = DEFAULT_SERIES or {}
+        index: dict[str, list[str]] = {}
+        for key in specs:
+            nk = _norm_key(key)
+            if nk:
+                index.setdefault(nk, []).append(key)
+        hit = _unique_alias_hit(target, index, specs.keys())
+        if not hit:
+            return None
+        spec = specs.get(hit)
+        if not isinstance(spec, dict):
+            return None
+        vendor = spec.get("vendor")
+        if not vendor or vendor not in enabled_adapters():
+            return None
+        return hit, dict(spec)
+    except Exception:  # noqa: BLE001 — resolver is fail-open
+        return None

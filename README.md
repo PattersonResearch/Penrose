@@ -6,7 +6,7 @@
 
 _Most edges don't survive. Penrose finds the few that do, and records why the rest didn't._
 
-[![Version](https://img.shields.io/badge/version-0.1.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.2.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -18,21 +18,17 @@ _Most edges don't survive. Penrose finds the few that do, and records why the re
 
 Penrose is a **referee for quantitative research**. It is not a strategy generator and not a
 backtester. A backtester measures one strategy's returns and moves on. Penrose asks whether a claim's
-evidence can be believed at all, given how it was discovered, and it keeps what it learns: every
+evidence can be believed at all, given how it was discovered, and it keeps what it learns. Every
 result becomes a durable, reusable **invalidation** that records what was tested, why it did not
 survive, and under what conditions. These accumulate into a slowly growing **corpus of
 invalidations**, a compounding map of what does not work that no single backtest can build. The rare
-claim that survives falsification is flagged for a human; the far more common invalidation is kept and
-learned from. In rare cases Penrose also runs this loop in reverse, mining the corpus for recurring
-principles and proposing its own unconfirmed hypotheses to test, the speculative frontier sometimes
-called [candidate alpha](#generating-candidates-a-research-direction)<sup>[[8]](#references)[[9]](#references)</sup>. That part is a research
-direction, not a delivered capability.
+claim that survives falsification is flagged for human review; the far more common case of invalidation is kept and investigated for principles (truths or patterns that are valuable despite the broader invalidation). Users can also invoke an experimental synthesis process in which the corpus is mined for connections between principles to form unconfirmed hypotheses to test, a speculative frontier sometimes
+referred to as [candidate alpha](#generating-candidate-alpha)<sup>[[8]](#references)[[9]](#references)</sup>.
 
 In use, you give Penrose a claim, whether from a paper, a strategy generator, or yourself. It
 reconstructs the claim in a sandbox, tests it under a rigorous robustness stack, **validates its own
-detector**, and returns a calibrated [verdict](#verdicts). Penrose finds **no new alpha** and does
-not promise to. Its value is an honest, accumulating account of what does not survive proper testing,
-plus the discipline to occasionally certify what does.
+detector**, and returns a calibrated [verdict](#verdicts). Penrose finds **no new alpha**, makes no promises to do so; verdicts should not be seen as financial advice or strategy endorsement. Its value is an honest, accumulating account of what does not survive proper testing,
+and the discipline to occasionally certify what does.
 
 ---
 
@@ -50,7 +46,8 @@ plus the discipline to occasionally certify what does.
   for a broken always-no machine. "We couldn't resolve it" never becomes "it's dead."
 - **A self-calibrated detector.** Before trusting any verdict, Penrose measures its own sensitivity
   and specificity on real data: placebo, injected-edge, native-breadth, dead-state, and
-  persistence-matched controls, plus a multi-null battery. Almost no system validates its own detector.
+  persistence-matched controls, plus a multi-null battery. See [docs/STRESS_TESTING.md](docs/STRESS_TESTING.md)
+  for the runnable stress controls. Almost no system validates its own detector.
 - **A discovery/confirmation firewall.** A single-use locked holdout confirms a survivor exactly once
   and then burns, so nothing can be tuned against the confirmation set.
 - **A growing corpus of invalidations.** Every verdict becomes a durable, reusable record of what was
@@ -61,18 +58,18 @@ plus the discipline to occasionally certify what does.
 - **Sandboxed and reproducible.** Untrusted generated code only ever runs inside a Docker sandbox, and
   evaluation paths are deterministic and seeded.
 - **Pennie, a corpus-grounded research assistant** that helps you shape a rough idea into a single
-  testable hypothesis ([see below](#pennie-the-research-assistant)).
+  testable hypothesis ([see below](#pennie-your-research-assistant)).
 
 ## Why Penrose
 
 Automated quant-research systems now propose, code, and backtest factors with little human input.
 They are improving fast, but they select winners by test-set performance over a large search,
-**with no penalty for the size of that search.** Their "winners" are inflated by selection bias, and
+with no penalty for the size of that search. Their "winners" are inflated by selection bias, and
 selection bias is only one of the ways a backtest lies: low statistical power, look-ahead,
 regime-specific luck, ignored costs, and post-publication decay all do the same. A single corrected
-statistic does not catch all of them; a referee needs the whole stack.
+statistic does not catch all of them; a referee needs a suite of tools to provide proper verdicts.
 
-The academic record sets the prior: most published anomalies don't survive proper testing
+Academic record sets the prior: most published anomalies don't survive proper testing
 (Hou-Xue-Zhang 2020), they decay after publication (McLean-Pontiff 2016), and the "factor zoo" came
 from an enormous undisclosed search (Harvey-Liu-Zhu 2016). So the honest prior on any published or
 generated edge is **"probably doesn't survive,"** which is exactly why an *independent, calibrated*
@@ -111,25 +108,13 @@ cross-domain links, principles). Hard rule: these connections **inform, they nev
 corpus contextualizes a result for a human; it never auto-rejects a new idea. Every new claim is
 tested independently on its own data.
 
-### Generating candidates (a research direction)
+### Generating candidate alpha
 
-Penrose can also produce its own **candidate hypotheses** from that corpus of past results, not only
-referee external ones (the `dream` and synthesize paths). These are candidates *to be tested*, never
+Penrose can also produce its own **candidate alpha** from the user's corpus of past results, not only
+referee external ones (the `dream` and synthesize paths). These candidates are fundamentally **untested hypotheses**, never
 predictions of profit: each one re-enters the same falsification path above, is capped at `watch`
 until independently confirmed, and the quality of corpus-generated candidates is an open research
-question rather than a delivered capability.
-
-### Where the name comes from
-
-Penrose is named for the [Penrose process](https://en.wikipedia.org/wiki/Penrose_process), Roger
-Penrose's mechanism for extracting energy from a rotating black hole: almost everything that enters is
-swallowed, but a rare fraction escapes the ergosphere carrying away *more* energy than it arrived with.
-The metaphor fits. The gauntlet of real conditions, deflation, costs, regimes, and a single-use locked
-holdout, is the black hole, and nearly every edge that enters is destroyed. What falls in is not
-wasted: it becomes the corpus of invalidations that Penrose mines for new candidates. And the rare
-claim that escapes falsification is the fraction that gets out enriched, the small part that survived
-the thing that kills almost everything. It is never guaranteed profit, only the candidate worth
-confirming.
+question rather than a promised standard.
 
 ## Verdicts
 
@@ -201,7 +186,24 @@ external data. The full pipeline (ingesting a paper) and the literature/generato
 model key and/or a data download; the notebook walks through both. Commands that need a key fail with a
 clear message, never a crash, if one is not set.
 
-## Results (honest, reproducible)
+## MCP server (optional)
+
+An agent can query Penrose over the [Model Context Protocol](https://modelcontextprotocol.io):
+
+```
+pip install -e ".[mcp]"
+penrose-mcp                 # runs the read-only MCP server
+```
+
+It exposes five **read-only** tools: `penrose_verdicts`, `penrose_proposals`,
+`penrose_principles` (distilled cross-run proposals), `penrose_data_requests`, and `penrose_status`.
+
+By design it **exposes operations, not escape hatches**: every tool only reads results Penrose already
+produced. Nothing over MCP can approve or promote a verdict (the P9 sign-off stays human), write the
+approved corpus, run a paper, or run a module — so an agent can pull what Penrose found without being
+able to make Penrose fool itself. `mcp` is an optional extra; the core install never requires it.
+
+## Results
 
 - **Referee a generator.** Of 16 factors a generative system ([Microsoft RD-Agent](https://github.com/microsoft/RD-Agent)) produced on real
   data: **14/16 killed per-factor, 0/16 survive deflation across the full search,** including
@@ -217,9 +219,9 @@ clear message, never a crash, if one is not set.
   0.02 to 0.05 IC range), not a fixed limit.
 
 See [`docs/PENROSE_SYSTEMS_PAPER.md`](docs/PENROSE_SYSTEMS_PAPER.md) for the full system write-up, and
-[`docs/FPES_STANDARD_PAPER.md`](docs/FPES_STANDARD_PAPER.md) for the underlying evidence standard.
+[`docs/FPES_STANDARD_PAPER.md`](docs/FPES_STANDARD_PAPER.md) for the underlying evidence standard. All points listed here are reproducible with the information found in this repository.
 
-## Pennie, the research assistant
+## Pennie, your research assistant
 
 Pennie is the chat assistant built into the Penrose dashboard. She is a skeptical research
 collaborator, not an oracle and not a trader. Her one job is to help you turn a rough idea into a
@@ -268,7 +270,7 @@ this repo: `pip install -e ".[embed]"` enables in-process FastEmbed vector searc
 `BAAI/bge-small-en-v1.5`; without that optional extra, retrieval falls back to deterministic lexical
 scoring. No external embedding service is required.
 
-## Honest limitations
+## Limitations
 
 - **Reconstruction fidelity** is the central risk for prose inputs ("you tested a broken approximation
   of my strategy"), and a depreciating moat as foundation models improve. The strongest use is
@@ -293,6 +295,14 @@ scoring. No external embedding service is required.
 
 See [ROADMAP.md](ROADMAP.md) for where this is going, and [AGENTS.md](AGENTS.md) if you are pointing a
 coding agent at the repo.
+
+
+## Why is it called Penrose?
+
+Penrose is named for the [Penrose process](https://en.wikipedia.org/wiki/Penrose_process), Roger
+Penrose's mechanism for extracting energy from a rotating black hole. Almost everything that enters a black hole is
+swallowed, but a rare fraction escapes the ergosphere carrying away *more* energy than it arrived with. The gauntlet of real conditions, deflation, costs, regimes, and a single-use locked holdout, is the black hole, and nearly every edge that enters is destroyed. What falls in is not wasted: it becomes the corpus of invalidations that Penrose mines for new candidates. The rare
+claim that escapes falsification is the fraction that gets out enriched, the small part that survived the thing that kills almost everything. It is never guaranteed profit, only the candidate worth confirming.
 
 ## References
 

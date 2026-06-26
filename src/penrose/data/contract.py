@@ -9,23 +9,54 @@ pipeline now, fix data fidelity later).
 """
 from __future__ import annotations
 
+import logging
 import re
+import sys
 from dataclasses import dataclass, field
+from importlib import import_module
 from typing import Optional
 
 import pandas as pd
+
+LOG = logging.getLogger(__name__)
 
 # Filler tokens stripped when normalizing a series name, so naming drift from auto-generated
 # modules ('price.eth_usd_spot_daily') still resolves to the catalog key ('eth_spot_daily').
 _KEY_FILLER = {"usd", "close", "px", "last", "value", "series", "the", "rate"}
 
 
-def _norm_key(name: str) -> str:
+def _key_tokens(name: str, *, drop_filler: bool) -> list[str]:
     s = (name or "").lower().strip()
     if "." in s:                      # drop a 'price.' / 'crypto.' style namespace prefix
         s = s.split(".")[-1]
-    toks = [t for t in re.split(r"[^a-z0-9]+", s) if t and t not in _KEY_FILLER]
+    toks = [t for t in re.split(r"[^a-z0-9]+", s) if t]
+    if drop_filler:
+        toks = [t for t in toks if t not in _KEY_FILLER]
+    return toks
+
+
+def _norm_key(name: str) -> str:
+    toks = _key_tokens(name, drop_filler=True)
     return "_".join(sorted(toks))     # sorted -> order-insensitive; distinct entity tokens still separate
+
+
+def load_catalog_loader(data_dir):
+    """Import <data_dir>/loader.py without leaving data_dir on sys.path."""
+    dd = str(data_dir)
+    sentinel = object()
+    prior_loader = sys.modules.get("loader", sentinel)
+    prior_path = list(sys.path)
+    try:
+        if dd not in sys.path:
+            sys.path.insert(0, dd)
+        sys.modules.pop("loader", None)
+        return import_module("loader")
+    finally:
+        if prior_loader is sentinel:
+            sys.modules.pop("loader", None)
+        else:
+            sys.modules["loader"] = prior_loader
+        sys.path[:] = prior_path
 
 
 @dataclass
@@ -89,11 +120,12 @@ class DataBundle:
             for k in self.series:
                 nk = _norm_key(k)
                 if nk:
-                    idx[nk] = k
+                    idx.setdefault(nk, []).append(k)
             object.__setattr__(self, "_norm_index", idx)
             object.__setattr__(self, "_norm_index_keys", keys)
-        hit = self._norm_index.get(target)
+        hit = _unique_alias_hit(target, self._norm_index, keys)
         if hit:
+            LOG.info("resolved data series alias %r -> %r", name, hit)
             self._note_access(hit)
             return self.series.get(hit)
         return None
@@ -131,3 +163,50 @@ class DataBundle:
     def any_synthetic(self) -> bool:
         return any(isinstance(v, Series) and v.provenance == "synthetic"
                    for v in self.series.values())
+
+
+def _unique_alias_hit(target: str, index: dict[str, list[str]], all_keys=None) -> str | None:
+    """Resolve only a unique high-confidence alias hit.
+
+    Exact normalized-key matches are allowed, as are unique normalized prefix/suffix
+    matches for multi-token names. Ambiguous buckets deliberately miss.
+    """
+    direct = index.get(target) or []
+    if len(direct) == 1:
+        hit = direct[0]
+        return None if _has_qualifier_sibling(hit, all_keys or ()) else hit
+    if direct:
+        return None
+
+    target_parts = target.split("_")
+    if len(target_parts) < 2:
+        return None
+    hits = []
+    for nk, keys in index.items():
+        if len(keys) != 1:
+            continue
+        nk_parts = nk.split("_")
+        if len(nk_parts) < 2:
+            continue
+        if (nk.startswith(f"{target}_") or nk.endswith(f"_{target}")
+                or target.startswith(f"{nk}_") or target.endswith(f"_{nk}")):
+            hits.append(keys[0])
+    unique_hits = set(hits)
+    if len(unique_hits) != 1:
+        return None
+    hit = hits[0]
+    return None if _has_qualifier_sibling(hit, all_keys or ()) else hit
+
+
+def _has_qualifier_sibling(hit: str, all_keys) -> bool:
+    """Return True when another key is the same base plus one qualifier."""
+    base = set(_key_tokens(hit, drop_filler=True))
+    if not base:
+        return False
+    for other in all_keys:
+        if other == hit:
+            continue
+        other_tokens = set(_key_tokens(other, drop_filler=False))
+        if base.issubset(other_tokens) and len(other_tokens - base) == 1:
+            return True
+    return False

@@ -21,10 +21,13 @@ Pure numpy / pandas; no harness coupling. Deterministic given a seed.
 """
 from __future__ import annotations
 
+import itertools
 import math
 
 import numpy as np
 import pandas as pd
+
+from .. import config
 
 
 # --------------------------------------------------------------------------- #
@@ -56,6 +59,7 @@ def _max_drawdown(r: np.ndarray) -> float:
 # Sharpe never legitimately reaches this, so it reads as "deterministic edge"
 # downstream while staying finite (no inf/NaN to crash percentiles / JSON).
 _SHARPE_DETERMINISTIC = 1.0e6
+_CPCV_MIN_PER_GROUP = 5
 
 
 def _sharpe(r: np.ndarray, bpy: float) -> float:
@@ -80,6 +84,124 @@ def _sharpe(r: np.ndarray, bpy: float) -> float:
     if mean < 0:
         return -_SHARPE_DETERMINISTIC
     return 0.0
+
+
+# --------------------------------------------------------------------------- #
+def cpcv(net, bars_per_year: float, *, n_groups: int = 8, k_test: int = 2,
+         embargo_frac: float = 0.01, max_combos: int = 200, seed: int = 0) -> dict:
+    """Combinatorial purged CV on the already non-holdout return window.
+
+    This is a single-strategy overfitting lens: it reports the distribution of
+    purged combinatorial OOS Sharpes and the share of paths with non-positive
+    OOS Sharpe. It never fabricates a CSCV/PBO value; `pbo` is reserved for a
+    real >=2-config family path.
+    """
+    try:
+        s = pd.Series(net).dropna().astype(float)
+    except Exception as e:  # noqa: BLE001
+        return {"ran": False, "reason": f"invalid input: {type(e).__name__}: {e}"}
+    n = len(s)
+    try:
+        n_groups = int(n_groups)
+        k_test = int(k_test)
+        max_combos = int(max_combos)
+        embargo_frac = float(embargo_frac)
+    except (TypeError, ValueError):
+        return {"ran": False, "reason": "invalid CPCV configuration"}
+    if n_groups < 2 or k_test < 1 or k_test >= n_groups:
+        return {"ran": False, "reason": "invalid CPCV group/test configuration"}
+    if embargo_frac <= 0.0:
+        return {"ran": False, "reason": "CPCV requires a positive embargo fraction"}
+    if max_combos < 1:
+        return {"ran": False, "reason": "CPCV max_combos must be positive"}
+    if n < n_groups * _CPCV_MIN_PER_GROUP:
+        return {"ran": False, "reason": f"too few observations for {n_groups} CPCV groups"}
+    vals = s.to_numpy(dtype=float)
+    if float(np.nanstd(vals, ddof=1)) == 0.0:
+        return {"ran": False, "reason": "zero-variance series cannot support CPCV"}
+
+    groups = [g.astype(int) for g in np.array_split(np.arange(n), n_groups)]
+    if any(len(g) < _CPCV_MIN_PER_GROUP for g in groups):
+        return {"ran": False, "reason": "CPCV groups too small after partitioning"}
+    all_combos = list(itertools.combinations(range(n_groups), k_test))
+    combos_total = len(all_combos)
+    min_paths = int(getattr(config, "CPCV", {}).get("min_paths", 1))
+    if combos_total < min_paths:
+        return {"ran": False, "reason": f"too few CPCV paths ({combos_total} < {min_paths})"}
+    if combos_total > max_combos:
+        rng = np.random.default_rng(seed)
+        chosen = np.sort(rng.choice(combos_total, size=max_combos, replace=False))
+        combos = [all_combos[int(i)] for i in chosen]
+        subsampled = True
+    else:
+        combos = all_combos
+        subsampled = False
+
+    embargo_n = max(1, int(math.ceil(embargo_frac * n)))
+    sharpes: list[float] = []
+    split_meta: list[dict] = []
+    for combo in combos:
+        test_idx = np.concatenate([groups[g] for g in combo])
+        test_mask = np.zeros(n, dtype=bool)
+        test_mask[test_idx] = True
+        train_mask = ~test_mask
+        purged = set()
+        embargoed = set()
+        for g in combo:
+            block = groups[g]
+            start, end = int(block[0]), int(block[-1])
+            for p in (start - 1, end + 1):
+                if 0 <= p < n and train_mask[p]:
+                    purged.add(p)
+            emb_start = end + 1
+            emb_end = min(n, end + 1 + embargo_n)
+            for p in range(emb_start, emb_end):
+                if train_mask[p]:
+                    embargoed.add(p)
+        if purged:
+            train_mask[list(purged)] = False
+        if embargoed:
+            train_mask[list(embargoed)] = False
+        if not np.any(train_mask):
+            return {"ran": False, "reason": "CPCV purge/embargo removed all training observations"}
+        sh = _sharpe(vals[np.sort(test_idx)], bars_per_year)
+        sharpes.append(float(sh))
+        split_meta.append({
+            "test_groups": [int(g) for g in combo],
+            "test_n": int(len(test_idx)),
+            "train_n_after_purge_embargo": int(train_mask.sum()),
+            "purged_n": int(len(purged)),
+            "embargoed_n": int(len(embargoed)),
+        })
+
+    arr = np.asarray(sharpes, dtype=float)
+    q25, q75 = np.percentile(arr, [25, 75])
+    is_sharpe = _sharpe(vals, bars_per_year)
+    prob_oos_loss = float((arr <= 0.0).mean())
+    threshold = float(getattr(config, "CPCV", {}).get("overfit_prob_kill", 0.50))
+    return {
+        "ran": True,
+        "n_paths": int(len(combos)),
+        "combos_used": int(len(combos)),
+        "combos_total": int(combos_total),
+        "subsampled": bool(subsampled),
+        "seed": int(seed),
+        "n_groups": int(n_groups),
+        "k_test": int(k_test),
+        "embargo_frac": float(embargo_frac),
+        "embargo_n": int(embargo_n),
+        "purge": "one_observation_adjacent_to_each_test_block",
+        "oos_sharpes": [round(float(x), 3) for x in arr],
+        "median_oos_sharpe": round(float(np.median(arr)), 3),
+        "iqr_oos_sharpe": round(float(q75 - q25), 3),
+        "prob_oos_loss": round(prob_oos_loss, 4),
+        "is_sharpe": round(float(is_sharpe), 3),
+        "haircut": round(float(np.median(arr) / is_sharpe), 4) if is_sharpe > 0 else None,
+        "pbo": None,
+        "pbo_note": "single-strategy CPCV; PBO requires >=2 candidate configs",
+        "overfit": bool(prob_oos_loss >= threshold),
+        "splits": split_meta,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -272,7 +394,22 @@ def walk_forward_vol(frame: pd.DataFrame, hold_days: int = 5, cost_frac: float =
 
 
 # --------------------------------------------------------------------------- #
-def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=None) -> dict:
+def _normalize_declared_regime(declared: dict | None) -> dict | None:
+    if declared is None:
+        return None
+    try:
+        scheme = str(declared.get("scheme", "")).strip().lower()
+        label = str(declared.get("label", "")).strip().lower()
+    except AttributeError:
+        return None
+    if not scheme or not label:
+        return None
+    return {"scheme": scheme, "label": label}
+
+
+# --------------------------------------------------------------------------- #
+def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=None,
+                 declared: dict | None = None) -> dict:
     """STRICT regime kill-lens (Punisher's lesson: most bots die to regime, not signal).
 
     Partition the per-trade net series by EXOGENOUS calendar regime (weekday/weekend,
@@ -297,9 +434,17 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
     Intraday session regimes activate automatically once the index carries intraday
     timestamps (more buckets, same logic).
     """
+    declared_norm = _normalize_declared_regime(declared)
     s = pd.Series(net).dropna()
     if not isinstance(s.index, pd.DatetimeIndex) or len(s) < max(20, 3 * min_bucket):
-        return {"applicable": False, "n_partitions": 0, "fragile": False}
+        out = {"applicable": False, "n_partitions": 0, "fragile": False}
+        if declared_norm is not None:
+            out.update({"declared_regime": declared_norm, "declared_present": False,
+                        "adheres": False,
+                        "adherence": {"trade_share": 0.0, "edge_share": 0.0,
+                                      "top_edge_label": None},
+                        "declared_note": "regime adherence unavailable: insufficient dated trades"})
+        return out
     vals = s.values.astype(float)
     overall = float(vals.mean())
     dow = np.asarray(s.index.dayofweek)
@@ -336,6 +481,10 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
     # is a second independent layer, so this only needs to catch clear concentration.
     SURVIVAL_FRAC = 0.25
     schemes, n_partitions, fragile, reason = {}, 0, False, None
+    declared_present = False
+    declared_exempted = False
+    declared_note = None
+    adherence = None
     for name, labels in schemes_def.items():
         buckets = {}
         for lab in pd.unique(labels):
@@ -349,6 +498,24 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
                 buckets[str(lab)] = {"n": int(len(r)),
                                      "sharpe": round(_sharpe(r, bars_per_year), 3),
                                      "edge": round(float(r.mean()), 6)}
+        declared_scheme = declared_norm is not None and name.lower() == declared_norm["scheme"]
+        if declared_scheme:
+            labels_norm = np.asarray([str(x).strip().lower() for x in labels])
+            declared_mask = labels_norm == declared_norm["label"]
+            declared_n = int(declared_mask.sum())
+            declared_present = declared_n >= min_bucket
+            contrib_all = {str(lab).strip().lower(): float(vals[labels_norm == str(lab).strip().lower()].sum())
+                           for lab in pd.unique(labels_norm)}
+            top_edge_label = max(contrib_all, key=contrib_all.get) if contrib_all else None
+            total_abs_edge = float(np.abs(vals).sum())
+            declared_edge = float(vals[declared_mask].sum()) if declared_n else 0.0
+            adherence = {
+                "trade_share": round(float(declared_n / len(vals)), 4) if len(vals) else 0.0,
+                "edge_share": round(float(declared_edge / total_abs_edge), 4) if total_abs_edge else 0.0,
+                "declared_edge": round(declared_edge, 6),
+                "top_edge_label": top_edge_label,
+                "min_trade_share": float(getattr(config, "REGIME_ADHERENCE_MIN", 0.60)),
+            }
         if len(buckets) >= 2:
             schemes[name] = buckets
             n_partitions += len(buckets)
@@ -358,10 +525,38 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
                 rest = vals[labels != best]
                 rest_edge = float(rest.mean()) if len(rest) >= min_bucket else 0.0
                 if rest_edge <= SURVIVAL_FRAC * overall:
+                    if (declared_scheme
+                            and str(best).strip().lower() == declared_norm["label"]):
+                        declared_exempted = True
+                        declared_note = (f"declared regime concentration exempted for "
+                                         f"{name}={best}; other schemes still tested")
+                        continue
                     fragile = True
                     reason = (f"edge concentrated in '{best}' ({name}): only "
                               f"{rest_edge:.5f}/trade survives without it "
                               f"({rest_edge / overall * 100:.0f}% of {overall:.5f})")
-    return {"applicable": True, "overall_edge": round(overall, 6),
-            "schemes": schemes, "n_partitions": int(n_partitions),
-            "fragile": bool(fragile), "fragile_reason": reason}
+    out = {"applicable": True, "overall_edge": round(overall, 6),
+           "schemes": schemes, "n_partitions": int(n_partitions),
+           "fragile": bool(fragile), "fragile_reason": reason}
+    if declared_norm is not None:
+        if adherence is None:
+            adherence = {"trade_share": 0.0, "edge_share": 0.0, "declared_edge": 0.0,
+                         "top_edge_label": None,
+                         "min_trade_share": float(getattr(config, "REGIME_ADHERENCE_MIN", 0.60))}
+            declared_note = (declared_note or
+                             f"declared regime scheme '{declared_norm['scheme']}' was not available")
+        adheres = bool(
+            declared_present
+            and adherence["trade_share"] >= adherence["min_trade_share"]
+            and adherence["top_edge_label"] == declared_norm["label"]
+        )
+        out.update({
+            "declared_regime": declared_norm,
+            "declared_present": bool(declared_present),
+            "declared_exempted": bool(declared_exempted),
+            "adheres": adheres,
+            "adherence": adherence,
+        })
+        if declared_note:
+            out["declared_note"] = declared_note
+    return out

@@ -26,6 +26,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from penrose.pipeline import p7_backtest as P7   # noqa: E402 (self-adds harness path)
+from penrose.pipeline import run as RUN          # noqa: E402
 from penrose.pipeline import stages              # noqa: E402
 from penrose.brain import Claim                  # noqa: E402
 
@@ -40,6 +41,11 @@ def _claim() -> Claim:
     return Claim(claim_id="eval", statement="eval planted strategy", mechanism="",
                  scope="", horizon="", source_id="eval", source_span="",
                  claimed_metric_quote="", applicable_strategy_class="eval")
+
+
+class _EvalModule:
+    __strategy_class__ = "eval"
+    __module_id__ = "eval"
 
 
 def _idx(n: int) -> pd.DatetimeIndex:
@@ -153,6 +159,10 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("POWER: low DSR + thin sample -> underpowered (not kill); MDE reported",
                 _d_up.verdict == "underpowered" and _d_up.kill_reason == "below_detection_floor"
                 and _d_up.metrics.get("mde_ic") and _d_up.metrics.get("power_sufficient") is False))
+    _res_up = _d_up.metrics.get("resolution") or {}
+    out.append(("POWER: underpowered exposes marginal more_oos_bars_needed",
+                isinstance(_res_up.get("more_oos_bars_needed"), int)
+                and _res_up.get("more_oos_bars_needed") >= 0))
     # Structural kills are power-INDEPENDENT: a THIN sample with sign-unstable 3-fold still KILLS.
     _bt_st = {"psr": 0.5, "dsr": 0.5, "edge_t": 0.2, "n_oos": 60, "oos_sharpe": 0.3, "bars_per_year": 252,
               "three_fold": {"folds": [1, -1, 1], "consistent": False}, "capacity_usd": 1e6,
@@ -188,6 +198,82 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("A-004: 5 rows / 2 distinct strategies -> 2 trials (deduped)", n_distinct == 2))
     out.append(("B-016: re-running existing 'a' does NOT add a trial (no +1)", n_rerun == 2))
     out.append(("B-016: a new strategy 'c' counts once -> 3", n_new == 3))
+
+    # 5c: paper/ad-hoc runs pre-register P7-ready claims as a per-family cohort, so the
+    # DSR denominator is fixed before any backtest reads it. This is a correctness tightening:
+    # first-vs-last order cannot change n_trials or verdict, while single-claim cohorts remain n=1.
+    def _eval_claim(cid: str) -> Claim:
+        return Claim(claim_id=cid, statement="BTC eval cohort", mechanism="",
+                     scope="", horizon="", source_id="eval", source_span="",
+                     claimed_metric_quote="", applicable_strategy_class="eval")
+
+    _cohort_net = pd.Series(np.random.default_rng(905).normal(0.002, 0.004, 240),
+                            index=_idx(240))
+
+    def _cohort_score(claim: Claim, family: str) -> tuple[dict, str]:
+        _bt = P7.run_backtest(
+            claim.claim_id, _cohort_net, pd.Series(1.0, index=_cohort_net.index),
+            252.0, family=family, search_cohort_id=claim.search_cohort_id,
+            search_denominator=claim.search_denominator, log=True)
+        _dec = stages.p8_verdict(claim, _bt, {}, False)
+        return _bt, _dec.verdict
+
+    _old_stats = P7._trial_stats
+    P7._trial_stats = _REAL_TRIAL_STATS
+    _order_ok = False
+    _single_ok = False
+    _order_a = Path(tempfile.gettempdir()) / "_eval_5c_order_a.tsv"
+    _order_b = Path(tempfile.gettempdir()) / "_eval_5c_order_b.tsv"
+    _single_l = Path(tempfile.gettempdir()) / "_eval_5c_single.tsv"
+    _base_l = Path(tempfile.gettempdir()) / "_eval_5c_single_base.tsv"
+    for _p in (_order_a, _order_b, _single_l, _base_l):
+        _p.unlink(missing_ok=True)
+        Path(str(_p) + ".lock").unlink(missing_ok=True)
+    _old_ledger = P7.LEDGER
+    try:
+        P7.LEDGER = _order_a
+        _target_first = _eval_claim("target")
+        _first_claims = [_target_first, *[_eval_claim(f"filler-{i}") for i in range(4)]]
+        _first_ready = [{"claim": c, "module": _EvalModule()} for c in _first_claims]
+        RUN._register_run_cohorts(_first_ready, "eval-source")
+        _bt_first, _v_first = _cohort_score(_target_first, _first_ready[0]["family"])
+
+        P7.LEDGER = _order_b
+        _target_last = _eval_claim("target")
+        _last_claims = [*[_eval_claim(f"filler-{i}") for i in range(4)], _target_last]
+        _last_ready = [{"claim": c, "module": _EvalModule()} for c in _last_claims]
+        RUN._register_run_cohorts(_last_ready, "eval-source")
+        for _item in _last_ready[:-1]:
+            _cohort_score(_item["claim"], _item["family"])
+        _bt_last, _v_last = _cohort_score(_target_last, _last_ready[-1]["family"])
+        _first_family_n = _bt_first["n_trials"] - int(_bt_first["regime"].get("n_partitions", 0))
+        _last_family_n = _bt_last["n_trials"] - int(_bt_last["regime"].get("n_partitions", 0))
+        _order_ok = (
+            _bt_first["n_trials"] == _bt_last["n_trials"]
+            and _first_family_n == _last_family_n == 5
+            and _v_first == _v_last
+        )
+
+        P7.LEDGER = _base_l
+        _base_claim = _eval_claim("single")
+        _base_family = RUN._family(_base_claim, _EvalModule())
+        _bt_base, _ = _cohort_score(_base_claim, _base_family)
+        P7.LEDGER = _single_l
+        _single_claim = _eval_claim("single")
+        _single_ready = [{"claim": _single_claim, "module": _EvalModule()}]
+        RUN._register_run_cohorts(_single_ready, "eval-source")
+        _bt_single, _ = _cohort_score(_single_claim, _single_ready[0]["family"])
+        _single_family_n = _bt_single["n_trials"] - int(_bt_single["regime"].get("n_partitions", 0))
+        _single_ok = _bt_single == _bt_base and _single_family_n == 1
+    finally:
+        P7.LEDGER = _old_ledger
+        P7._trial_stats = _old_stats
+        for _p in (_order_a, _order_b, _single_l, _base_l):
+            _p.unlink(missing_ok=True)
+            Path(str(_p) + ".lock").unlink(missing_ok=True)
+    out.append(("5c: same strategy first-vs-last in a paper cohort has identical n_trials + verdict",
+                _order_ok))
+    out.append(("5c: single-claim paper cohort stays byte-identical at n=1", _single_ok))
 
     # ===================== Wave 2/3 audit-fix regression guards ===================== #
     import tempfile
@@ -338,6 +424,23 @@ def invariants() -> list[tuple[str, bool]]:
     _mismatch = _RB.regime_split(_net, 252.0, extra_schemes={"vol_regime": _vr_utc})
     out.append(("REGIME H-001: vol lens fires across a tz-naive/tz-aware index mismatch",
                 "vol_regime" in _mismatch.get("schemes", {}) and _mismatch["fragile"] is True))
+    # REGIME-SCOPE: declaring a regime is ADDITIVE (declared=None byte-identical to the undeclared
+    # lens), it exempts the DECLARED concentration, and the adherence gate refuses a regime you do not
+    # actually trade in — so declaring a regime can never become a free pass.
+    out.append(("REGIME-SCOPE: declared=None is byte-identical to the undeclared lens (additive)",
+                _RB.regime_split(_net, 252.0, extra_schemes={"vol_regime": _vr}, declared=None) == _vol))
+    _hv = _vr.index[_vr.values == "high_vol"]
+    _net_hv = pd.Series(_rng.normal(0.004, 0.002, len(_hv)), index=_hv)
+    _scoped = _RB.regime_split(_net_hv, 252.0, extra_schemes={"vol_regime": _vr},
+                               declared={"scheme": "vol_regime", "label": "high_vol"})
+    out.append(("REGIME-SCOPE: a declared high_vol strategy that trades there adheres and is not fragile",
+                _scoped.get("adheres") is True and _scoped.get("fragile") is False))
+    _lv = _vr.index[_vr.values == "low_vol"]
+    _net_lv = pd.Series(_rng.normal(0.004, 0.002, len(_lv)), index=_lv)
+    _scoped_bad = _RB.regime_split(_net_lv, 252.0, extra_schemes={"vol_regime": _vr},
+                                   declared={"scheme": "vol_regime", "label": "high_vol"})
+    out.append(("REGIME-SCOPE: declaring high_vol while trading low_vol fails adherence (no free pass)",
+                _scoped_bad.get("adheres") is False))
     # REGIME-WIRING: the PRODUCTION path (run_backtest) threads regime_schemes into the kill-lens,
     # so vol/trend buckets appear in P7's regime output AND inflate the DSR trial count (no free look).
     _pos = pd.Series(1.0, index=_ix)
@@ -699,6 +802,54 @@ def invariants() -> list[tuple[str, bool]]:
         _dead_msg = str(e)
     out.append(("CALIB-DEAD: degenerate series has a clear failure message",
                 "at least 40 observations" in _dead_msg))
+
+    # ===================== CPCV / overfitting-lens invariants ===================== #
+    _cidx = _idx(160)
+    _crng = np.random.default_rng(10)
+    _over = pd.Series(np.r_[
+        _crng.normal(0.006, 0.001, 80),
+        _crng.normal(-0.008, 0.001, 80),
+    ], index=_cidx)
+    _persist = pd.Series(np.random.default_rng(11).normal(0.008, 0.001, 160), index=_cidx)
+    _cv_over = R.cpcv(_over, BPY, n_groups=8, k_test=2, embargo_frac=0.01, seed=3)
+    _cv_persist = R.cpcv(_persist, BPY, n_groups=8, k_test=2, embargo_frac=0.01, seed=3)
+    out.append(("CPCV: early-edge/later-loss series is caught as overfit",
+                _cv_over.get("ran") is True
+                and _cv_over.get("prob_oos_loss", 0) >= 0.50
+                and _cv_over.get("overfit") is True
+                and _cv_over.get("pbo") is None))
+    out.append(("CPCV: persistent edge survives the combinatorial loss lens",
+                _cv_persist.get("ran") is True
+                and _cv_persist.get("prob_oos_loss") == 0.0
+                and _cv_persist.get("overfit") is False))
+
+    def _cpcv_bt(cv):
+        return {"psr": 0.98, "dsr": 0.98, "edge_t": 3.0, "n_oos": 1200,
+                "bars_per_year": BPY, "oos_sharpe": 1.2, "is_sharpe": 1.0,
+                "n_trials": 1,
+                "three_fold": {"folds": [1, 1, 1], "consistent": True},
+                "capacity_usd": 1e6,
+                "bootstrap": {"edge_ci_includes_zero": False},
+                "permutation": {"p_value": 0.01},
+                "regime": {"fragile": False}, "walk_forward": {},
+                "capacity_ci": {}, "cpcv": cv}
+
+    _base_cpcv_dec = stages.p8_verdict(_claim(), _cpcv_bt({}), {}, False)
+    _over_cpcv_dec = stages.p8_verdict(_claim(), _cpcv_bt(_cv_over), {}, False)
+    _persist_cpcv_dec = stages.p8_verdict(_claim(), _cpcv_bt(_cv_persist), {}, False)
+    _rank = {"kill": 0, "underpowered": 1, "insufficient_data": 1, "watch": 2, "research-supported": 3}
+    out.append(("CPCV: overfit lens can only demote a borderline survivor",
+                _rank[_over_cpcv_dec.verdict] <= _rank[_base_cpcv_dec.verdict]
+                and "CPCV overfit" in _over_cpcv_dec.rationale))
+    out.append(("CPCV: persistent edge leaves the borderline verdict unchanged",
+                _persist_cpcv_dec.verdict == _base_cpcv_dec.verdict
+                and _persist_cpcv_dec.kill_reason == _base_cpcv_dec.kill_reason))
+    _short_cv = R.cpcv(pd.Series([0.1, -0.1, 0.2], index=_idx(3)), BPY)
+    _skip_cpcv_dec = stages.p8_verdict(_claim(), _cpcv_bt(_short_cv), {}, False)
+    out.append(("CPCV: graceful skip is inert for verdicts",
+                _short_cv.get("ran") is False
+                and _skip_cpcv_dec.verdict == _base_cpcv_dec.verdict
+                and _skip_cpcv_dec.kill_reason == _base_cpcv_dec.kill_reason))
     return out
 
 

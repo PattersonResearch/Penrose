@@ -18,6 +18,7 @@ fast and work even when the backtest stack can't import. `run` pulls in the full
 from __future__ import annotations
 
 import argparse
+from dataclasses import MISSING, fields
 import json
 import sys
 from pathlib import Path
@@ -38,8 +39,8 @@ def _read_jsonl(path: Path) -> list[dict]:
 
 
 def _cmd_verdicts(args) -> int:
-    from . import config
-    rows = _read_jsonl(config.ANALYSIS_INDEX)[-args.n:]
+    from . import views
+    rows = views.verdicts(args.n)
     if not rows:
         print("No backtested verdicts yet (reports/analysis_index.jsonl is empty)."); return 0
     print(f"{'verdict':<18} {'syn':<4} {'claim_id':<26} statement")
@@ -47,35 +48,31 @@ def _cmd_verdicts(args) -> int:
     for r in rows:
         syn = "yes" if r.get("synthetic") else "no"
         print(f"{str(r.get('verdict')):<18} {syn:<4} {str(r.get('claim_id'))[:26]:<26} "
-              f"{str(r.get('statement',''))[:50]}")
+              f"{str(r.get('statement') or '')[:50]}")
     return 0
 
 
 def _cmd_data_requests(args) -> int:
-    from . import config
-    rows = [r for r in _read_jsonl(config.DATA_REQUESTS) if r.get("status", "open") == "open"]
-    # dedupe by claim_id, keep latest
-    latest = {r.get("claim_id"): r for r in rows}
-    if not latest:
+    from . import views
+    rows = views.data_requests()
+    if not rows:
         print("No open data requests."); return 0
-    print(f"Open F7b data blockers ({len(latest)}):")
-    for r in latest.values():
+    print(f"Open F7b data blockers ({len(rows)}):")
+    for r in rows:
         miss = ", ".join(r.get("missing_series", []) or [])[:70]
         print(f"  {str(r.get('claim_id'))[:30]:<30} needs: {miss}")
     return 0
 
 
 def _cmd_status(args) -> int:
-    from . import config
-    live = config.ROOT / "dashboard" / "live.json"
-    if not live.exists():
+    from . import views
+    d = views.status()
+    if d.get("pipeline_status") == "idle" and d.get("note"):
         print("idle (no dashboard/live.json)"); return 0
-    try:
-        d = json.loads(live.read_text())
-    except (json.JSONDecodeError, OSError):
+    if d.get("pipeline_status") == "unknown" and "status_badge" not in d:
         print("unknown"); return 1
     print(f"pipeline: {d.get('pipeline_status', 'unknown')}  ({d.get('status_badge', '')})")
-    print(f"updated:  {d.get('updated_at', '?')}")
+    print(f"updated:  {d.get('updated_at') or '?'}")
     st = d.get("stats") or {}
     if st:
         print(f"stats:    {json.dumps(st)}")
@@ -86,6 +83,39 @@ def _cmd_run(args) -> int:
     # Heavy: pulls the full pipeline + backtest stack. Lazy-imported so the read-only commands
     # above don't pay for it (and still work if the stats stack can't import).
     from .pipeline import run as runmod
+    if args.all and (args.json or args.claims):
+        raise ValueError("--all cannot be combined with --json or --claims")
+    if args.json or args.claims:
+        paper = _resolve_run_paper(args.paper, args.claims, runmod)
+        if paper is None:
+            print(json.dumps({
+                "source_id": None,
+                "verdicts": [],
+                "principle": None,
+                "status": "all_processed",
+                "inbox": len(runmod._inbox_pdfs()),
+                "note": "every inbox paper already run; `make reset` to reprocess",
+            }, sort_keys=True))
+            return 0
+        claims_override = _load_claims_file(args.claims, _source_id_for(paper)) if args.claims else None
+        out = runmod.run_source(
+            paper,
+            use_llm=not args.no_llm,
+            claims_override=claims_override,
+            force=args.force,
+            max_claims=args.max_claims,
+        )
+        if args.json:
+            print(json.dumps(_run_json_object(out), sort_keys=True, default=str))
+        else:
+            print(json.dumps({
+                "run_at": out["run_at"], "source_id": out.get("source_id"),
+                "claims_extracted": len(out.get("claims", [])),
+                "specs_generated": out.get("specs_generated", 0),
+                "report": out.get("report"),
+                "p2_mode": out.get("p2", {}).get("mode"),
+            }, indent=2))
+        return 0
     argv = []
     if args.paper:
         argv += ["--paper", args.paper]
@@ -93,9 +123,92 @@ def _cmd_run(args) -> int:
         argv += ["--all"]
     if args.no_llm:
         argv += ["--no-llm"]
+    if args.force:
+        argv += ["--force"]
+    if args.max_claims is not None:
+        argv += ["--max-claims", str(args.max_claims)]
     sys.argv = ["penrose-run"] + argv
     runmod.main()
     return 0
+
+
+def _source_id_for(path: Path) -> str:
+    return path.stem or "claims-file"
+
+
+def _resolve_run_paper(paper_arg: str | None, claims_arg: str | None, runmod) -> Path | None:
+    if paper_arg:
+        paper = Path(paper_arg)
+        if not paper.exists():
+            raise FileNotFoundError(f"paper not found: {paper}")
+        return paper
+    if claims_arg:
+        claims_path = Path(claims_arg)
+        if not claims_path.exists():
+            raise FileNotFoundError(f"claims file invalid: not found: {claims_path}")
+        return claims_path
+    paper = runmod._find_paper(None)
+    return paper
+
+
+def _load_claims_file(path_arg: str, fallback_source_id: str):
+    from .brain import Claim
+    path = Path(path_arg)
+    try:
+        raw = json.loads(path.read_text())
+    except FileNotFoundError:
+        raise FileNotFoundError(f"claims file invalid: not found: {path}") from None
+    except json.JSONDecodeError as e:
+        raise ValueError(f"claims file invalid: malformed JSON at line {e.lineno} column {e.colno}") from None
+    except OSError as e:
+        raise ValueError(f"claims file invalid: cannot read {path}: {e}") from None
+    if not isinstance(raw, list):
+        raise ValueError("claims file invalid: top-level JSON value must be a list")
+    claim_fields = {f.name: f for f in fields(Claim)}
+    required = [
+        f.name for f in fields(Claim)
+        if f.default is MISSING and f.default_factory is MISSING and f.name != "source_id"
+    ]
+    claims = []
+    for i, item in enumerate(raw, 1):
+        prefix = f"claims file invalid: claim {i}"
+        if not isinstance(item, dict):
+            raise ValueError(f"{prefix} must be an object")
+        unknown = sorted(set(item) - set(claim_fields))
+        if unknown:
+            raise ValueError(f"{prefix} has unknown field(s): {', '.join(unknown)}")
+        missing = [name for name in required if name not in item]
+        if missing:
+            raise ValueError(f"{prefix} missing required field(s): {', '.join(missing)}")
+        payload = dict(item)
+        payload.setdefault("source_id", fallback_source_id)
+        try:
+            claims.append(Claim(**payload))
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"{prefix} invalid: {e}") from None
+    return claims
+
+
+def _run_json_object(out: dict) -> dict:
+    skipped = bool((out.get("idempotency") or {}).get("skipped"))
+    metrics_by_claim = out.get("decision_metrics") or {}
+    verdicts = []
+    for row in list(out.get("decisions") or []):
+        item = dict(row)
+        if item.get("claim_id") in metrics_by_claim:
+            item["resolution"] = (metrics_by_claim.get(item.get("claim_id")) or {}).get("resolution")
+        verdicts.append(item)
+    return {
+        "source_id": out.get("source_id"),
+        "verdicts": verdicts,
+        "principle": out.get("principle_proposed"),
+        "status": "skipped" if skipped else "complete",
+    }
+
+
+def _json_error_object(message: str) -> dict:
+    return {"source_id": None, "verdicts": [], "principle": None,
+            "status": "error", "error": message}
 
 
 def _run_repo_script(script_rel: str) -> int:
@@ -154,6 +267,37 @@ def _cmd_brain_rebuild(args) -> int:
     return 0
 
 
+def _cmd_proposals(args) -> int:
+    from .brain import read_proposals
+    rows = read_proposals()
+    if args.json:
+        print(json.dumps(rows, sort_keys=True))
+        return 0
+    if not rows:
+        print("No proposed principles.")
+        return 0
+    print(f"{'status':<10} {'n':<4} {'domain':<24} {'kill_reason':<22} statement")
+    print("-" * 100)
+    for r in rows:
+        print(f"{str(r.get('status', 'proposed')):<10} {str(r.get('n_observations', '')):<4} "
+              f"{str(r.get('domain', ''))[:24]:<24} {str(r.get('kill_reason', ''))[:22]:<22} "
+              f"{str(r.get('statement', ''))[:48]}")
+    return 0
+
+
+def _cmd_principles(args) -> int:
+    from .learning import distill_principles
+    from .proposals import write_proposals
+    rows = distill_principles()
+    stored = write_proposals(rows, source="distilled") if rows else []
+    out = {"distilled": rows, "stored": len(stored), "status": "proposed"}
+    if args.json:
+        print(json.dumps(out, sort_keys=True))
+    else:
+        print(json.dumps(out, indent=2, sort_keys=True))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="penrose",
                                  description="Falsification-first research pipeline.")
@@ -163,6 +307,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--paper", help="path to a PDF/MD; default = next unprocessed inbox paper")
     p.add_argument("--all", action="store_true", help="process every unprocessed inbox paper")
     p.add_argument("--no-llm", action="store_true", help="force the no-LLM fallback path")
+    p.add_argument("--force", action="store_true",
+                   help="re-run sources and supersede prior decision rows for that source_id")
+    p.add_argument("--max-claims", type=int,
+                   help=("process at most N extracted claims; setting "
+                         "PENROSE_CLAIM_TIME_BUDGET_SECONDS makes budget skips wall-clock-dependent"))
+    p.add_argument("--json", action="store_true",
+                   help="print one parseable JSON result object to stdout")
+    p.add_argument("--claims", help="path to a JSON list of structured Claim objects")
     p.set_defaults(fn=_cmd_run)
 
     p = sub.add_parser("verdicts", help="recent backtested verdicts")
@@ -196,6 +348,15 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("brain-rebuild", help="rebuild native BrainStore from flat files").set_defaults(
         fn=_cmd_brain_rebuild)
+    p = sub.add_parser("proposals", help="read propose-only principle proposals")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=_cmd_proposals)
+    p = sub.add_parser("principles", help="distill cross-run proposed principles")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=_cmd_principles)
+    p = sub.add_parser("distill", help="alias for principles")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=_cmd_principles)
 
     args = ap.parse_args(argv)
     # CLI error boundary: expected runtime problems (missing API key, missing run/file)
@@ -203,7 +364,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.fn(args)
     except (RuntimeError, FileNotFoundError, ValueError) as e:
-        print(f"penrose: {e}")
+        if getattr(args, "json", False):
+            print(json.dumps(_json_error_object(str(e)), sort_keys=True))
+        else:
+            print(f"penrose: {e}")
         return 1
     except KeyboardInterrupt:
         print("penrose: interrupted")

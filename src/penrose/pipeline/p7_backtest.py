@@ -148,6 +148,30 @@ def register_trials(rows: list[dict]) -> None:
         _write_ledger(merged)
 
 
+def cleanup_unscored_paper_cohorts(cohort_ids: set[str]) -> int:
+    """Remove paper-path cohort registrations that never became scored trials.
+
+    Dream/generator cohorts intentionally count blocker candidates. This cleanup is only for
+    paper/external runs, where pre-registration exists to make same-run scoring order-independent
+    and should not leave unscored phantoms that over-deflate later papers in the same family.
+    """
+    cohort_ids = {str(c or "") for c in cohort_ids if str(c or "")}
+    if not cohort_ids:
+        return 0
+    with _ledger_guard():
+        old = _canonicalize_ledger()
+        if old.empty:
+            return 0
+        cohort = old["search_cohort_id"].astype(str).isin(cohort_ids)
+        paper = old["generation_source"].astype(str) == "paper"
+        unscored = pd.to_numeric(old["per_trade_sharpe"], errors="coerce").isna()
+        remove = cohort & paper & unscored
+        removed = int(remove.sum())
+        if removed:
+            _write_ledger(old.loc[~remove].copy())
+        return removed
+
+
 def _append_ledger(name: str, stats: dict, family: str | None = None, *,
                    generation_source: str = "paper",
                    search_cohort_id: str | None = None,
@@ -266,7 +290,8 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
                  generation_source: str = "paper",
                  search_cohort_id: str | None = None,
                  search_denominator: int | None = None,
-                 regime_schemes: dict | None = None) -> dict:
+                 regime_schemes: dict | None = None,
+                 declared_regime: dict | None = None) -> dict:
     """Score a strategy's per-trade net returns under full S4 discipline, plus the
     empirical robustness layer (bootstrap CI, permutation, walk-forward, capacity CI).
 
@@ -279,6 +304,8 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     regime_schemes  : dict[name -> date->label pd.Series] of PRE-REGISTERED, point-in-time
                       MARKET-regime labels (vol/trend from penrose.regime). Passed to the
                       kill-lens so it also catches edges concentrated in one vol/trend regime.
+    declared_regime : optional pre-registered claim scope, e.g.
+                      {"scheme": "vol_regime", "label": "high_vol"}.
 
     These optional inputs are keyword-only: existing callers are unaffected; permutation,
     walk-forward, and the market-regime lens simply activate when the module supplies them.
@@ -302,7 +329,8 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     # pre-registered point-in-time vol/trend labels (extra_schemes) join when supplied so the
     # lens also catches edges concentrated in one MARKET regime. Each populated partition is an
     # extra "look", so it inflates the DSR trial count before deflation (incl. the vol/trend buckets).
-    regime = R.regime_split(seen, bars_per_year, extra_schemes=regime_schemes)
+    regime = R.regime_split(
+        seen, bars_per_year, extra_schemes=regime_schemes, declared=declared_regime)
     n_trials += int(regime.get("n_partitions", 0))
 
     mean, sd = float(oos.mean()), float(oos.std(ddof=1)) if len(oos) > 1 else 0.0
@@ -357,6 +385,11 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
         wf_seen = wf_frame.iloc[:int(len(wf_frame) * (IS_FRAC + OOS_FRAC))]
         out["walk_forward"] = R.walk_forward_vol(
             wf_seen, cost_frac=cost_frac or 0.0008, **config.WALK_FORWARD)
+    cpcv_keys = {"n_groups", "k_test", "embargo_frac", "max_combos", "seed"}
+    out["cpcv"] = R.cpcv(
+        seen, bars_per_year,
+        **{k: v for k, v in config.CPCV.items() if k in cpcv_keys},
+    )
 
     if log:
         _append_ledger(

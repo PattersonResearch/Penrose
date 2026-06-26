@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "penrose"
-version = "0.1.0"
+version = "0.2.0"
 description = "Falsification-first research pipeline: ingest trading-strategy papers, test their claims under a robustness stack (deflated Sharpe, 3-fold, locked holdout, fee curve), and emit trustworthy verdicts."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -34,11 +34,13 @@ dependencies = [
 charts = ["matplotlib>=3.6"]         # equity-curve PNGs for the dashboard
 databento = ["databento>=0.30"]      # BYO point-in-time market-data adapter
 embed = ["fastembed>=0.3"]           # optional in-process corpus/vector retrieval
+mcp = ["mcp>=1.0"]                    # read-only MCP server (agent-queryable verdicts/proposals)
 test = ["pytest>=7"]
 
-# The `penrose` command (penrose/cli.py).
+# The `penrose` command (penrose/cli.py) and the optional read-only MCP server.
 [project.scripts]
 penrose = "penrose.cli:main"
+penrose-mcp = "penrose.mcp_server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]                      # penrose lives under src/penrose

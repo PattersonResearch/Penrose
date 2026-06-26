@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
 from . import brainstore, config
+from .proposals import read_proposals
 
 SOURCE_TYPES = frozenset({
     "external_source", "generated_hypothesis", "synthesized_hypothesis",
@@ -110,9 +111,21 @@ class Claim:
     search_denominator: Optional[int] = None
     raw_hypothesis_id: Optional[str] = None
     data_provenance: dict = field(default_factory=dict)
+    declared_regime: Optional[dict] = None
 
     def __post_init__(self) -> None:
         self.source_type = validate_source_type(self.source_type)
+        if self.declared_regime is not None:
+            if not isinstance(self.declared_regime, dict):
+                raise ValueError("declared_regime must be a mapping with scheme and label")
+            scheme = self.declared_regime.get("scheme")
+            label = self.declared_regime.get("label")
+            if not isinstance(scheme, str) or not scheme.strip():
+                raise ValueError("declared_regime.scheme must be a non-empty string")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError("declared_regime.label must be a non-empty string")
+            self.declared_regime = {"scheme": scheme.strip().lower(),
+                                    "label": label.strip().lower()}
 
 
 @dataclass

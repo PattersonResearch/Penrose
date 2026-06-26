@@ -128,10 +128,22 @@ def test_underpowered_resolution():
     assert d_thin.verdict == "underpowered"
     res = d_thin.metrics.get("resolution")
     assert res is not None
+    assert res["current_oos_bars"] == thin["n_oos"]
     assert res["needed_oos_bars"] > thin["n_oos"]
+    assert res["more_oos_bars_needed"] == res["needed_oos_bars"] - thin["n_oos"]
+    assert res["more_oos_bars_needed"] >= 0
     assert res["needed_breadth_n"] >= 1
     assert res["current_mde_ic"] == d_thin.metrics["mde_ic"]
     assert "breadth via IR" in res["basis"]
+    assert "more OOS trades" in d_thin.rationale
+
+    insufficient = stages.p8_verdict(claim, dict(base, n_oos=20), {}, False)
+    assert insufficient.verdict == "insufficient_data"
+    insuff_res = insufficient.metrics.get("resolution")
+    assert insuff_res is not None
+    assert insuff_res["current_oos_bars"] == 20
+    assert insuff_res["more_oos_bars_needed"] >= 0
+    assert "more OOS trades" in insufficient.rationale
 
     thinner = stages.p8_verdict(claim, dict(base, n_oos=30), {}, False)
     thicker = stages.p8_verdict(claim, dict(base, n_oos=120), {}, False)

@@ -36,6 +36,7 @@ class LLMResponse:
     elapsed_s: float
     cached: bool = False
     finish_reason: str | None = None
+    independent_verifier: bool = False
 
 
 # --- budget enforcement ----------------------------------------------------- #
@@ -171,6 +172,36 @@ def _provider() -> OpenAICompatProvider:
     return _PROVIDER
 
 
+def _default_provider_config() -> tuple[str, str]:
+    api_key = os.environ.get("PENROSE_LLM_API_KEY") or ""
+    base_url = (os.environ.get("PENROSE_LLM_BASE_URL")
+                or "https://api.artificialanalysis.ai/v1").rstrip("/")
+    return base_url, api_key
+
+
+def _verifier_provider_config() -> tuple[str, str]:
+    base_url = (getattr(config, "VERIFIER_LLM_BASE_URL", "")
+                or os.environ.get("PENROSE_LLM_VERIFIER_BASE_URL", "")).rstrip("/")
+    api_key = (getattr(config, "VERIFIER_LLM_API_KEY", "")
+               or os.environ.get("PENROSE_LLM_VERIFIER_API_KEY", ""))
+    return base_url, api_key
+
+
+def _fidelity_verifier_provider() -> tuple[OpenAICompatProvider, bool, str | None]:
+    """Return provider, whether it is genuinely independent, and a cache namespace."""
+    verifier_base, verifier_key = _verifier_provider_config()
+    if not (verifier_base and verifier_key):
+        return _provider(), False, None
+    default_base, _default_key = _default_provider_config()
+    # Independence is a PROVIDER property, not a billing-key one: a different api_key at the SAME
+    # base_url and the same default model is still the model judging its own work. Only a different
+    # provider endpoint OR a different verifier model counts as genuinely independent.
+    independent = (verifier_base != default_base) or (
+        config.VERIFIER_LLM_MODEL != config.DEFAULT_LLM_MODEL)
+    namespace = hashlib.sha256(f"{verifier_base}\0{verifier_key}".encode()).hexdigest()[:12]
+    return OpenAICompatProvider(api_key=verifier_key, base_url=verifier_base), independent, namespace
+
+
 def _estimate_cost(model: str, in_tok: int, out_tok: int) -> float:
     """Rough cost in USD; per-model pricing in config.LLM_PRICING."""
     p = config.LLM_PRICING.get(model, config.LLM_PRICING["__default__"])
@@ -180,7 +211,7 @@ def _estimate_cost(model: str, in_tok: int, out_tok: int) -> float:
 def call(role: str, messages: list[dict], *,
          max_tokens: Optional[int] = None, temperature: float = 0.2,
          json_mode: bool = False, use_cache: bool = True,
-         timeout: int = 90, extra_body: Optional[dict] = None) -> LLMResponse:
+         timeout: Optional[int] = None, extra_body: Optional[dict] = None) -> LLMResponse:
     """Run one LLM call for a named role.
 
     role: one of config.LLM_ROLES (claim_extractor, falsifiability_classifier,
@@ -196,28 +227,55 @@ def call(role: str, messages: list[dict], *,
 
     role_cfg = config.LLM_ROLES[role]
     model = role_cfg["model"]
+    if timeout is None:
+        timeout = int(config.LLM_TIMEOUTS.get(role, config.LLM_TIMEOUTS.get("default", 90)))
     role_cap = role_cfg.get("max_tokens", 2000)
     if max_tokens is None:
         max_tokens = role_cap
     else:
         max_tokens = min(max_tokens, role_cap)
 
+    provider = _provider()
+    independent_verifier = False
+    verifier_cache_namespace = None
+    verifier_provider_configured = False
+    if role == "fidelity_refuter":
+        provider, independent_verifier, verifier_cache_namespace = _fidelity_verifier_provider()
+        verifier_provider_configured = verifier_cache_namespace is not None
+
+    cache_extra = ({"verifier_provider": verifier_cache_namespace}
+                   if verifier_provider_configured else {})
     key = _cache_key(model, messages, max_tokens=max_tokens, temperature=temperature,
-                     json_mode=json_mode)
+                     json_mode=json_mode, **cache_extra)
     if use_cache:
         cached = _cache_get(key)
         if cached:
             return LLMResponse(**cached)
 
     t0 = time.time()
-    payload = _provider().complete(
-        model, messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        response_format={"type": "json_object"} if json_mode else None,
-        timeout=timeout,
-        extra_body=extra_body,
-    )
+    verifier_fallback = False
+    try:
+        payload = provider.complete(
+            model, messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format={"type": "json_object"} if json_mode else None,
+            timeout=timeout,
+            extra_body=extra_body,
+        )
+    except Exception:  # noqa: BLE001 - verifier provider must degrade to the default path
+        if role != "fidelity_refuter" or not verifier_provider_configured:
+            raise
+        verifier_fallback = True
+        independent_verifier = False
+        payload = _provider().complete(
+            model, messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            response_format={"type": "json_object"} if json_mode else None,
+            timeout=timeout,
+            extra_body=extra_body,
+        )
     elapsed = time.time() - t0
     cost = _estimate_cost(payload["model"], payload["in_tokens"], payload["out_tokens"])
 
@@ -235,12 +293,13 @@ def call(role: str, messages: list[dict], *,
         in_tokens=payload["in_tokens"], out_tokens=payload["out_tokens"],
         cost_usd=cost, elapsed_s=round(elapsed, 3), cached=False,
         finish_reason=payload.get("finish_reason"),
+        independent_verifier=bool(independent_verifier),
     )
-    if use_cache and (resp.text or "").strip():   # never cache an empty reply (would poison retries)
+    if use_cache and not verifier_fallback and (resp.text or "").strip():   # never cache an empty reply (would poison retries)
         _cache_put(key, {"text": resp.text, "model": resp.model,
                          "in_tokens": resp.in_tokens, "out_tokens": resp.out_tokens,
                          "cost_usd": resp.cost_usd, "elapsed_s": resp.elapsed_s,
-                         "cached": False})
+                         "cached": False, "independent_verifier": resp.independent_verifier})
     return resp
 
 

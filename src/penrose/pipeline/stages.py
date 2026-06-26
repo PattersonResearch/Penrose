@@ -13,6 +13,91 @@ from ..brain import Claim, Decision, Principle, BrainReader, source_is_unanchore
 from .. import stats as H        # vendored DSR/Sharpe/capacity — penrose is self-contained
 
 
+def _genuine_cscv_pbo(candidate_oos_series, cpcv: dict) -> float | None:
+    """Real CSCV PBO for a supplied >=2 candidate family.
+
+    Current production callers do not pass such a family. This helper stays inert
+    unless a future caller supplies candidate return series explicitly; the
+    single-strategy CPCV path must keep `pbo` as None.
+    """
+    if not candidate_oos_series:
+        return None
+    fam = list(candidate_oos_series.values()) if isinstance(candidate_oos_series, dict) else list(candidate_oos_series)
+    if len(fam) < 2:
+        return None
+    vals = []
+    for series in fam:
+        try:
+            arr = [float(x) for x in series if x is not None and not math.isnan(float(x))]
+        except (TypeError, ValueError):
+            return None
+        vals.append(arr)
+    if not vals or len({len(v) for v in vals}) != 1 or len(vals[0]) < 10:
+        return None
+    splits = cpcv.get("splits") or []
+    n_groups = int(cpcv.get("n_groups") or 0)
+    if not splits or n_groups < 2:
+        return None
+    n = len(vals[0])
+    groups = [list(g) for g in __import__("numpy").array_split(range(n), n_groups)]
+    logits = []
+    for sp in splits:
+        test_groups = set(sp.get("test_groups") or [])
+        test_idx = [i for g, idx in enumerate(groups) if g in test_groups for i in idx]
+        train_idx = [i for g, idx in enumerate(groups) if g not in test_groups for i in idx]
+        if not test_idx or not train_idx:
+            continue
+        is_scores = [sum(v[i] for i in train_idx) / len(train_idx) for v in vals]
+        best = max(range(len(is_scores)), key=lambda j: (is_scores[j], -j))
+        oos_scores = [sum(v[i] for i in test_idx) / len(test_idx) for v in vals]
+        rank = 1 + sum(x < oos_scores[best] for x in oos_scores)
+        pct = rank / (len(oos_scores) + 1.0)
+        if 0.0 < pct < 1.0:
+            logits.append(math.log(pct / (1.0 - pct)))
+    if not logits:
+        return None
+    return round(sum(1 for x in logits if x < 0.0) / len(logits), 4)
+
+
+def _power_resolution(n_oos, bars_per_year, mde_ic, pw: dict) -> dict | None:
+    """Sequential sample guidance for verdicts below the detection floor."""
+    try:
+        current = int(n_oos or 0)
+        floor = float(pw.get("realistic_ic_floor") or 0.0)
+        z_certify = float(pw.get("z_certify") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if current < 1 or floor <= 0.0 or z_certify <= 0.0 or mde_ic is None:
+        return None
+    needed = int((z_certify / floor) ** 2) + 1
+    try:
+        bpy = float(bars_per_year or 0.0)
+    except (TypeError, ValueError):
+        bpy = 0.0
+    needed_breadth = (max(1, int(math.ceil((z_certify / floor) ** 2 / max(1, current))))
+                      if bpy > 0.0 else None)
+    return {
+        "current_oos_bars": current,
+        "needed_oos_bars": needed,
+        "more_oos_bars_needed": max(0, needed - current),
+        "needed_breadth_n": needed_breadth,
+        "current_mde_ic": mde_ic,
+        "basis": "z/sqrt(n) single-asset; breadth via IR=IC*sqrt(N*bars)",
+    }
+
+
+def _resolution_rationale(verdict: str, resolution: dict, pw: dict) -> str:
+    floor = pw.get("realistic_ic_floor")
+    more = resolution.get("more_oos_bars_needed")
+    breadth = resolution.get("needed_breadth_n")
+    if breadth is None:
+        breadth_txt = "or add native cross-sectional breadth"
+    else:
+        breadth_txt = f"or breadth >= {breadth} names"
+    return (f"{verdict}: ~{more} more OOS trades ({breadth_txt}) would resolve a realistic "
+            f"{floor} IC edge")
+
+
 # --- P1 ingest -------------------------------------------------------------- #
 def p1_ingest(source_id: str, title: str) -> dict:
     return {"stage": "P1", "source_id": source_id, "title": title,
@@ -231,9 +316,22 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     boot = bt.get("bootstrap") or {}
     perm = bt.get("permutation") or {}
     regime = bt.get("regime") or {}
+    declared_regime = regime.get("declared_regime") or getattr(claim, "declared_regime", None)
+    cpcv = dict(bt.get("cpcv") or {})
+    pbo = _genuine_cscv_pbo(bt.get("cpcv_candidate_oos_series"), cpcv)
+    if pbo is not None:
+        cpcv["pbo"] = pbo
     gates = config.ROBUSTNESS_GATES
     if verdict in ("watch", "research-supported"):
-        if gates.get("kill_if_regime_fragile", True) and regime.get("fragile"):
+        if declared_regime and regime.get("adheres") is False:
+            verdict, kill = "kill", "regime_mismatch"
+            adherence = regime.get("adherence") or {}
+            reasons.append(
+                f"regime_mismatch: declared {declared_regime.get('scheme')}="
+                f"{declared_regime.get('label')} but adherence failed "
+                f"(trade_share={adherence.get('trade_share')}, "
+                f"top_edge_label={adherence.get('top_edge_label')})")
+        elif gates.get("kill_if_regime_fragile", True) and regime.get("fragile"):
             verdict, kill = "kill", "regime_fragile"
             reasons.append(f"regime-fragile: {regime.get('fragile_reason')}")
         elif gates["kill_if_edge_ci_includes_zero"] and boot.get("edge_ci_includes_zero"):
@@ -253,6 +351,13 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                 verdict, kill = "kill", "walk_forward_drift"
                 reasons.append(f"walk-forward inconsistent across windows {wf.get('per_window_sharpe')} "
                                "(parameter drift)")
+            elif (gates.get("kill_if_cpcv_overfit", True)
+                  and cpcv.get("ran") and cpcv.get("overfit")):
+                verdict, kill = "kill", "overfit_cpcv"
+                reasons.append(
+                    f"CPCV overfit: prob_oos_loss={cpcv.get('prob_oos_loss')}, "
+                    f"median_oos_sharpe={cpcv.get('median_oos_sharpe')}, "
+                    f"combos={cpcv.get('combos_used')}")
 
     if cap is None and verdict in ("watch", "research-supported"):
         reasons.append("capacity not estimable")
@@ -293,28 +398,29 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     # below the detection floor. Relabel it `underpowered`. Structural kills (in_sample_only,
     # regime_fragile, walk_forward_drift, no_signal_alignment, negative_dsr) are power-INDEPENDENT
     # and stand. This is the fix for "a skeptic that rejects everything real == a broken always-no".
-    _AMBIGUOUS_NULL = {"no_oos_edge", "edge_ci_zero"}
+    _AMBIGUOUS_NULL = {"no_oos_edge", "edge_ci_zero", "overfit_cpcv"}
     if verdict == "kill" and kill in _AMBIGUOUS_NULL and not power_sufficient:
         verdict, kill = "underpowered", "below_detection_floor"
-        _need = int((pw["z_certify"] / pw["realistic_ic_floor"]) ** 2) + 1
-        if _n_oos and _bpy and pw.get("realistic_ic_floor", 0) > 0:
-            _need_breadth = max(1, int(math.ceil(
-                (pw["z_certify"] / pw["realistic_ic_floor"]) ** 2 / max(1, _n_oos))))
-        else:
-            _need_breadth = None
-        resolution = {
-            "needed_oos_bars": _need if _n_oos else None,
-            "needed_breadth_n": _need_breadth,
-            "current_mde_ic": mde_ic,
-            "basis": "z/sqrt(n) single-asset; breadth via IR=IC*sqrt(N*bars)",
-        }
+        resolution = _power_resolution(_n_oos, _bpy, mde_ic, pw)
         reasons.append(
             f"NOT proven dead — below the detection floor: min detectable IC ~{mde_ic} on n_oos="
             f"{_n_oos} (realistic edges are 0.02-0.05). To resolve a {pw['realistic_ic_floor']} IC "
-            f"edge you'd need n_oos >~ {_need} at this breadth, or to test at native cross-sectional "
+            f"edge you'd need n_oos >~ {resolution.get('needed_oos_bars') if resolution else None} "
+            f"at this breadth, or to test at native cross-sectional "
             f"breadth. Verdict = cannot falsify at deployable confidence, not 'dead'.")
+    if resolution is None and not power_sufficient:
+        resolution = _power_resolution(_n_oos, _bpy, mde_ic, pw)
+    # The "~N more trades would resolve it" RATIONALE applies ONLY to the power-limited labels.
+    # Structural kills (in_sample_only, regime_fragile, no_signal_alignment, walk_forward_drift, ...)
+    # are power-INDEPENDENT and stand — telling a researcher to collect more data there is false. The
+    # resolution OBJECT is still attached in metrics (above) as neutral data for any not-powered case.
+    if resolution and verdict in ("underpowered", "insufficient_data"):
+        reasons.append(_resolution_rationale(verdict, resolution, pw))
 
     rationale = "; ".join(reasons) or "passed all gates"
+    if declared_regime and verdict != "kill" and regime.get("adheres") is True:
+        rationale += (f"; valid within declared regime: {declared_regime.get('scheme')}="
+                      f"{declared_regime.get('label')}; not a claim about other regimes")
     if synthetic:
         rationale += ". NOTE: macro signal SYNTHETIC this run — provisional verdict."
 
@@ -335,9 +441,12 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "is_sharpe": bt.get("is_sharpe"),
                  "three_fold": folds.get("folds"), "n_trades": bt.get("n"),
                  "bootstrap": boot, "permutation": perm, "regime": regime,
+                 "cpcv": cpcv,
                  "capacity_ci": bt.get("capacity_ci"),
                  "cost_sensitivity": bt.get("cost_sensitivity"),
                  "walk_forward": bt.get("walk_forward"),
+                 "declared_regime": declared_regime,
+                 "regime_adherence": regime.get("adherence"),
                  "fidelity_provenance": fidelity_provenance,
                  "holdout": holdout, "synthetic_signal": synthetic},
         revisit_at="2026-07-01",

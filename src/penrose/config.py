@@ -47,18 +47,32 @@ DATA_CACHE = ROOT / ".data_cache"
 LLM_CACHE_DIR = ROOT / ".llm_cache"
 DECISIONS_LOG = ROOT / "decisions.jsonl"               # decisions log (atoms also go to brain)
 PRINCIPLES_LOG = ROOT / "principles.jsonl"
+PROPOSALS_LOG = REPORTS / "proposals.jsonl"            # propose-only, never P9-approved knowledge
 REVIEW_QUEUE = ROOT / "review_queue.jsonl"             # P9 Action Required queue
 DATA_REQUESTS = ROOT / "data_requests.jsonl"          # backlog: data a claim needs but the catalog lacks
 PROCESSED_PAPERS = ROOT / "processed_papers.json"     # filenames already run, so the loop advances through inbox/
 DREAM_RUNS = ROOT / "dream_runs.jsonl"                # registered generator searches + lifecycle summaries
 PROGRESS_JSON = ROOT / "dashboard" / "progress.json"  # live per-stage progress for the dashboard activity panel
 ANALYSIS_INDEX = ROOT / "reports" / "analysis_index.jsonl"  # backtested outcomes + chart paths for the Reports page
+FIDELITY_REJECTIONS = ROOT / "reports" / "fidelity_rejections.jsonl"
 CONCEPTS = REPORTS / "concepts.jsonl"
 CORPUS_GRAPH = REPORTS / "corpus_graph.jsonl"
 CORPUS_JSON = ROOT / "dashboard" / "corpus.json"
 SYNTHESIS_ARCHIVES = ARCHIVES / "syntheses"
 SYNTHESIS_RUNS = ROOT / "synthesis_runs.jsonl"
 LIVE_JSON = ROOT / "dashboard" / "live.json"           # what the read-only dash server injects
+
+
+def ensure_output_dirs() -> None:
+    """Create first-run output directories. Safe to call repeatedly."""
+    for path in (
+        REPORTS,
+        REPORTS / "charts",
+        LIVE_JSON.parent,
+        LLM_CACHE_DIR,
+        ARCHIVES,
+    ):
+        path.mkdir(parents=True, exist_ok=True)
 
 # --- LLM provider config --------------------------------------------------- #
 # All roles default to GLM 5x. Swap by editing PENROSE_LLM_* env vars or
@@ -67,6 +81,8 @@ LIVE_JSON = ROOT / "dashboard" / "live.json"           # what the read-only dash
 # Ollama, LiteLLM proxy, etc.).
 DEFAULT_LLM_MODEL = os.environ.get("PENROSE_LLM_DEFAULT_MODEL", "glm-5.2")
 VERIFIER_LLM_MODEL = os.environ.get("PENROSE_LLM_VERIFIER_MODEL", DEFAULT_LLM_MODEL)
+VERIFIER_LLM_BASE_URL = os.environ.get("PENROSE_LLM_VERIFIER_BASE_URL", "")
+VERIFIER_LLM_API_KEY = os.environ.get("PENROSE_LLM_VERIFIER_API_KEY", "")
 
 LLM_ROLES = {
     # NOTE: glm-5.2 is a THINKING model — reasoning tokens count against max_tokens. A cap
@@ -83,7 +99,8 @@ LLM_ROLES = {
     "module_implementer":       {"model": DEFAULT_LLM_MODEL, "max_tokens": 16000,
                                  "max_cost_per_call": 0.60},
     # adversarial VERIFY gate — checks a module faithfully implements its claim. Configure an
-    # independent judge with PENROSE_LLM_VERIFIER_MODEL; unset preserves the default model.
+    # independent judge with PENROSE_LLM_VERIFIER_BASE_URL/API_KEY/MODEL; unset preserves the
+    # default provider/model path.
     "fidelity_refuter":         {"model": VERIFIER_LLM_MODEL, "max_tokens": 4000,
                                  "max_cost_per_call": 0.30},
     "concept_extractor":        {"model": DEFAULT_LLM_MODEL, "max_tokens": 5000,
@@ -121,6 +138,13 @@ LLM_BUDGET = {
     "max_usd_per_day": float(os.environ.get("PENROSE_LLM_MAX_USD_DAY", "40.0")),
     "_note": "hard daily cap (F6-lite); raises RuntimeError if exceeded",
 }
+
+LLM_TIMEOUTS = {
+    "default": int(os.environ.get("PENROSE_LLM_TIMEOUT_DEFAULT", "90")),
+    "fidelity_refuter": int(os.environ.get("PENROSE_LLM_TIMEOUT_FIDELITY_REFUTER", "150")),
+}
+
+CLAIM_TIME_BUDGET_SECONDS = float(os.environ.get("PENROSE_CLAIM_TIME_BUDGET_SECONDS", "0") or 0)
 
 # Optional local data catalog for PRE-COLLECTED series that have no free live API
 # (e.g. historical Kalshi macro signals). Bring-your-own: point PENROSE_DATA_DIR at a
@@ -179,12 +203,18 @@ POWER = {"realistic_ic_floor": 0.05,   # the effect size we want to be able to r
 BOOTSTRAP = {"n_boot": 2000, "ci": 0.90, "block": None, "seed": 0}
 PERMUTATION = {"n_perm": 2000, "seed": 0}
 WALK_FORWARD = {"n_windows": 4, "scheme": "anchored", "is_min": 0.30}
+CPCV = {"n_groups": 8, "k_test": 2, "embargo_frac": 0.01,
+        "max_combos": 200, "seed": 0,
+        "overfit_prob_kill": 0.50,
+        "min_paths": 6}
 ROBUSTNESS_GATES = {
     "kill_if_edge_ci_includes_zero": True,   # bootstrap edge CI straddles 0 -> kill
     "permutation_kill_p": 0.10,              # data-snooping p above this -> kill
     "kill_if_regime_fragile": True,          # edge concentrated in one calendar regime -> kill
     "kill_if_walk_forward_inconsistent": True,  # B-007: walk-forward drift -> kill (independent axis)
+    "kill_if_cpcv_overfit": True,            # CPCV loss distribution kills only borderline survivors
 }
+REGIME_ADHERENCE_MIN = 0.60
 
 # Advisory by default: report how much higher modeled costs can go before a survivor flips.
 # Enabling this turns the advisory into a stricter verdict gate for isolated tests/experiments.

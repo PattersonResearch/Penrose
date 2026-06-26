@@ -41,7 +41,7 @@ pip install -e .
 # optional in-process embeddings (vector retrieval; lexical fallback works without it):
 pip install -e '.[embed]'
 
-python scripts/eval_suite.py                          # 82/82 invariants
+python scripts/eval_suite.py                          # 92/92 invariants
 python scripts/calibration_placebo.py                 # placebo: no no-edge signal certified
 python scripts/worked_example_process_conditional.py  # the process-conditional verdict demo
 python -m pytest -q

@@ -358,10 +358,15 @@ def _add_catalog_series(bundle: DataBundle) -> None:
         import loader as catalog  # <PENROSE_DATA_DIR>/loader.py
     except Exception:  # noqa: BLE001
         return
+    if not hasattr(catalog, "available") or not hasattr(catalog, "load_series"):
+        return
     for name in catalog.available():
         if name in bundle.series:
             continue
-        r = catalog.load_series(name)
+        try:
+            r = catalog.load_series(name)
+        except Exception:  # noqa: BLE001
+            continue
         if r is None:
             continue
         s, prov = r

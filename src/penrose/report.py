@@ -52,6 +52,19 @@ def write_report(source_id, title, claims, decisions, provenance, principle) -> 
             lines.append("\n- **Single-use holdout:** "
                          f"Sharpe {ho.get('holdout_sharpe')}, "
                          f"PSR {ho.get('holdout_psr')}, nbars {ho.get('nbars')}")
+        regime = m.get("regime") or {}
+        declared = regime.get("declared_regime") or m.get("declared_regime")
+        if declared:
+            adherence = regime.get("adherence") or m.get("regime_adherence") or {}
+            lines.append("- **Declared regime:** "
+                         f"`{declared.get('scheme')}={declared.get('label')}`; "
+                         f"trade_share={adherence.get('trade_share')}, "
+                         f"edge_share={adherence.get('edge_share')}, "
+                         f"adheres={regime.get('adheres')}; "
+                         f"declared-scheme exemption="
+                         f"{regime.get('declared_exempted', False) and regime.get('adheres') is True}")
+            if d.verdict != "kill" and regime.get("adheres") is True:
+                lines.append("- **Scope:** valid within declared regime; not a claim about other regimes.")
         try:
             psr = float(m.get("psr"))
             dsr = float(m.get("dsr"))
@@ -63,11 +76,16 @@ def write_report(source_id, title, claims, decisions, provenance, principle) -> 
         res = m.get("resolution")
         if res:
             edge = res.get("current_mde_ic")
+            current = res.get("current_oos_bars")
             bars = res.get("needed_oos_bars")
+            more = res.get("more_oos_bars_needed")
             breadth = res.get("needed_breadth_n")
             target = config.POWER["realistic_ic_floor"]
+            breadth_txt = (f"or breadth >= {breadth} names" if breadth is not None
+                           else "or add native cross-sectional breadth")
             lines.append(f"- **Resolution:** current MDE IC ~{edge}; to resolve a {target} IC edge: "
-                         f"~{bars} OOS trades, or breadth >= {breadth} names")
+                         f"{current} current OOS trades, ~{bars} total "
+                         f"(~{more} more), {breadth_txt}")
         cs = m.get("cost_sensitivity") or {}
         if cs:
             cfg_bps = 1e4 * (cs.get("configured_cost_frac") or 0.0)
@@ -80,6 +98,19 @@ def write_report(source_id, title, claims, decisions, provenance, principle) -> 
                 lines.append(f"- **Cost sensitivity:** survives to ~{1e4*be:.1f} bps round-trip; "
                              f"configured cost {cfg_bps:.1f} bps"
                              f"{f' (margin {margin}x)' if margin is not None else ''}")
+        cv = m.get("cpcv") or {}
+        if cv.get("ran"):
+            bits = [
+                f"median OOS Sharpe {cv.get('median_oos_sharpe')}",
+                f"prob_oos_loss {cv.get('prob_oos_loss')}",
+                f"haircut {cv.get('haircut')}",
+                f"combos {cv.get('combos_used')}/{cv.get('combos_total')}",
+            ]
+            if cv.get("pbo") is not None:
+                bits.append(f"PBO {cv.get('pbo')}")
+            if d.kill_reason == "overfit_cpcv":
+                bits.append("kill_reason overfit_cpcv")
+            lines.append(f"- **CPCV:** {', '.join(bits)}")
         ci = m.get("corpus_isolation") or {}
         if ci:
             lines.append(f"- **Corpus isolation:** {ci.get('advisory')} "

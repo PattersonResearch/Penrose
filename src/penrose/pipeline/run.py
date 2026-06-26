@@ -13,10 +13,14 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import fcntl
+import hashlib
 import json
 import os
 import re
 import sys
+import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,7 +33,7 @@ from ..report import write_report
 from . import stages, p7_backtest
 # NB: claims.py is per-paper P2 output and gitignored (cold-start = none), so it is NOT imported
 # here — a fresh clone has no claims.py. extract.fallback_claims loads it lazily when present.
-from . import p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox
+from . import p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox, fidelity_memory
 
 
 def _now() -> str:
@@ -37,6 +41,8 @@ def _now() -> str:
 
 
 def _append_jsonl(path, obj) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a") as f:
         f.write(json.dumps(obj, default=str) + "\n")
 
@@ -58,11 +64,83 @@ def _processed_set() -> set[str]:
         return set()
 
 
-def _mark_processed(paper_path: Path) -> None:
-    done = _processed_set()
-    done.add(paper_path.name)
-    config.PROCESSED_PAPERS.write_text(
-        json.dumps({"processed": sorted(done), "updated_at": _now()}, indent=2))
+def _record_processed_source(source_id: str, paper_path: Path, text_sha256: str) -> None:
+    existing = {}
+    if config.PROCESSED_PAPERS.exists():
+        try:
+            raw = json.loads(config.PROCESSED_PAPERS.read_text())
+            existing = raw if isinstance(raw, dict) else {}
+        except Exception:  # noqa: BLE001
+            existing = {}
+    processed = set(existing.get("processed", []) or [])
+    processed.add(paper_path.name)
+    sources = dict(existing.get("sources", {}) or {})
+    sources[source_id] = {
+        "paper": paper_path.name,
+        "content_sha256": text_sha256,
+        "completed_at": _now(),
+    }
+    config.PROCESSED_PAPERS.parent.mkdir(parents=True, exist_ok=True)
+    config.PROCESSED_PAPERS.write_text(json.dumps({
+        **existing,
+        "processed": sorted(processed),
+        "sources": sources,
+        "updated_at": _now(),
+    }, indent=2))
+
+
+def _processed_source_entry(source_id: str) -> dict:
+    if not config.PROCESSED_PAPERS.exists():
+        return {}
+    try:
+        raw = json.loads(config.PROCESSED_PAPERS.read_text())
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    sources = raw.get("sources", {}) or {}
+    entry = sources.get(source_id, {})
+    return entry if isinstance(entry, dict) else {}
+
+
+def _decision_row_source_id(row: dict) -> str:
+    source_id = str(row.get("source_id") or "")
+    if source_id:
+        return source_id
+    claim_id = str(row.get("claim_id") or "")
+    m = re.match(r"^(.+)-c\d+(?:$|-)", claim_id)
+    return m.group(1) if m else ""
+
+
+def _supersede_decision_rows(source_id: str, run_id: str) -> int:
+    """Remove prior decision rows for this source_id only, preserving this run's rows."""
+    path = config.DECISIONS_LOG
+    if not path.exists():
+        return 0
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = Path(str(path) + ".lock")
+    keep: list[str] = []
+    removed = 0
+    with lock_path.open("a+") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                keep.append(line)
+                continue
+            if _decision_row_source_id(row) == source_id and row.get("run_id") != run_id:
+                removed += 1
+            else:
+                keep.append(line)
+        if removed:
+            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
+            tmp.write_text(("\n".join(keep) + "\n") if keep else "")
+            tmp.replace(path)
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    return removed
 
 
 def _inbox_pdfs() -> list[Path]:
@@ -95,6 +173,12 @@ def _find_paper(cli_path: str | None) -> Path | None:
 # before running the paper those modules target. A new paper with no module
 # triggers ModuleSpec generation at P6.
 REGISTRY: dict[str, object] = {}   # strategy_class -> module object with .run()
+_REGISTRY_ALIAS_OWNERS: dict[str, str] = {}
+_REGISTRY_CANONICAL_OWNERS: dict[str, str] = {}
+
+
+def _canonical_strategy_class(alias: str) -> str:
+    return str(alias or "").replace("-", "_")
 
 
 def _register_known_modules() -> None:
@@ -136,16 +220,24 @@ def _register_known_modules() -> None:
             if primary:
                 aliases.add(primary)
             if hasattr(module, "run") and aliases:
+                owner = str(getattr(module, "__module_id__", "") or mod_dir.name)
                 for alias in aliases:
+                    canonical = _canonical_strategy_class(alias)
+                    existing_owner = (
+                        _REGISTRY_CANONICAL_OWNERS.get(canonical)
+                        or _REGISTRY_ALIAS_OWNERS.get(alias)
+                    )
                     # Trusted-first-wins: never let a later trusted module silently clobber an
                     # alias another already claimed (a real operator foot-gun — dir-iteration
                     # order would otherwise decide routing nondeterministically). First registrant
                     # keeps the alias; the collision is surfaced, not hidden.
-                    if alias in REGISTRY and REGISTRY[alias] is not module:
+                    if existing_owner is not None and existing_owner != owner:
                         print(f"[penrose] strategy_class alias collision: {alias!r} already owned by "
-                              f"{getattr(REGISTRY[alias], '__module_id__', '?')}; "
+                              f"{existing_owner}; "
                               f"{mod_dir.name} not registered for it", file=sys.stderr)
                         continue
+                    _REGISTRY_CANONICAL_OWNERS[canonical] = owner
+                    _REGISTRY_ALIAS_OWNERS[alias] = owner
                     REGISTRY[alias] = module
         except Exception as e:  # noqa: BLE001
             print(f"[penrose] module {mod_dir.name} failed to load: {e}", file=sys.stderr)
@@ -178,6 +270,76 @@ def _family(claim, module) -> str:
     return f"{cls}::{_data_domain(claim)}"
 
 
+def _generation_source_for(claim: Claim) -> str:
+    if claim.source_type == "confirmation":
+        return "confirmation"
+    if source_is_unanchored(claim.source_type):
+        return "generated"
+    return "paper"
+
+
+def _cohort_id(source_id: str, family: str) -> str:
+    digest = hashlib.sha256(family.encode("utf-8")).hexdigest()[:16]
+    return f"{source_id}:p7:{digest}"
+
+
+def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str) -> None:
+    """Register the run's P7-ready claims as per-family cohorts before backtesting.
+
+    This fixes the paper/external path's order-dependent running denominator. The cohort is
+    built only from claims that survived P3-P6 and are about to enter P7; if ledger registration
+    fails, leave newly computed cohort fields unset so P7 falls back to the prior running count.
+    """
+    if not ready_for_backtest:
+        return
+    grouped: dict[str, list[dict]] = {}
+    for item in ready_for_backtest:
+        claim = item["claim"]
+        family = _family(claim, item["module"])
+        item["family"] = family
+        grouped.setdefault(family, []).append(item)
+
+    prepared: list[tuple[Claim, str, str, int]] = []
+    rows: list[dict] = []
+    for family, items in sorted(grouped.items()):
+        # The per-run cohort size is this run's P7-ready claim count only. Ignore any
+        # stale cohort fields if a Claim object is accidentally reused across runs.
+        denominator = len(items)
+        cohort_id = _cohort_id(source_id, family)
+        for item in items:
+            claim = item["claim"]
+            prepared.append((claim, family, cohort_id, denominator))
+            rows.append({
+                "strategy": claim.claim_id,
+                "family": family,
+                "generation_source": _generation_source_for(claim),
+                "search_cohort_id": cohort_id,
+                "search_denominator": denominator,
+            })
+    try:
+        p7_backtest.register_trials(rows)
+    except Exception as e:  # noqa: BLE001
+        print(f"[penrose] cohort pre-registration failed; falling back to running count: "
+              f"{type(e).__name__}: {e}", file=sys.stderr)
+        return
+    for claim, _family_name, cohort_id, denominator in prepared:
+        claim.search_cohort_id = cohort_id
+        claim.search_denominator = denominator
+
+
+def _cleanup_run_cohorts(ready_for_backtest: list[dict]) -> None:
+    cohort_ids = {
+        str(getattr(item["claim"], "search_cohort_id", "") or "")
+        for item in ready_for_backtest
+        if _generation_source_for(item["claim"]) == "paper"
+    }
+    try:
+        p7_backtest.cleanup_unscored_paper_cohorts(cohort_ids)
+    except Exception as e:  # noqa: BLE001
+        print(f"[penrose] cohort cleanup failed; continuing: {type(e).__name__}: {e}",
+              file=sys.stderr)
+
+
 def _holdout_unreachable_reason(claim: Claim) -> str | None:
     if getattr(config, "COST_PROVENANCE", "modeled") != "measured":
         return ("holdout not consulted: research-supported unreachable under modeled costs - "
@@ -208,8 +370,11 @@ def _maybe_consult_holdout(claim: Claim, bt: dict, mres: dict, dec, synthetic: b
 def run_source(paper_path: Path, *, use_llm: bool | None = None,
                claims_override: list[Claim] | None = None,
                source_type: str = "external_source",
-               bundle_override=None) -> dict:
+               bundle_override=None,
+               force: bool = False,
+               max_claims: int | None = None) -> dict:
     """Run one paper end-to-end. Returns the run log (also written to runs.jsonl)."""
+    config.ensure_output_dirs()
     source_type = validate_source_type(source_type)
     if claims_override is not None:
         for claim in claims_override:
@@ -224,11 +389,33 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     source = p1_ingest.sanitize(paper_path)
     source_id = source.source_id
     title = source.title or source_id
+    run_id = f"{source_id}-{uuid.uuid4().hex}"
     run_log["source_id"] = source_id
     run_log["source_title"] = source.title
     run_log["p1"] = {"n_pages": source.n_pages, "n_chars": source.n_chars,
                      "sha": source.text_sha256,
                      "injection_flags": source.injection_flags}
+    run_log["idempotency"] = {
+        "source_id": source_id,
+        "run_id": run_id,
+        "content_sha256": source.text_sha256,
+        "force": bool(force),
+        "superseded_decisions": 0,
+    }
+    prior = _processed_source_entry(source_id)
+    if (
+        not force
+        and prior.get("completed_at")
+        and prior.get("content_sha256") == source.text_sha256
+    ):
+        msg = "already processed (unchanged); use --force to re-run"
+        print(f"[penrose] {source_id}: {msg}", file=sys.stderr)
+        run_log["idempotency"]["skipped"] = True
+        run_log["note"] = msg
+        _append_jsonl(config.ROOT / "runs.jsonl", run_log)
+        _record_processed_source(source_id, paper_path, source.text_sha256)
+        _progress(None)
+        return run_log
 
     # archive the source record
     archive_kind = ("dreams" if source_type == "generated_hypothesis"
@@ -260,7 +447,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         if not rel.get("relevant", True):
             print(f"[penrose] off-domain, skipping P2+: {rel.get('reason')}", file=sys.stderr)
             _progress(None)
-            return _finish_offdomain(source, source_id, rel, run_log)
+            out = _finish_offdomain(source, source_id, rel, run_log)
+            run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
+            _append_jsonl(config.ROOT / "runs.jsonl", run_log)
+            _record_processed_source(source_id, paper_path, source.text_sha256)
+            return out
 
     # register operator-supplied modules FIRST, so P2 can reuse their strategy classes
     # (controlled-vocabulary routing — the LLM names an existing class when a claim fits,
@@ -294,9 +485,15 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     run_log["p2"] = p2_prov
     if not claims:
         run_log["note"] = "no claims extracted; pipeline ends here"
+        run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
         _append_jsonl(config.ROOT / "runs.jsonl", run_log)
+        _record_processed_source(source_id, paper_path, source.text_sha256)
         _progress(None)
         return run_log
+    if max_claims is not None:
+        max_claims = max(0, int(max_claims))
+        run_log["max_claims"] = max_claims
+        claims = claims[:max_claims]
 
     # ---- one data pull shared across claims ------------------------------- #
     bundle = bundle_override if bundle_override is not None else dataclient.fetch_bundle()
@@ -306,8 +503,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
 
     decisions = []
     specs_generated = []
+    ready_for_backtest = []
+    auto_fetch_attempted_series: set[str] = set()
 
     for _ci, claim in enumerate(claims, 1):
+        claim_started = time.monotonic()
         _progress("evaluate", detail=f"P3–P6 routing: {_short_name(claim)}",
                   paper=title, claim_i=_ci, claim_n=len(claims))
         rec: dict = {"claim_id": claim.claim_id, "statement": claim.statement, "stages": {}}
@@ -354,17 +554,27 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 _mc = Path(getattr(module, "__file__", "") or "").read_text()
             except Exception:  # noqa: BLE001
                 _mc = ""
-            _rf = fidelity.assess(claim, _mc)
+            _rf = _assess_fidelity_safe(claim, _mc)
             if not _rf.get("verified", False):
                 rec["stages"]["P6_route_fidelity"] = {
                     "reused": False, "reason": _rf.get("note", "")[:140],
                     "confidence": _rf.get("confidence", 0),
                 }
                 module = None      # unverified reuse is not an authorization to test this claim
+        if _claim_budget_exceeded(claim_started):
+            decisions.append(_skip(claim, "timeout",
+                                   "skipped: per-claim time budget exceeded before module routing",
+                                   rec, run_log))
+            continue
         if module is None:
             # cold-start / novel class -> generate spec, then TRY to auto-implement it
             spec = spec_gen.generate_spec(claim, source, use_llm=use_llm)
             specs_generated.append(spec)
+            pre_fid = _assess_spec_fidelity_safe(claim, spec) if use_llm and getattr(config, "FIDELITY_CHECK", False) else {}
+            if _fidelity_confidently_unfaithful(pre_fid):
+                _persist_fidelity_rejection(claim, spec, pre_fid)
+                decisions.append(_cannot_replicate_unfaithful_spec(claim, spec, pre_fid, rec, run_log))
+                continue
             # Auto-implementation REQUIRES the Docker sandbox — model-written code never execs unsandboxed.
             # No Docker -> no auto-implement (the claim stays pending_module for the operator).
             if not config.AUTO_IMPLEMENT_MODULES:
@@ -402,191 +612,242 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         else:
             rec["stages"]["P6"] = {"module_id": getattr(module, "__module_id__", "unknown"),
                                    "spec_generated": False}
-        # ---- P7: backtest (pre-existing OR just auto-implemented module) -- #
-        _progress("evaluate", detail=f"P7 backtest: {_short_name(claim)}",
-                  paper=title, claim_i=_ci, claim_n=len(claims))
-        bundle.reset_access()                 # track which series THIS module reads (per-verdict synthetic)
-        is_auto = bool(getattr(module, "__auto_generated__", False))
-        if is_auto:
-            # untrusted model-written code -> run in the Docker sandbox, NEVER in-process
-            mres = sandbox.run_in_container(getattr(module, "__file__", ""), bundle, claim, cost_frac)
-        else:
-            try:
-                mres = module.run(bundle, claim, cost_frac)   # operator/trusted module, in-process
-            except TypeError:
-                # legacy signature: run(bundle, channel, cost_frac)
-                try:
-                    mres = _run_legacy_module(module, bundle, claim, cost_frac)
-                except Exception as e:  # noqa: BLE001
-                    mres = {"ok": False, "reason": f"data_unavailable: legacy module raised {type(e).__name__}: {e}"}
-            except Exception as e:  # noqa: BLE001 — a buggy module must not abort the whole paper (A-027)
-                mres = {"ok": False, "reason": f"data_unavailable: module raised {type(e).__name__}: {e}"}
-        if not isinstance(mres, dict) or not mres.get("ok"):
-            mres = mres if isinstance(mres, dict) else {"ok": False, "reason": "module returned non-dict"}
-            # A module that can't get its data is NOT a falsified claim — it's a data
-            # BLOCKER. Record a structured request to the data backlog and mark the claim
-            # needs_data (re-runnable once the catalog gains the series), never kill it.
-            decisions.append(_needs_data(claim, mres.get("reason"), rec, run_log))
+        if _claim_budget_exceeded(claim_started):
+            decisions.append(_skip(claim, "timeout",
+                                   "skipped: per-claim time budget exceeded before backtest",
+                                   rec, run_log))
             continue
-        # B-005: an ok-module may still omit required keys -> guard before subscript (no KeyError
-        # aborting the paper). Treat a malformed result as a data blocker, not a crash.
-        _missing = [k for k in ("net", "positions", "bars_per_year") if k not in mres]
-        if _missing:
-            decisions.append(_needs_data(
-                claim, f"data_unavailable: module result missing keys {_missing}", rec, run_log))
-            continue
-        family = _family(claim, module)        # C1: strategy_class + data_domain
-        # Pre-registered point-in-time MARKET-regime labels for the kill-lens. PRIMARY source is
-        # the bundle's regime catalog series (btc_vol_regime / btc_trend_regime) — the SAME labels
-        # a module conditions on via bundle.get(), so the lens partitions by exactly what the
-        # strategy could have used. A module may also hand back its own labels (regime_schemes) or
-        # the price series it traded (prices) to derive more. All are exogenous + trailing -> not
-        # data-snooping; each populated bucket still inflates the DSR trial count (no free pass).
-        reg_schemes = {}
-        for _rk in ("btc_vol_regime", "btc_trend_regime"):
-            _rs = bundle.series.get(_rk)
-            if _rs is not None and getattr(_rs, "available", False) and getattr(_rs, "data", None) is not None:
-                reg_schemes[_rk] = _rs.data
-        if mres.get("regime_schemes"):
-            if not isinstance(mres["regime_schemes"], dict):
-                decisions.append(_needs_data(
-                    claim, "data_unavailable: module regime_schemes must be a mapping", rec, run_log))
-                continue
-            reg_schemes.update(mres["regime_schemes"])
-        elif mres.get("prices") is not None:
-            try:
-                reg_schemes.update(regime_lib.regime_schemes(mres["prices"]))
-            except Exception:  # noqa: BLE001 — a label-build failure must not abort the paper
-                pass
-        reg_schemes = reg_schemes or None
-        try:
-            bt = p7_backtest.run_backtest(
-                claim.claim_id, mres["net"], mres["positions"], mres["bars_per_year"],
-                payoff=mres.get("payoff"), position_signed=mres.get("position_signed"),
-                cost_frac=cost_frac, wf_frame=mres.get("wf_frame"), family=family,
-                generation_source=("confirmation" if claim.source_type == "confirmation"
-                                   else "generated" if source_is_unanchored(claim.source_type)
-                                   else "paper"),
-                search_cohort_id=claim.search_cohort_id,
-                search_denominator=claim.search_denominator,
-                regime_schemes=reg_schemes)
-        except Exception as e:  # noqa: BLE001 — C-005: one bad backtest must not abort the paper
-            decisions.append(_needs_data(
-                claim, f"data_unavailable: backtest raised {type(e).__name__}: {e}", rec, run_log))
-            continue
-        rec["stages"]["P7"] = bt
+        ready_for_backtest.append({
+            "claim": claim,
+            "module": module,
+            "rec": rec,
+            "claim_i": _ci,
+        })
 
-        # Per-verdict synthetic flag: only synthetic if THIS module actually READ a synthetic
-        # series (in-process tracking). Sandboxed modules can't be tracked from here -> fall
-        # back to the conservative bundle-level flag.
-        syn_here = synthetic if is_auto else bundle.accessed_synthetic()
+    _register_run_cohorts(ready_for_backtest, source_id)
 
-        # ---- P8: verdict -------------------------------------------------- #
-        # Run the verdict provisionally WITHOUT the holdout first, so all robustness KILL
-        # gates (3-fold, regime, bootstrap, permutation) decide before the single-use holdout
-        # is ever touched. Only a genuine survivor — passed every gate AND deflated-score >=
-        # the research-supported band — earns the holdout consultation. This stops a
-        # robustness-killed claim from wasting the lock (A-003); the gates never saw it (A-002).
-        holdout = {}
-        try:
-            dec = stages.p8_verdict(claim, bt, holdout, syn_here)
-            dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
-            dec.metrics["corpus_isolation"] = stages.corpus_isolation(claim, reader)
-        except Exception as e:  # noqa: BLE001 — C-005: a verdict-stage error isolates to this claim
-            decisions.append(_needs_data(
-                claim, f"data_unavailable: verdict stage raised {type(e).__name__}: {e}", rec, run_log))
-            continue
-        rec["stages"]["holdout"] = holdout
-
-        # ---- VERIFY: module-fidelity refuter (does the code faithfully test the claim?) -- #
-        # The statistical gates can't see translation drift; only a reader comparing claim
-        # to code can. An unfaithful module's verdict is untrustworthy -> flag it, and never
-        # let an unfaithful module graduate to research-supported.
-        if use_llm and getattr(config, "FIDELITY_CHECK", False):
-            _progress("evaluate", detail=f"fidelity check: {_short_name(claim)}",
+    try:
+        for _ready in ready_for_backtest:
+            claim = _ready["claim"]
+            module = _ready["module"]
+            rec = _ready["rec"]
+            _ci = _ready["claim_i"]
+            claim_started = time.monotonic()
+            # ---- P7: backtest (pre-existing OR just auto-implemented module) -- #
+            _progress("evaluate", detail=f"P7 backtest: {_short_name(claim)}",
                       paper=title, claim_i=_ci, claim_n=len(claims))
+            bundle.reset_access()                 # track which series THIS module reads (per-verdict synthetic)
+            is_auto = bool(getattr(module, "__auto_generated__", False))
+            mres = _run_module_once(module, bundle, claim, cost_frac, is_auto)
+            if not isinstance(mres, dict) or not mres.get("ok"):
+                mres = mres if isinstance(mres, dict) else {"ok": False, "reason": "module returned non-dict"}
+                # A module that can't get its data is NOT a falsified claim — it's a data
+                # BLOCKER. Record a structured request to the data backlog and mark the claim
+                # needs_data (re-runnable once the catalog gains the series), never kill it.
+                retry = _auto_fetch_and_retry_missing_series(
+                    module, bundle, claim, cost_frac, is_auto, mres, auto_fetch_attempted_series)
+                if retry.get("attempted"):
+                    rec["stages"]["P7_auto_fetch"] = {
+                        "attempted": retry.get("attempted", []),
+                        "added": retry.get("added", []),
+                        "status": retry.get("status", "miss"),
+                    }
+                if retry.get("retried"):
+                    provenance = bundle.provenance_summary()
+                    synthetic = bundle.any_synthetic()
+                    mres = retry.get("mres")
+                    if isinstance(mres, dict) and mres.get("ok"):
+                        pass
+                    else:
+                        decisions.append(_needs_data(
+                            claim, retry.get("reason", mres.get("reason")), rec, run_log,
+                            auto_fetch_attempted=retry.get("attempted")))
+                        continue
+                else:
+                    decisions.append(_needs_data(
+                        claim, mres.get("reason"), rec, run_log,
+                        auto_fetch_attempted=retry.get("attempted")))
+                    continue
+            if not isinstance(mres, dict) or not mres.get("ok"):
+                decisions.append(_needs_data(claim, mres.get("reason"), rec, run_log))
+                continue
+            # B-005: an ok-module may still omit required keys -> guard before subscript (no KeyError
+            # aborting the paper). Treat a malformed result as a data blocker, not a crash.
+            _missing = [k for k in ("net", "positions", "bars_per_year") if k not in mres]
+            if _missing:
+                decisions.append(_needs_data(
+                    claim, f"data_unavailable: module result missing keys {_missing}", rec, run_log))
+                continue
+            family = _family(claim, module)        # C1: strategy_class + data_domain
+            # Pre-registered point-in-time MARKET-regime labels for the kill-lens. PRIMARY source is
+            # the bundle's regime catalog series (btc_vol_regime / btc_trend_regime) — the SAME labels
+            # a module conditions on via bundle.get(), so the lens partitions by exactly what the
+            # strategy could have used. A module may also hand back its own labels (regime_schemes) or
+            # the price series it traded (prices) to derive more. All are exogenous + trailing -> not
+            # data-snooping; each populated bucket still inflates the DSR trial count (no free pass).
+            reg_schemes = {}
+            for _rk in ("btc_vol_regime", "btc_trend_regime"):
+                _rs = bundle.series.get(_rk)
+                if _rs is not None and getattr(_rs, "available", False) and getattr(_rs, "data", None) is not None:
+                    reg_schemes[_rk] = _rs.data
+            if mres.get("regime_schemes"):
+                if not isinstance(mres["regime_schemes"], dict):
+                    decisions.append(_needs_data(
+                        claim, "data_unavailable: module regime_schemes must be a mapping", rec, run_log))
+                    continue
+                reg_schemes.update(mres["regime_schemes"])
+            elif mres.get("prices") is not None:
+                try:
+                    reg_schemes.update(regime_lib.regime_schemes(mres["prices"]))
+                except Exception:  # noqa: BLE001 — a label-build failure must not abort the paper
+                    pass
+            reg_schemes = reg_schemes or None
             try:
-                mcode = Path(getattr(module, "__file__", "") or "").read_text()  # real path (B-011)
+                bt = p7_backtest.run_backtest(
+                    claim.claim_id, mres["net"], mres["positions"], mres["bars_per_year"],
+                    payoff=mres.get("payoff"), position_signed=mres.get("position_signed"),
+                    cost_frac=cost_frac, wf_frame=mres.get("wf_frame"), family=family,
+                    generation_source=_generation_source_for(claim),
+                    search_cohort_id=claim.search_cohort_id,
+                    search_denominator=claim.search_denominator,
+                    regime_schemes=reg_schemes,
+                    declared_regime=claim.declared_regime)
+            except Exception as e:  # noqa: BLE001 — C-005: one bad backtest must not abort the paper
+                decisions.append(_needs_data(
+                    claim, f"data_unavailable: backtest raised {type(e).__name__}: {e}", rec, run_log))
+                continue
+            rec["stages"]["P7"] = bt
+            if _claim_budget_exceeded(claim_started):
+                decisions.append(_skip(claim, "timeout",
+                                       "skipped: per-claim time budget exceeded before verdict",
+                                       rec, run_log))
+                continue
+
+            # Per-verdict synthetic flag: only synthetic if THIS module actually READ a synthetic
+            # series (in-process tracking). Sandboxed modules can't be tracked from here -> fall
+            # back to the conservative bundle-level flag.
+            syn_here = synthetic if is_auto else bundle.accessed_synthetic()
+
+            # ---- P8: verdict -------------------------------------------------- #
+            # Run the verdict provisionally WITHOUT the holdout first, so all robustness KILL
+            # gates (3-fold, regime, bootstrap, permutation) decide before the single-use holdout
+            # is ever touched. Only a genuine survivor — passed every gate AND deflated-score >=
+            # the research-supported band — earns the holdout consultation. This stops a
+            # robustness-killed claim from wasting the lock (A-003); the gates never saw it (A-002).
+            holdout = {}
+            try:
+                dec = stages.p8_verdict(claim, bt, holdout, syn_here)
+                dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
+                dec.metrics["corpus_isolation"] = stages.corpus_isolation(claim, reader)
+            except Exception as e:  # noqa: BLE001 — C-005: a verdict-stage error isolates to this claim
+                decisions.append(_needs_data(
+                    claim, f"data_unavailable: verdict stage raised {type(e).__name__}: {e}", rec, run_log))
+                continue
+            rec["stages"]["holdout"] = holdout
+
+            # ---- VERIFY: module-fidelity refuter (does the code faithfully test the claim?) -- #
+            # The statistical gates can't see translation drift; only a reader comparing claim
+            # to code can. An unfaithful module's verdict is untrustworthy -> flag it, and never
+            # let an unfaithful module graduate to research-supported.
+            if use_llm and getattr(config, "FIDELITY_CHECK", False):
+                _progress("evaluate", detail=f"fidelity check: {_short_name(claim)}",
+                          paper=title, claim_i=_ci, claim_n=len(claims))
+                try:
+                    mcode = Path(getattr(module, "__file__", "") or "").read_text()  # real path (B-011)
+                except Exception:  # noqa: BLE001
+                    mcode = ""
+                fid = _assess_fidelity_safe(claim, mcode)
+                bt["fidelity"] = fid
+                dec.metrics["fidelity"] = fid
+                dec.metrics["independent_verifier"] = bool(fid.get("independent_verifier", False))
+                if fid.get("checked") is False:
+                    dec.metrics["fidelity_provenance"] = "unknown"
+                else:
+                    base_provenance = dec.metrics.get("fidelity_provenance", "unknown")
+                    dec.metrics["fidelity_provenance"] = (
+                        f"{base_provenance}; independent_verifier="
+                        f"{str(bool(fid.get('independent_verifier', False))).lower()}"
+                    )
+                if not fid.get("verified", False):
+                    dec.metrics["fidelity_unverified"] = True
+                    dec.rationale += f". FIDELITY UNVERIFIED: {fid.get('note', 'inconclusive')}."
+                    if dec.verdict == "research-supported":
+                        dec.verdict = "watch"
+                        dec.rationale += " Strongest verdict withheld."
+                if not fid.get("faithful", False) and fid.get("confidence", 0) >= config.FIDELITY_KILL_CONFIDENCE:
+                    # B3: an unfaithful module's result is NOT a trusted kill OR survivor — it's a
+                    # distinct `cannot_replicate` verdict (a translation failure), excluded from the
+                    # corpus, never a principle.
+                    _persist_fidelity_rejection(claim, None, fid)
+                    dec.metrics["fidelity_suspect"] = True
+                    dec.metrics["original_verdict"] = dec.verdict
+                    dec.verdict = "cannot_replicate"
+                    dec.kill_reason = "unfaithful_module"
+                    dec.rationale += (f". CANNOT_REPLICATE — module unfaithful to the claim "
+                                      f"(conf {fid['confidence']:.2f}): {fid.get('note', '')}")
+
+            rec["stages"]["P8"] = {"verdict": dec.verdict, "kill_reason": dec.kill_reason,
+                                   "rationale": dec.rationale}
+            # Scientist depth is advisory and fail-soft: it refines the concept but cannot alter P8.
+            try:
+                from .. import explanations
+                # WP3 is forbidden from reading the final locked holdout. Match P7's visible
+                # IS+OOS window exactly, and align every optional explanatory series to it.
+                _inputs = explanations.visible_inputs(
+                    mres["net"], market=mres.get("market_returns"),
+                    momentum=mres.get("momentum_proxy"), simpler_net=mres.get("simpler_net"),
+                    visible_frac=p7_backtest.IS_FRAC + p7_backtest.OOS_FRAC)
+                competing = explanations.analyze(
+                    _inputs["net"], mres["bars_per_year"],
+                    market=_inputs["market"], momentum=_inputs["momentum"],
+                    crisis_windows=mres.get("crisis_windows"),
+                    simpler_net=_inputs["simpler_net"])
             except Exception:  # noqa: BLE001
-                mcode = ""
-            fid = fidelity.assess(claim, mcode)
-            bt["fidelity"] = fid
-            dec.metrics["fidelity"] = fid
-            if not fid.get("verified", False):
-                dec.metrics["fidelity_unverified"] = True
-                dec.rationale += f". FIDELITY UNVERIFIED: {fid.get('note', 'inconclusive')}."
-                if dec.verdict == "research-supported":
-                    dec.verdict = "watch"
-                    dec.rationale += " Strongest verdict withheld."
-            if not fid.get("faithful", False) and fid.get("confidence", 0) >= config.FIDELITY_KILL_CONFIDENCE:
-                # B3: an unfaithful module's result is NOT a trusted kill OR survivor — it's a
-                # distinct `cannot_replicate` verdict (a translation failure), excluded from the
-                # corpus, never a principle.
-                dec.metrics["fidelity_suspect"] = True
-                dec.metrics["original_verdict"] = dec.verdict
-                dec.verdict = "cannot_replicate"
-                dec.kill_reason = "unfaithful_module"
-                dec.rationale += (f". CANNOT_REPLICATE — module unfaithful to the claim "
-                                  f"(conf {fid['confidence']:.2f}): {fid.get('note', '')}")
+                competing = []
+            rec["competing_explanations"] = competing
+            decisions.append(dec)
+            _queue_and_log(claim, dec, run_log)
 
-        rec["stages"]["P8"] = {"verdict": dec.verdict, "kill_reason": dec.kill_reason,
-                               "rationale": dec.rationale}
-        # Scientist depth is advisory and fail-soft: it refines the concept but cannot alter P8.
-        try:
-            from .. import explanations
-            # WP3 is forbidden from reading the final locked holdout. Match P7's visible
-            # IS+OOS window exactly, and align every optional explanatory series to it.
-            _inputs = explanations.visible_inputs(
-                mres["net"], market=mres.get("market_returns"),
-                momentum=mres.get("momentum_proxy"), simpler_net=mres.get("simpler_net"),
-                visible_frac=p7_backtest.IS_FRAC + p7_backtest.OOS_FRAC)
-            competing = explanations.analyze(
-                _inputs["net"], mres["bars_per_year"],
-                market=_inputs["market"], momentum=_inputs["momentum"],
-                crisis_windows=mres.get("crisis_windows"),
-                simpler_net=_inputs["simpler_net"])
-        except Exception:  # noqa: BLE001
-            competing = []
-        rec["competing_explanations"] = competing
-        decisions.append(dec)
-        _queue_and_log(claim, dec, run_log)
+            # ---- Analysis report: chart the backtested equity curve + index it --- #
+            chart = charts.render_backtest_chart(claim.claim_id, _short_name(claim),
+                                                 mres["net"], bt, dec.verdict)
+            analysis_record = {
+                "claim_id": claim.claim_id, "source_id": source_id, "source_title": title,
+                "statement": claim.statement[:240], "mechanism": claim.mechanism,
+                "verdict": dec.verdict,
+                "kill_reason": dec.kill_reason,
+                "metrics": {k: bt.get(k) for k in ("dsr", "psr", "oos_sharpe", "n_trades",
+                                                   "n_oos", "three_fold", "regime",
+                                                   "capacity_usd", "edge_t")},
+                "fidelity": dec.metrics.get("fidelity"),
+                "fidelity_provenance": dec.metrics.get("fidelity_provenance"),
+                "competing_explanations": competing,
+                "data_provenance": {
+                    **(getattr(claim, "data_provenance", {}) or {}),
+                    "data_domain": _data_domain(claim), "strategy_family": family,
+                    "datasets": sorted(
+                        (getattr(bundle, "_accessed", None) or bundle.series.keys())
+                        if is_auto else (getattr(bundle, "_accessed", None) or [])),
+                    "periods": ([{"start": str(bundle.requested_window[0]),
+                                  "end": str(bundle.requested_window[1])}]
+                                if getattr(bundle, "requested_window", None) else []),
+                    "bundle": provenance,
+                },
+                "source_type": claim.source_type,
+                "declared_regime": claim.declared_regime,
+                "synthetic": syn_here, "chart": chart, "run_at": _now()}
+            _append_jsonl(config.ANALYSIS_INDEX, analysis_record)
+            # WP1: concept extraction cannot abort a paper and has no path back into the verdict.
+            try:
+                from ..concepts import extract_and_append
+                concept = extract_and_append(analysis_record, use_llm=bool(use_llm))
+                if concept:
+                    rec["concept_id"] = concept["concept_id"]
+            except Exception as e:  # noqa: BLE001
+                rec["concept_error"] = f"{type(e).__name__}: {e}"[:160]
 
-        # ---- Analysis report: chart the backtested equity curve + index it --- #
-        chart = charts.render_backtest_chart(claim.claim_id, _short_name(claim),
-                                             mres["net"], bt, dec.verdict)
-        analysis_record = {
-            "claim_id": claim.claim_id, "source_id": source_id, "source_title": title,
-            "statement": claim.statement[:240], "mechanism": claim.mechanism,
-            "verdict": dec.verdict,
-            "kill_reason": dec.kill_reason,
-            "metrics": {k: bt.get(k) for k in ("dsr", "psr", "oos_sharpe", "n_trades",
-                                               "n_oos", "three_fold", "regime",
-                                               "capacity_usd", "edge_t")},
-            "fidelity": dec.metrics.get("fidelity"),
-            "fidelity_provenance": dec.metrics.get("fidelity_provenance"),
-            "competing_explanations": competing,
-            "data_provenance": {
-                **(getattr(claim, "data_provenance", {}) or {}),
-                "data_domain": _data_domain(claim), "strategy_family": family,
-                "datasets": sorted(
-                    (getattr(bundle, "_accessed", None) or bundle.series.keys())
-                    if is_auto else (getattr(bundle, "_accessed", None) or [])),
-                "periods": ([{"start": str(bundle.requested_window[0]),
-                              "end": str(bundle.requested_window[1])}]
-                            if getattr(bundle, "requested_window", None) else []),
-                "bundle": provenance,
-            },
-            "source_type": claim.source_type,
-            "synthetic": syn_here, "chart": chart, "run_at": _now()}
-        _append_jsonl(config.ANALYSIS_INDEX, analysis_record)
-        # WP1: concept extraction cannot abort a paper and has no path back into the verdict.
-        try:
-            from ..concepts import extract_and_append
-            concept = extract_and_append(analysis_record, use_llm=bool(use_llm))
-            if concept:
-                rec["concept_id"] = concept["concept_id"]
-        except Exception as e:  # noqa: BLE001
-            rec["concept_error"] = f"{type(e).__name__}: {e}"[:160]
+    finally:
+        _cleanup_run_cohorts(ready_for_backtest)
 
     # ---- P8 aggregate: principle proposal (sub-threshold if <3 same-class kills) #
     _progress("finalize", paper=title)
@@ -611,6 +872,10 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     run_log["decisions"] = [{"claim_id": d.claim_id, "verdict": d.verdict,
                              "kill_reason": getattr(d, "kill_reason", None)}
                             for d in decisions if hasattr(d, "claim_id")]
+    run_log["decision_metrics"] = {
+        d.claim_id: {"resolution": (getattr(d, "metrics", {}) or {}).get("resolution")}
+        for d in decisions if hasattr(d, "claim_id")
+    }
 
     # ---- write report + dashboard live.json ------------------------------- #
     report_path = write_report(source_id, source.title, claims, decisions,
@@ -619,7 +884,9 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     run_log["provenance"] = provenance
     _write_live(source.title, source_id, decisions, provenance, principle, synthetic,
                 specs_generated, p2_prov.get("mode", "unknown"), use_llm)
+    run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
     _append_jsonl(config.ROOT / "runs.jsonl", run_log)
+    _record_processed_source(source_id, paper_path, source.text_sha256)
     _progress(None)
     return run_log
 
@@ -658,7 +925,50 @@ def _skip(claim, reason, note, rec, run_log):
                    metrics={"skip_reason": reason}, revisit_at="2026-07-01")
     rec["stages"]["P8"] = {"verdict": "pending_module", "skip_reason": reason}
     run_log["claims"].append(rec)
-    _append_jsonl(config.DECISIONS_LOG, asdict(dec) | {"logged_at": _now()})   # log, do NOT queue
+    _append_jsonl(config.DECISIONS_LOG,
+                  asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
+    return dec
+
+
+def _cannot_replicate_unfaithful_spec(claim, spec: dict, fid: dict, rec, run_log):
+    """Early fidelity block for a generated spec.
+
+    This is not a statistical verdict and never promotes credibility. It only saves the
+    wasted auto-impl/backtest when the refuter has already found a high-confidence
+    translation failure in the spec itself.
+    """
+    from ..brain import Decision
+
+    note = fid.get("note") or "; ".join(fid.get("divergences") or []) or "unfaithful spec"
+    dec = Decision(
+        decision_id=f"{claim.claim_id}-d1",
+        claim_id=claim.claim_id,
+        verdict="cannot_replicate",
+        kill_reason="unfaithful_spec",
+        rationale=(f"CANNOT_REPLICATE — generated ModuleSpec is unfaithful to the claim "
+                   f"(conf {float(fid.get('confidence', 0) or 0):.2f}): {str(note)[:240]}"),
+        metrics={
+            "fidelity": fid,
+            "fidelity_suspect": True,
+            "independent_verifier": bool(fid.get("independent_verifier", False)),
+            "fidelity_provenance": (
+                "spec-fidelity; independent_verifier="
+                f"{str(bool(fid.get('independent_verifier', False))).lower()}"
+            ),
+            "spec_path": str(spec.get("_path", "")),
+            "claim_type": spec.get("claim_type"),
+        },
+        revisit_at="2026-07-01",
+    )
+    rec["stages"]["P6_pre_fidelity"] = {
+        "blocked": True,
+        "confidence": fid.get("confidence", 0),
+        "divergences": fid.get("divergences", []),
+        "spec_path": str(spec.get("_path", "")),
+    }
+    rec["stages"]["P8"] = {"verdict": "cannot_replicate", "kill_reason": "unfaithful_spec"}
+    run_log["claims"].append(rec)
+    _append_jsonl(config.DECISIONS_LOG, asdict(dec) | _decision_log_metadata(claim, run_log))
     return dec
 
 
@@ -697,13 +1007,101 @@ def _parse_missing_series(reason: str) -> list[str]:
     return out or ([r.strip()[:80]] if r.strip() else ["unspecified"])
 
 
-def _needs_data(claim, reason, rec, run_log):
+def _run_module_once(module, bundle, claim, cost_frac, is_auto: bool):
+    if is_auto:
+        # untrusted model-written code -> run in the Docker sandbox, NEVER in-process
+        return sandbox.run_in_container(getattr(module, "__file__", ""), bundle, claim, cost_frac)
+    try:
+        return module.run(bundle, claim, cost_frac)   # operator/trusted module, in-process
+    except TypeError:
+        # legacy signature: run(bundle, channel, cost_frac)
+        try:
+            return _run_legacy_module(module, bundle, claim, cost_frac)
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "reason": f"data_unavailable: legacy module raised {type(e).__name__}: {e}"}
+    except Exception as e:  # noqa: BLE001 — a buggy module must not abort the whole paper (A-027)
+        return {"ok": False, "reason": f"data_unavailable: module raised {type(e).__name__}: {e}"}
+
+
+def _auto_fetch_and_retry_missing_series(
+        module, bundle, claim, cost_frac, is_auto: bool, mres: dict,
+        attempted_series: set[str] | None = None) -> dict:
+    """Try one conservative vendor fetch pass for missing series, then rerun once.
+
+    Any miss, disabled vendor, bad spec, failed fetch, or malformed result returns
+    a non-retried status so the caller keeps today's needs_data behavior.
+    """
+    attempted: list[str] = []
+    added: list[str] = []
+    attempted_series = attempted_series if attempted_series is not None else set()
+    try:
+        from ..data.contract import Series
+        from ..data import vendors
+    except Exception:  # noqa: BLE001
+        return {"retried": False, "attempted": attempted, "added": added, "status": "unavailable"}
+
+    for missing in _parse_missing_series(mres.get("reason")):
+        if not missing or missing in getattr(bundle, "series", {}):
+            continue
+        try:
+            resolved = vendors.resolve_vendor_spec(missing)
+        except Exception:  # noqa: BLE001
+            resolved = None
+        if resolved is None:
+            continue
+        key, spec = resolved
+        if key in attempted_series:
+            continue
+        attempted_series.add(key)
+        attempted.append(key)
+        if key in getattr(bundle, "series", {}):
+            continue
+        try:
+            mod = vendors.enabled_adapters().get(spec.get("vendor"))
+            if mod is None:
+                continue
+            fetched = mod.fetch(spec)
+            if fetched is None:
+                continue
+            s, prov = fetched
+            if s is None or len(s) == 0:
+                continue
+            if getattr(s.index, "tz", None) is None:
+                s.index = s.index.tz_localize("UTC")
+            else:
+                s.index = s.index.tz_convert("UTC")
+            grade = getattr(mod, "PROVENANCE_GRADE", "as_displayed")
+            s.name = key
+            bundle.series[key] = Series(
+                key, s, f"{prov} [{grade}]", spec.get("unit", ""),
+                note=f"vendor:auto_fetch:{mod.NAME}:{key}")
+            added.append(key)
+        except Exception:  # noqa: BLE001 — fail-open; one bad fetch is a miss
+            continue
+
+    if not added:
+        return {"retried": False, "attempted": attempted, "added": added, "status": "miss"}
+
+    try:
+        bundle.reset_access()
+        retry_res = _run_module_once(module, bundle, claim, cost_frac, is_auto)
+    except Exception as e:  # noqa: BLE001
+        retry_res = {"ok": False, "reason": f"data_unavailable: auto-fetch retry raised {type(e).__name__}: {e}"}
+    if not isinstance(retry_res, dict):
+        retry_res = {"ok": False, "reason": "module returned non-dict after auto-fetch retry"}
+    return {"retried": True, "attempted": attempted, "added": added,
+            "status": "retried", "mres": retry_res,
+            "reason": retry_res.get("reason", mres.get("reason"))}
+
+
+def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     """Module returned data_unavailable -> record a structured data REQUEST
     and return a `needs_data` blocker decision. Not a kill (the claim isn't falsified, just
     untestable until the catalog gains the series). Logged, not queued to review — the data
     request itself is the actionable artifact, surfaced via the dashboard data-requests panel."""
     from ..brain import Decision
     missing = _parse_missing_series(reason)
+    attempted = [str(x) for x in (auto_fetch_attempted or []) if str(x)]
     req = {"request_id": f"{claim.claim_id}-data",
            "claim_id": claim.claim_id,
            "source_id": getattr(claim, "source_id", ""),
@@ -713,21 +1111,47 @@ def _needs_data(claim, reason, rec, run_log):
            "raw_reason": str(reason or "")[:240],
            "status": "open",
            "requested_at": _now()}
+    if attempted:
+        req["auto_fetch_attempted"] = attempted
     _append_jsonl(config.DATA_REQUESTS, req)
     needs = ", ".join(missing[:4]) + ("…" if len(missing) > 4 else "")
+    auto_fetch_note = ""
+    if attempted:
+        auto_fetch_note = " Auto-fetch attempted: " + ", ".join(attempted[:4])
+        if len(attempted) > 4:
+            auto_fetch_note += "…"
+        auto_fetch_note += "."
+    metrics = {"missing_series": missing}
+    if attempted:
+        metrics["auto_fetch_attempted"] = attempted
     dec = Decision(decision_id=f"{claim.claim_id}-d1", claim_id=claim.claim_id,
                    verdict="needs_data", kill_reason=None,
                    rationale=f"untestable until the data catalog provides: {needs}. "
-                             f"Logged to the F7b data-request backlog; re-runnable once sourced.",
-                   metrics={"missing_series": missing}, revisit_at="2026-07-01")
+                             f"Logged to the F7b data-request backlog; re-runnable once sourced."
+                             f"{auto_fetch_note}",
+                   metrics=metrics, revisit_at="2026-07-01")
     rec["stages"]["P8"] = {"verdict": "needs_data", "missing_series": missing}
+    if attempted:
+        rec["stages"]["P8"]["auto_fetch_attempted"] = attempted
     run_log["claims"].append(rec)
-    _append_jsonl(config.DECISIONS_LOG, asdict(dec) | {"logged_at": _now()})   # log, do NOT queue
+    _append_jsonl(config.DECISIONS_LOG,
+                  asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
     return dec
 
 
+def _decision_log_metadata(claim, run_log) -> dict:
+    source_id = getattr(claim, "source_id", "") or run_log.get("source_id", "")
+    idempotency = run_log.get("idempotency", {}) if isinstance(run_log, dict) else {}
+    return {
+        "source_id": source_id,
+        "run_id": idempotency.get("run_id", ""),
+        "logged_at": _now(),
+    }
+
+
 def _queue_and_log(claim, dec, run_log) -> None:
-    _append_jsonl(config.DECISIONS_LOG, asdict(dec) | {"logged_at": _now()})
+    _append_jsonl(config.DECISIONS_LOG,
+                  asdict(dec) | _decision_log_metadata(claim, run_log))
     _append_jsonl(config.REVIEW_QUEUE,
                   {"type": "decision", "queued_at": _now(), "status": "pending",
                    "proposal_id": dec.decision_id, "name": _short_name(claim),
@@ -773,6 +1197,115 @@ def _run_legacy_module(module, bundle, claim, cost_frac):
                   "policy rate", "rate hike", "rate cut", "fomc")
     channel = "fed" if any(k in text for k in _fed_terms) else "recession"
     return module.run(bundle, channel, cost_frac)
+
+
+def _fidelity_unknown(error: Exception) -> dict:
+    return {
+        "faithful": False,
+        "verified": False,
+        "checked": False,
+        "confidence": 0.0,
+        "divergences": [],
+        "independent_verifier": False,
+        "error": f"{type(error).__name__}: {error}"[:240],
+        "note": f"fidelity check unavailable: {type(error).__name__}: {error}"[:240],
+    }
+
+
+def _assess_fidelity_safe(claim, module_code: str) -> dict:
+    try:
+        fid = fidelity.assess(claim, module_code)
+    except Exception as e:  # noqa: BLE001 — fidelity must not abort a source run
+        return _fidelity_unknown(e)
+    if not isinstance(fid, dict):
+        return _fidelity_unknown(TypeError("fidelity assessor returned non-dict"))
+    if "checked" not in fid:
+        fid = dict(fid)
+        note = str(fid.get("note", "") or "").lower()
+        fid["checked"] = not (
+            "not checked" in note
+            or "inconclusive" in note
+            or "errored" in note
+            or "unavailable" in note
+        )
+    if "independent_verifier" not in fid:
+        fid = dict(fid)
+        fid["independent_verifier"] = False
+    return fid
+
+
+def _spec_fidelity_payload(spec: dict) -> str:
+    return json.dumps({
+        "module_spec_only": True,
+        "strategy_class": spec.get("strategy_class"),
+        "claim_type": spec.get("claim_type"),
+        "claim_translation": spec.get("claim_translation"),
+        "inputs": spec.get("inputs"),
+        "signal_logic": spec.get("signal_logic"),
+        "statistic_logic": spec.get("statistic_logic"),
+        "kill_criterion": spec.get("kill_criterion"),
+        "unknowns": spec.get("unknowns"),
+    }, sort_keys=True, default=str)
+
+
+def _assess_spec_fidelity_safe(claim, spec: dict) -> dict:
+    try:
+        fid = fidelity.assess(claim, _spec_fidelity_payload(spec), spec=spec)
+    except Exception as e:  # noqa: BLE001 — pre-check must fail open into the normal path
+        return _fidelity_unknown(e)
+    if not isinstance(fid, dict):
+        return _fidelity_unknown(TypeError("fidelity assessor returned non-dict"))
+    if "checked" not in fid:
+        fid = dict(fid)
+        note = str(fid.get("note", "") or "").lower()
+        fid["checked"] = not (
+            "not checked" in note
+            or "inconclusive" in note
+            or "errored" in note
+            or "unavailable" in note
+        )
+    if "independent_verifier" not in fid:
+        fid = dict(fid)
+        fid["independent_verifier"] = False
+    return fid
+
+
+def _fidelity_confidently_unfaithful(fid: dict) -> bool:
+    return (
+        isinstance(fid, dict)
+        and fid.get("checked", True) is not False
+        and fid.get("faithful") is False
+        and float(fid.get("confidence", 0) or 0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+
+
+def _persist_fidelity_rejection(claim, spec: dict | None, fid: dict) -> None:
+    try:
+        claim_type = (
+            (spec or {}).get("claim_type")
+            or fidelity_memory.classify_claim_type(claim)
+        )
+        strategy_class = (
+            (spec or {}).get("strategy_class")
+            or getattr(claim, "applicable_strategy_class", "")
+            or "unspecified"
+        )
+        divergences = list(fid.get("divergences") or [])
+        if not divergences and fid.get("note"):
+            divergences = [fid.get("note")]
+        fidelity_memory.append_rejection(
+            strategy_class=strategy_class,
+            claim_type=claim_type,
+            divergences=divergences,
+            note=str(fid.get("note", "")),
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _claim_budget_exceeded(started_at: float) -> bool:
+    budget = float(getattr(config, "CLAIM_TIME_BUDGET_SECONDS", 0) or 0)
+    return budget > 0 and (time.monotonic() - started_at) > budget
 
 
 def _set_pipeline_status(status: str) -> None:
@@ -863,7 +1396,6 @@ def _finish_offdomain(source, source_id, rel, run_log) -> dict:
     }
     config.LIVE_JSON.parent.mkdir(parents=True, exist_ok=True)
     config.LIVE_JSON.write_text(json.dumps(live, indent=2, default=str))
-    _append_jsonl(config.ROOT / "runs.jsonl", run_log)
     return run_log
 
 
@@ -910,14 +1442,14 @@ def _write_live(source_title, source_id, decisions, provenance, principle,
     config.LIVE_JSON.write_text(json.dumps(live, indent=2, default=str))
 
 
-def _run_and_report(paper: Path, use_llm: bool) -> None:
+def _run_and_report(paper: Path, use_llm: bool, *, force: bool = False,
+                    max_claims: int | None = None) -> None:
     try:
-        out = run_source(paper, use_llm=use_llm)
+        out = run_source(paper, use_llm=use_llm, force=force, max_claims=max_claims)
     except BaseException:  # noqa: BLE001 — incl. KeyboardInterrupt/SystemExit (B-015): never leave 'running'
         _set_pipeline_status("error")
         _progress(None)
         raise
-    _mark_processed(paper)
     print(json.dumps({
         "run_at": out["run_at"], "source_id": out.get("source_id"),
         "claims_extracted": len(out.get("claims", [])),
@@ -934,12 +1466,18 @@ def main() -> None:
                     help="process EVERY unprocessed inbox paper this invocation")
     ap.add_argument("--no-llm", action="store_true",
                     help="force fallback (claims.py / stub P3) even if API key is set")
+    ap.add_argument("--force", action="store_true",
+                    help="re-run even if this source was already processed; prior rows are superseded")
+    ap.add_argument("--max-claims", type=int,
+                    help=("process at most N extracted claims from this source; setting "
+                          "PENROSE_CLAIM_TIME_BUDGET_SECONDS makes budget skips wall-clock-dependent"))
     args = ap.parse_args()
     use_llm = (not args.no_llm)
 
     if args.paper:
         _run_and_report(Path(args.paper) if Path(args.paper).exists()
-                        else _find_paper(args.paper), use_llm)
+                        else _find_paper(args.paper), use_llm, force=args.force,
+                        max_claims=args.max_claims)
         return
 
     if args.all:
@@ -951,13 +1489,12 @@ def main() -> None:
         for i, paper in enumerate(pending, 1):
             print(f"[penrose] ({i}/{len(pending)}) {paper.name}", file=sys.stderr)
             try:
-                _run_and_report(paper, use_llm)
+                _run_and_report(paper, use_llm, force=args.force, max_claims=args.max_claims)
             except Exception as e:  # noqa: BLE001 — one bad paper must not stop the batch
-                # Record the failure VISIBLY (not silent data loss, A-025), then mark processed
-                # so the batch advances instead of wedging on the same crash forever.
+                # Record the failure VISIBLY (not silent data loss, A-025), then keep
+                # this invocation moving to the next paper.
                 _append_jsonl(config.ROOT / "failed_papers.jsonl",
                               {"paper": paper.name, "error": str(e)[:300], "at": _now()})
-                _mark_processed(paper)
                 print(json.dumps({"paper": paper.name, "error": str(e)[:200]}), file=sys.stderr)
         return
 
@@ -967,7 +1504,7 @@ def main() -> None:
                           "inbox": len(_inbox_pdfs()),
                           "note": "every inbox paper already run; `make reset` to reprocess"}))
         return
-    _run_and_report(paper, use_llm)
+    _run_and_report(paper, use_llm, force=args.force, max_claims=args.max_claims)
 
 
 if __name__ == "__main__":

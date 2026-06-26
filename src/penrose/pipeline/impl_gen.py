@@ -122,10 +122,12 @@ IMPL_USER_TMPL = """Implement this ModuleSpec as the module described above.
 
 module_id: {module_id}
 strategy_class: {strategy_class}
+claim_type: {claim_type}
 claim_translation: {claim_translation}
 signal_logic: {signal_logic}
 inputs requested by the spec: {inputs}
 kill_criterion (for context; the engine applies it, you do not): {kill_criterion}
+template guidance: {template_guidance}
 
 The ONLY data series available in `bundle` (use these exact keys; anything else -> data_unavailable):
 {keys}
@@ -161,6 +163,28 @@ def _extract_code(text: str) -> str:
 
 # back-compat alias (older callers/tests referenced _strip_fences)
 _strip_fences = _extract_code
+
+
+def _template_guidance(spec: dict) -> str:
+    claim_type = str(spec.get("claim_type") or "trading_strategy")
+    if claim_type == "descriptive_statistical":
+        return (
+            "DESCRIPTIVE_STATISTICAL: compute the stated statistic directly over the requested "
+            "sample (for example an unconditional mean, frequency, or correlation) and expose a "
+            "minimal contract-valid result for the engine. Do not create entry thresholds, rolling "
+            "signals, conditional positions, or a proxy trading strategy unless the claim explicitly "
+            "requires trading."
+        )
+    if claim_type == "structural_proposition":
+        return (
+            "STRUCTURAL_PROPOSITION: if the spec cannot be operationalized against the available "
+            "bundle keys, return {'ok': False, 'reason': 'data_unavailable: cannot_operationalize: ...'} "
+            "rather than inventing a trading strategy."
+        )
+    return (
+        "TRADING_STRATEGY: implement the stated signal -> position -> net-return test with "
+        "non-overlapping trades and no look-ahead."
+    )
 
 
 # --- Static safety scan of LLM-generated code TEXT, run BEFORE exec ---------------
@@ -299,10 +323,12 @@ def _generate_code(spec: dict, available: dict,
     user = IMPL_USER_TMPL.format(
         module_id=spec.get("module_id", "auto_module"),
         strategy_class=spec.get("strategy_class", "unspecified"),
+        claim_type=spec.get("claim_type", "trading_strategy"),
         claim_translation=str(spec.get("claim_translation", ""))[:600],
         signal_logic=str(spec.get("signal_logic", ""))[:800],
         inputs=", ".join(spec.get("inputs", []) or []) or "(unspecified)",
         kill_criterion=str(spec.get("kill_criterion", ""))[:200],
+        template_guidance=_template_guidance(spec),
         keys=keys,
     )
     if feedback:                                  # self-repair: prior code + the error it hit

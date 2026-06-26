@@ -6,8 +6,8 @@
 PY ?= python3
 export PYTHONPATH := src:.
 
-.PHONY: help eval worked-example calib-placebo calib-injection calib-nulls calib-sensitivity \
-        calib-breadth calib-synth calib-hypothesis connections test \
+.PHONY: help eval worked-example calib-placebo calib-persistence calib-injection calib-nulls \
+        calib-sensitivity calib-breadth calib-synth calib-hypothesis connections test \
         run review dream synthesize stage0 dash cz-referee cz-decay rdagent-referee reset clean
 
 help:
