@@ -18,7 +18,7 @@ accumulate. See [docs/GATES.md](docs/GATES.md) for every gate in plain language.
 
 ```bash
 pip install -e .                              # editable install; Penrose runs scripts from the clone
-python scripts/eval_suite.py                  # invariant suite — must print 92/92 passed
+python scripts/eval_suite.py                  # invariant suite — must print 93/93 passed
 python -m pytest -q                           # unit tests — must stay green
 python scripts/calibration_placebo.py         # placebo: no no-edge signal may be certified
 ```
