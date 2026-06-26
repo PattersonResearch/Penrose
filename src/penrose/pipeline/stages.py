@@ -8,6 +8,8 @@ from __future__ import annotations
 import math
 import sys
 
+import numpy as np
+
 from .. import config
 from ..brain import Claim, Decision, Principle, BrainReader, source_is_unanchored
 from .. import stats as H        # vendored DSR/Sharpe/capacity — penrose is self-contained
@@ -39,7 +41,7 @@ def _genuine_cscv_pbo(candidate_oos_series, cpcv: dict) -> float | None:
     if not splits or n_groups < 2:
         return None
     n = len(vals[0])
-    groups = [list(g) for g in __import__("numpy").array_split(range(n), n_groups)]
+    groups = [list(g) for g in np.array_split(range(n), n_groups)]
     logits = []
     for sp in splits:
         test_groups = set(sp.get("test_groups") or [])

@@ -54,7 +54,13 @@ _STRUCTURAL_PATTERNS = [
 
 
 def classify_claim_type(claim) -> str:
-    """Return a deterministic claim type, failing open to trading_strategy."""
+    """Return a deterministic claim type, failing open to trading_strategy.
+
+    Classification is keyword/regex-based over the ENGLISH claim text. Non-English
+    claims, or unusual phrasings that match no cue, fall through to the
+    `trading_strategy` default — the conservative fail-open (the claim is tested as
+    a strategy rather than mis-specialized), never a crash.
+    """
     try:
         text = " ".join([
             getattr(claim, "statement", "") or "",

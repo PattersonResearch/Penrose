@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 
@@ -126,8 +127,11 @@ def test_make_eval_honors_py_and_cosmetic_docs_are_resolved():
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     assert "X scripts/eval_suite.py" in dry.stdout
 
+    # Internally the public-facing Makefile is `Makefile.public`; the public build
+    # ships it AS `Makefile`. Read whichever exists so the public green bar is clean.
+    mk = "Makefile.public" if os.path.exists("Makefile.public") else "Makefile"
     phony = next(
-        line for line in open("Makefile.public").read().splitlines()
+        line for line in open(mk).read().splitlines()
         if line.startswith(".PHONY:") or "calib-persistence" in line)
-    assert "calib-persistence" in phony or "calib-persistence" in open("Makefile.public").read()
+    assert "calib-persistence" in phony or "calib-persistence" in open(mk).read()
     assert "docs/STRESS_TESTING.md" in open("README.md").read()

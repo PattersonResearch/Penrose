@@ -299,9 +299,11 @@ Statistical validity cannot detect whether a module tests the wrong proposition.
 
 The refuter defaults to unverified. Errors are inconclusive rather than faithful. An unverified module cannot authorize trusted-module reuse or the strongest positive verdict. A high-confidence finding of unfaithfulness changes the outcome to `cannot_replicate`, records the original statistical verdict, and excludes the result from principle formation.
 
-This control remains model-mediated and nondeterministic. The verifier role can be routed to an
-independent model with `PENROSE_LLM_VERIFIER_MODEL`; when unset it defaults to the same model family
-as the implementer, which leaves correlated blind spots. The strongest future fidelity gate is
+This control remains model-mediated and nondeterministic. As of v0.2.0 the verifier role can be
+routed to an independent provider with `PENROSE_LLM_VERIFIER_BASE_URL`, `PENROSE_LLM_VERIFIER_API_KEY`,
+and `PENROSE_LLM_VERIFIER_MODEL`; independence is taken to hold when either the provider endpoint or
+the model differs from the implementer's. When all are unset it defaults to the same model family as
+the implementer, which leaves correlated blind spots. The strongest future fidelity gate is
 independent reproduction of the paper's reported statistic before evaluating novel holdout
 performance.
 
@@ -504,7 +506,7 @@ Current limitations that matter for interpreting positive evidence:
 
 - deflation is inert on the first single-claim run of a family and engages only as Penrose observes multiple trials or registered search breadth;
 - the strongest look-ahead defense is a dynamic truncated-bundle comparison, while static heuristics remain a fallback for idioms the dynamic path cannot execute;
-- the fidelity verifier can use an independent model through `PENROSE_LLM_VERIFIER_MODEL`, but the default remains the same model family as implementation;
+- the fidelity verifier can be routed to an independent provider through `PENROSE_LLM_VERIFIER_BASE_URL`/`_API_KEY`/`_MODEL`, but the default remains the same model family as implementation;
 - holdout confirmation is gated and, under modeled costs, cannot move the production label above `watch`.
 
 The label `research-supported` should be read as a system state, not a certification of truth. A community-facing standard would benefit from implementation-neutral evidence badges such as reproduced, statistically supported, economically supported, prospectively validated, and independently replicated. Penrose's internal states can map to such badges, but the present code does not yet implement that complete standards-layer vocabulary.
@@ -859,7 +861,7 @@ Penrose should therefore be evaluated as infrastructure: a reference implementat
 1. Bailey, D. H., and López de Prado, M. (2014). “The Deflated Sharpe Ratio: Correcting for Selection Bias, Backtest Overfitting and Non-Normality.” *Journal of Portfolio Management*, 40(5), 94–107.
 2. Harvey, C. R., Liu, Y., and Zhu, H. (2016). “…and the Cross-Section of Expected Returns.” *Review of Financial Studies*, 29(1), 5–68.
 3. Hou, K., Xue, C., and Zhang, L. (2020). “Replicating Anomalies.” *Review of Financial Studies*, 33(5), 2019–2133.
-4. Chen, A. Y., and Zimmermann, T. (2022). “Open Source Cross-Sectional Asset Pricing.” *Critical Finance Review*.
+4. Chen, A. Y., and Zimmermann, T. (2022). “Open Source Cross-Sectional Asset Pricing.” *Critical Finance Review*, 11(2), 207–264.
 5. McLean, R. D., and Pontiff, J. (2016). “Does Academic Research Destroy Stock Return Predictability?” *Journal of Finance*, 71(1), 5–32.
 6. Li, Y., Yang, X., Yang, X., Xu, M., Wang, X., Liu, W., and Bian, J. (2025). “R&D-Agent-Quant: A Multi-Agent Framework for Data-Centric Factors and Model Joint Optimization.” arXiv:2505.15155.
 7. Politis, D. N., and Romano, J. P. (1994). “The Stationary Bootstrap.” *Journal of the American Statistical Association*, 89(428), 1303–1313.

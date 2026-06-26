@@ -275,6 +275,10 @@ scoring. No external embedding service is required.
 - **Reconstruction fidelity** is the central risk for prose inputs ("you tested a broken approximation
   of my strategy"), and a depreciating moat as foundation models improve. The strongest use is
   refereeing *code-complete* candidates, where this risk disappears.
+- **Claim-type routing is English keyword-based.** Claims are routed (descriptive-statistical vs
+  trading-strategy vs structural) by English-text cues; non-English or unusually phrased claims fall
+  through to the `trading_strategy` default. That fail-open is conservative (tested as a strategy, not
+  mis-specialized), never a crash.
 - **Deflation is not magic on the first look.** On the first single-claim run in a family, DSR is
   effectively PSR; deflation engages as Penrose sees multiple trials, registered generator
   candidates, or populated partitions in the same search family.
@@ -282,8 +286,11 @@ scoring. No external embedding service is required.
   samples, hence the `underpowered` label rather than a false kill.
 - **Look-ahead defense is layered.** Generated modules run in Docker and are checked for static leak
   idioms; the dynamic truncated-bundle check is strongest when it runs on the same execution path.
-- **Fidelity verification is independently configurable, but defaults to the same model family.**
-  Set `PENROSE_LLM_VERIFIER_MODEL` to reduce correlated implementation and judging errors.
+- **Fidelity verification can use an independent verifier, but defaults to the same provider.**
+  Set `PENROSE_LLM_VERIFIER_MODEL` (and, for a genuinely independent endpoint,
+  `PENROSE_LLM_VERIFIER_BASE_URL` / `PENROSE_LLM_VERIFIER_API_KEY`) to route the fidelity check to a
+  different model/provider and reduce correlated implementation-and-judging errors; unset, it falls
+  back to the same provider, and each result records whether the check was independent.
 - **Holdout confirmation is gated and scarce.** It is single-use per claim, must pass the configured
   holdout evidence threshold, and production runs with modeled costs are capped at `watch` even when
   the statistical path is strong.

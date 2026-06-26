@@ -881,13 +881,13 @@ The proposal is ready for criticism and calibration, not institutional mandate. 
 
 ## References
 
-The following references were present in the source repository used to prepare this draft. Items marked **[unverified]** require bibliographic verification against the primary publication before submission.
+Bibliographic details below were verified against publisher or arXiv records.
 
 1. Bailey, D. H., & López de Prado, M. (2014). “The Deflated Sharpe Ratio: Correcting for Selection Bias, Backtest Overfitting and Non-Normality.” *Journal of Portfolio Management*, 40(5), 94–107.
 
-2. Chen, A. Y., & Zimmermann, T. (2022). “Open Source Cross-Sectional Asset Pricing.” *Critical Finance Review*. Data associated with the Open Source Cross-Sectional Asset Pricing project.
+2. Chen, A. Y., & Zimmermann, T. (2022). “Open Source Cross-Sectional Asset Pricing.” *Critical Finance Review*, 11(2), 207–264.
 
-3. Grinold, R. C., & Kahn, R. N. *Active Portfolio Management*. **[Unverified edition and publication details.]**
+3. Grinold, R. C., & Kahn, R. N. (2000). *Active Portfolio Management: A Quantitative Approach for Producing Superior Returns and Controlling Risk* (2nd ed.). New York: McGraw-Hill. ISBN 978-0-07-024882-3.
 
 4. Harvey, C. R., Liu, Y., & Zhu, H. (2016). “…and the Cross-Section of Expected Returns.” *Review of Financial Studies*, 29(1), 5–68.
 
@@ -897,7 +897,7 @@ The following references were present in the source repository used to prepare t
 
 7. Nikolopoulos, S. D. (2026). “Spurious Predictability in Financial Machine Learning.” arXiv:2604.15531. *[Preprint; the associated QuantAudit package is not yet publicly released.]*
 
-8. Politis, D. N., & Romano, J. P. Stationary-bootstrap reference. **[Unverified: complete bibliographic details were not present in the source manuscript and must be added from the primary publication.]**
+8. Politis, D. N., & Romano, J. P. (1994). “The Stationary Bootstrap.” *Journal of the American Statistical Association*, 89(428), 1303–1313.
 
 ---
 
