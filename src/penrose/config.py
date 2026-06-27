@@ -220,6 +220,10 @@ REGIME_ADHERENCE_MIN = 0.60
 # Enabling this turns the advisory into a stricter verdict gate for isolated tests/experiments.
 COST_SENSITIVITY_GATE = {"enabled": False, "min_margin": 1.5}
 
+# Tail-risk / widow-maker gate: kills (or caps) a stable, well-deflated strategy whose payoff is
+# bounded-up / unbounded-down. DEFAULT-OFF so it never silently moves an existing verdict.
+TAIL_RISK_GATE = {"enabled": False, "max_skew": -0.5, "min_tail_ratio": 3.0, "cap_only": False}
+
 # E2: all penrose economics (fee curve, impact coef, vol-trade cost) are MODELED placeholders,
 # not measured fills. While this is "modeled", a survivor is structurally capped at `watch`
 # (never research-supported). Flip to "measured" only when real paper-traded costs exist.

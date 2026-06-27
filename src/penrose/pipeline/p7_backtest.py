@@ -313,7 +313,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     net = net_per_trade.dropna()
     n = len(net)
     if n < config.DSR_DECISION["min_oos_bars"]:        # need enough total trades to carve an OOS (A-005)
-        return {"n": n, "note": "insufficient_trades", "dsr": 0.0}
+        return {"n": n, "note": "insufficient_trades", "dsr": 0.0, "tail": R.tail_metrics(net)}
 
     # time split FIRST — the final 0.20 is the LOCKED, single-use HOLDOUT. It must NEVER
     # reach a kill gate (3-fold, regime); only final_holdout_eval may read net[o:]. (A-002)
@@ -331,6 +331,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     # extra "look", so it inflates the DSR trial count before deflation (incl. the vol/trend buckets).
     regime = R.regime_split(
         seen, bars_per_year, extra_schemes=regime_schemes, declared=declared_regime)
+    tail = R.tail_metrics(seen)
     n_trials += int(regime.get("n_partitions", 0))
 
     mean, sd = float(oos.mean()), float(oos.std(ddof=1)) if len(oos) > 1 else 0.0
@@ -341,6 +342,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
         "bars_per_year": bars_per_year,        # needed for power/MDE in the verdict (power-aware labels)
         "n_trials": n_trials,
         "regime": regime,
+        "tail": tail,
         "dsr": round(H.deflated_sharpe(oos, n_trials, sr_var), 4) if len(oos) >= 20 else 0.0,
         "psr": round(H.probabilistic_sharpe(oos), 4) if len(oos) >= 20 else 0.0,
         "oos_sharpe": round(H.sharpe(oos, bars_per_year), 3) if len(oos) >= 20 else None,

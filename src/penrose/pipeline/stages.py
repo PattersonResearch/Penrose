@@ -360,6 +360,22 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                     f"CPCV overfit: prob_oos_loss={cpcv.get('prob_oos_loss')}, "
                     f"median_oos_sharpe={cpcv.get('median_oos_sharpe')}, "
                     f"combos={cpcv.get('combos_used')}")
+            else:
+                trg = getattr(config, "TAIL_RISK_GATE", {"enabled": False})
+                tail = bt.get("tail") or {}
+                if trg.get("enabled") and tail.get("asymmetric"):
+                    if trg.get("cap_only"):
+                        if verdict == "research-supported":
+                            verdict = "watch"
+                            reasons.append(
+                                f"tail-asymmetric: capped to watch (skew={tail.get('skew')}, "
+                                f"tail_ratio={tail.get('tail_ratio')})")
+                    else:
+                        verdict, kill = "kill", "tail_asymmetric"
+                        reasons.append(
+                            f"tail_asymmetric: bounded-up/unbounded-down payoff "
+                            f"(skew={tail.get('skew')}, tail_ratio={tail.get('tail_ratio')}, "
+                            f"max_loss={tail.get('max_loss')})")
 
     if cap is None and verdict in ("watch", "research-supported"):
         reasons.append("capacity not estimable")
@@ -443,6 +459,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "is_sharpe": bt.get("is_sharpe"),
                  "three_fold": folds.get("folds"), "n_trades": bt.get("n"),
                  "bootstrap": boot, "permutation": perm, "regime": regime,
+                 "tail": bt.get("tail"),
                  "cpcv": cpcv,
                  "capacity_ci": bt.get("capacity_ci"),
                  "cost_sensitivity": bt.get("cost_sensitivity"),

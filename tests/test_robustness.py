@@ -72,6 +72,18 @@ def test_capacity_ci_is_a_range():
     print(f"ok: capacity CI = [{cc['capacity_lo']:,} .. {cc['capacity_hi']:,}] (median {cc['capacity_median']:,})")
 
 
+def test_capacity_ci_graceful_when_capacity_diverges():
+    # Negligible turnover/impact sends modeled linear-impact capacity to +inf; capacity_ci
+    # must return a graceful note dict, never raise OverflowError on int(inf). Regression for
+    # a crash surfaced by refereeing low-turnover trend rules (slow EWMAC barely trades).
+    rng = np.random.default_rng(7)
+    net = pd.Series(np.abs(rng.normal(0.02, 0.01, 200)))          # positive edge in every resample
+    pos = pd.DataFrame({"VOL:BTC": np.abs(rng.normal(0.6, 0.2, 200))})
+    cc = R.capacity_ci(net.values, pos, bars_per_year=73, impact_bps_per_1m=1e-300, n_boot=200)
+    assert cc is not None and "note" in cc and "capacity_lo" not in cc
+    print("ok: capacity_ci returns a graceful note when capacity diverges")
+
+
 def test_verdict_gate_marks_ambiguous_thin_null_underpowered():
     from penrose.pipeline.stages import p8_verdict
     from penrose.brain import Claim
@@ -138,6 +150,7 @@ if __name__ == "__main__":
     test_max_drawdown()
     test_walk_forward_runs_and_flags_consistency()
     test_capacity_ci_is_a_range()
+    test_capacity_ci_graceful_when_capacity_diverges()
     test_verdict_gate_marks_ambiguous_thin_null_underpowered()
     test_unanchored_sources_cannot_reach_research_supported()
     test_v4a_tolerance_scales_with_reference_noise()

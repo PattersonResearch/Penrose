@@ -7,7 +7,7 @@ PY ?= python3
 export PYTHONPATH := src:.
 
 .PHONY: help eval worked-example calib-placebo calib-persistence calib-injection calib-nulls \
-        calib-sensitivity calib-breadth calib-synth calib-hypothesis connections test \
+        calib-sensitivity calib-breadth calib-synth calib-hypothesis calib-tail connections test \
         run review dream synthesize stage0 dash cz-referee cz-decay rdagent-referee reset clean
 
 help:
@@ -18,6 +18,7 @@ help:
 	@echo "  make calib-injection  — positive control: detection curve for a known injected edge"
 	@echo "  make calib-nulls      — 5-null falsification battery: no null may certify"
 	@echo "  make calib-sensitivity— detection-threshold vs sample size and cost"
+	@echo "  make calib-tail       — tail-risk control: detector flags widow-makers, spares benign"
 	@echo "  make calib-breadth    — native-breadth recalibration (IC floor vs N)"
 	@echo "  make calib-synth      — honesty controls for concepts / synthesis / firewall"
 	@echo "  make calib-hypothesis — planted-principle recovery + grounding firewall"
@@ -47,6 +48,8 @@ calib-nulls:
 	$(PY) scripts/calibration_nulls.py 60
 calib-sensitivity:
 	$(PY) scripts/calibration_sensitivity.py 12
+calib-tail:
+	$(PY) scripts/calibration_tail.py 200
 calib-breadth:
 	$(PY) scripts/calibration_breadth.py 12
 calib-synth:

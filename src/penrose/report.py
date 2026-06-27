@@ -52,6 +52,12 @@ def write_report(source_id, title, claims, decisions, provenance, principle) -> 
             lines.append("\n- **Single-use holdout:** "
                          f"Sharpe {ho.get('holdout_sharpe')}, "
                          f"PSR {ho.get('holdout_psr')}, nbars {ho.get('nbars')}")
+        tail = m.get("tail") or {}
+        if tail:
+            lines.append("- **Tail risk:** "
+                         f"skew {tail.get('skew')}, CVaR-5 {tail.get('cvar_5')}, "
+                         f"tail_ratio {tail.get('tail_ratio')}, "
+                         f"worst-vs-typical {tail.get('worst_vs_typical')}")
         regime = m.get("regime") or {}
         declared = regime.get("declared_regime") or m.get("declared_regime")
         if declared:

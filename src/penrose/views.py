@@ -73,6 +73,37 @@ def data_requests() -> list[dict]:
     ]
 
 
+def proposals() -> list[dict]:
+    """Propose-only principle proposals (status: proposed), read-only.
+
+    Promotion to the approved brain stays human (P9); this only reads the propose store.
+    Fail-open to `[]`."""
+    try:
+        from .proposals import read_proposals
+        return list(read_proposals() or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def principles(limit: int = 50) -> list[dict]:
+    """Distilled cross-run advisory principle candidates from the corpus, read-only.
+
+    This is the agent-discussable "what candidates exist" surface. It only distills and
+    returns proposals; it never writes the approved brain. `limit` is clamped to [1, 500];
+    fail-open to `[]`."""
+    try:
+        from .learning import distill_contrastive_principles, distill_principles
+        rows = list(distill_principles() or []) + list(distill_contrastive_principles() or [])
+    except Exception:  # noqa: BLE001
+        return []
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        n = 50
+    n = 50 if n <= 0 else min(n, 500)
+    return rows[:n]
+
+
 def status() -> dict:
     """Pipeline status from the dashboard live.json, read-only."""
     live = Path(config.LIVE_JSON)

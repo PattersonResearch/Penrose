@@ -173,6 +173,39 @@ lone result with no neighbors and no reason to work. This turns Penrose's growin
 not work into an active prior on what comes next. (On a fresh install the memory is empty, so this gate
 simply stays quiet until you have run enough claims to fill it.)
 
+### 16. Combinatorial purged cross-validation (CPCV)
+**Catches:** an edge that survives one chronological train/test split but not the many recombined
+splits a careful evaluator would try. **Dies here:** a strategy whose apparent edge depends on the exact
+ordering of its in-sample and out-of-sample windows. **Why you want it:** CPCV (Lopez de Prado) builds
+many train/test partitions with purging and embargoing between adjacent observations, so a real edge has
+to hold across recombinations, not just one lucky cut. An independent overfitting axis next to the
+bootstrap and walk-forward.
+
+### 17. Declared regime scope
+**Catches:** the unfairness of killing a claim that never *claimed* to work everywhere. **Dies here:**
+nothing extra; this is the honest counterpart to the regime kill-lens. **Why you want it:** a claim may
+pre-register the regime it asserts it holds in (e.g. high-volatility) and be tested *within* that scope
+instead of penalized for being flat elsewhere. It is adherence-gated: the narrower test is granted only
+when the strategy actually confines its activity to the declared regime, so nothing trades outside its
+stated scope while still claiming the easier exam.
+
+### 18. Tail-risk / widow-maker (opt-in)
+**Catches:** a stable, well-deflated strategy that nonetheless has a bounded upside and an unbounded
+downside, the short-volatility / positive-carry profile that works 95% of the time and then a rare
+event annihilates it. **Dies here:** a fat-left-tail payoff (strongly negative skew, a left tail far
+heavier than the right) even when the average edge is positive and every other gate passes. **Why you
+want it:** the other gates catch overfitting and instability; they do *not* catch a genuinely stable
+edge whose payoff shape is a time bomb. This gate is off by default (so it never silently moves a
+verdict) and reports the tail diagnostics on every run; enable it to kill or cap such payoffs.
+
+### 19. Data-granularity check (at the input boundary)
+**Catches:** the silent, confident-but-wrong verdict that results from feeding data at the wrong
+sampling frequency, e.g. intraday bars to a rule written for daily data. **Dies here:** nothing is
+killed; the mismatch is flagged before it can corrupt anything. **Why you want it:** a wrong-frequency
+input is invisible to every other gate and poisons every statistic downstream with full confidence.
+Penrose infers a series' actual frequency at the data boundary and warns on a mismatch, the input-side
+counterpart to the existing check that a strategy's output bars-per-year matches its calendar span.
+
 ---
 
 ## The philosophy, in one paragraph

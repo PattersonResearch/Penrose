@@ -55,6 +55,72 @@ def _max_drawdown(r: np.ndarray) -> float:
     return float(np.max(peak - eq))
 
 
+def tail_metrics(net) -> dict:
+    """Left-tail diagnostics for bounded-up / unbounded-down payoff shapes.
+
+    Advisory by default: the verdict gate reads these only when
+    config.TAIL_RISK_GATE["enabled"] is explicitly true. This function is
+    intentionally fail-open and never raises into P7.
+    """
+    out = {
+        "skew": None,
+        "cvar_5": None,
+        "cvar_95": None,
+        "tail_ratio": None,
+        "max_loss": None,
+        "max_gain": None,
+        "worst_vs_typical": None,
+        "asymmetric": False,
+    }
+    try:
+        x = np.asarray(pd.Series(net).dropna(), dtype=float)
+        x = x[np.isfinite(x)]
+        n = len(x)
+        if n == 0:
+            return out
+
+        out["max_loss"] = float(np.min(x))
+        out["max_gain"] = float(np.max(x))
+
+        k = max(1, int(math.ceil(0.05 * n)))
+        xs = np.sort(x)
+        cvar_5 = float(np.mean(xs[:k]))
+        cvar_95 = float(np.mean(xs[-k:]))
+        out["cvar_5"] = cvar_5
+        out["cvar_95"] = cvar_95
+        if cvar_95 > 0:
+            out["tail_ratio"] = float(abs(cvar_5) / cvar_95)
+
+        gains = x[x > 0]
+        if len(gains):
+            p95_gain = float(np.percentile(gains, 95))
+            if p95_gain > 0:
+                out["worst_vs_typical"] = float(abs(out["max_loss"]) / p95_gain)
+
+        if n < 20:
+            return out
+        mu = float(np.mean(x))
+        sd = float(np.std(x))
+        # Near-constant series (sd ~ float noise relative to scale) have an UNDEFINED skew; computing
+        # ((x-mu)/sd)**3 there yields garbage (and a divide overflow). Treat as no-skew, like sd==0.
+        scale = max(abs(mu), float(np.max(np.abs(x))), 1e-12)
+        if not np.isfinite(sd) or sd <= 0.0 or sd < 1e-9 * scale:
+            return out
+        skew = float(np.mean(((x - mu) / sd) ** 3))
+        out["skew"] = skew
+
+        trg = getattr(config, "TAIL_RISK_GATE", {"max_skew": -0.5, "min_tail_ratio": 3.0})
+        tail_ratio = out["tail_ratio"]
+        out["asymmetric"] = bool(
+            skew <= float(trg.get("max_skew", -0.5))
+            and tail_ratio is not None
+            and tail_ratio >= float(trg.get("min_tail_ratio", 3.0))
+        )
+        return out
+    except Exception:  # noqa: BLE001
+        return out
+
+
 # Capped sentinel for a deterministic (zero-variance) edge. A real annualized
 # Sharpe never legitimately reaches this, so it reads as "deterministic edge"
 # downstream while staying finite (no inf/NaN to crash percentiles / JSON).
@@ -316,6 +382,14 @@ def capacity_ci(net, positions: pd.DataFrame, bars_per_year: float,
     p_positive_edge = round(len(caps) / n_boot, 3)
     if not caps:
         return {"note": "edge non-positive in ALL resamples; capacity undefined",
+                "p_positive_edge": p_positive_edge,
+                "conditional_on_positive_edge": True}
+    # Negligible turnover makes modeled linear-impact capacity diverge to +inf. Drop the
+    # non-finite resamples and, if none remain, report capacity as undefined rather than
+    # crashing on int(inf) — a low-turnover strategy must still get a graceful verdict.
+    caps = [c for c in caps if math.isfinite(c)]
+    if not caps:
+        return {"note": "capacity undefined: turnover negligible, modeled capacity unbounded",
                 "p_positive_edge": p_positive_edge,
                 "conditional_on_positive_edge": True}
     lo_q, hi_q = (1 - ci) / 2 * 100, (1 + ci) / 2 * 100

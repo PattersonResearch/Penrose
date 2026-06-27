@@ -6,7 +6,7 @@
 
 _Most edges don't survive. Penrose finds the few that do, and records why the rest didn't._
 
-[![Version](https://img.shields.io/badge/version-0.2.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.3.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -36,8 +36,9 @@ and the discipline to occasionally certify what does.
 
 - **A full falsification stack, not a single statistic.** Each claim runs a gauntlet of independent
   gates: PSR/DSR evidence scoped to the search Penrose has actually seen, three-fold sign stability,
-  a regime kill-lens, a bootstrap edge interval, a permutation test, walk-forward consistency, cost
-  and capacity modeling, and a single-use locked holdout. A single isolated family run is scored by
+  a regime kill-lens, combinatorial purged cross-validation, a bootstrap edge interval, a permutation
+  test, walk-forward consistency, an opt-in tail-risk (widow-maker) check for bounded-up /
+  unbounded-down payoffs, cost and capacity modeling, and a single-use locked holdout. A single isolated family run is scored by
   Probabilistic Sharpe plus the robustness stack; DSR deflation strengthens as the family or
   generator ledger accumulates trials. See [docs/GATES.md](docs/GATES.md) for every gate in plain
   language.
@@ -45,13 +46,15 @@ and the discipline to occasionally certify what does.
   on under-powered data is labeled `underpowered`, not `kill`, so a rigorous skeptic is never mistaken
   for a broken always-no machine. "We couldn't resolve it" never becomes "it's dead."
 - **A self-calibrated detector.** Before trusting any verdict, Penrose measures its own sensitivity
-  and specificity on real data: placebo, injected-edge, native-breadth, dead-state, and
-  persistence-matched controls, plus a multi-null battery. See [docs/STRESS_TESTING.md](docs/STRESS_TESTING.md)
+  and specificity on real data: placebo, injected-edge, native-breadth, dead-state, persistence-matched,
+  and tail-risk (widow-maker) controls, plus a multi-null battery. See [docs/STRESS_TESTING.md](docs/STRESS_TESTING.md)
   for the runnable stress controls. Almost no system validates its own detector.
 - **A discovery/confirmation firewall.** A single-use locked holdout confirms a survivor exactly once
   and then burns, so nothing can be tuned against the confirmation set.
 - **A growing corpus of invalidations.** Every verdict becomes a durable, reusable record of what was
-  tested and why it failed, a compounding asset no single backtest can build.
+  tested and why it failed, a compounding asset no single backtest can build. The corpus is mined for
+  recurring-failure principles and **contrastive** ones (where one strategy class survives a failure
+  mode that kills another), all advisory and never gating a new test.
 - **Referees any source.** Papers, your own theses, code-complete strategies, or machine-generated
   hypotheses, all routed through the same pipeline, with generated candidates charged to the
   multiple-testing denominator.
@@ -98,10 +101,13 @@ falsification path as extracted paper claims. This makes discarded candidates co
 multiple-testing denominator instead of letting the generator report only its favorites.
 
 The robustness stack: PSR/DSR scoped to the observed search, a single-use locked holdout,
-walk-forward, a regime kill-lens (it catches edges concentrated in one calendar/vol/trend regime),
-bootstrap edge CI, a permutation test, capacity/impact, a fee curve, and a fidelity check that the
-code faithfully tests the claim. Untrusted auto-generated code **only ever runs inside a Docker
-sandbox,** never in Penrose's own process.
+walk-forward, a regime kill-lens (it catches edges concentrated in one calendar/vol/trend regime)
+with an adherence-gated declared-regime scope, combinatorial purged cross-validation, bootstrap edge
+CI, a permutation test, an opt-in tail-risk gate, capacity/impact, a fee curve, and a fidelity check
+that the code faithfully tests the claim. Input series are also frequency-checked at the data boundary
+(so intraday data can never be silently treated as daily); data adapters include keyless crypto and
+equity venues plus a bring-your-own futures adapter. Untrusted auto-generated code **only ever runs
+inside a Docker sandbox,** never in Penrose's own process.
 
 The **brain** accumulates verdicts and finds structure across them (shared failure modes,
 cross-domain links, principles). Hard rule: these connections **inform, they never gate.** The
@@ -221,6 +227,8 @@ able to make Penrose fool itself. `mcp` is an optional extra; the core install n
 
 See [`docs/PENROSE_SYSTEMS_PAPER.md`](docs/PENROSE_SYSTEMS_PAPER.md) for the full system write-up, and
 [`docs/FPES_STANDARD_PAPER.md`](docs/FPES_STANDARD_PAPER.md) for the underlying evidence standard. All points listed here are reproducible with the information found in this repository.
+For a narrative tour see [`docs/THE_PENROSE_EDGE.md`](docs/THE_PENROSE_EDGE.md), and
+[`docs/WORKED_EXAMPLE.md`](docs/WORKED_EXAMPLE.md) walks through the deterministic process-conditional example step by step.
 
 ## Pennie, your research assistant
 

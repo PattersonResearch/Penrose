@@ -3,6 +3,56 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.3.0] — 2026-06-27
+
+A robustness, agent-surface, and data release. Post-0.2.0 work, much of it surfaced by a fresh-clone
+audit and by refereeing an external code-complete framework, then adversarially swarm-audited.
+
+### Added
+- **Tail-risk / widow-maker gate (default-off).** Every backtest now reports tail diagnostics (skew,
+  CVaR-5/95, tail ratio, max loss vs gain, worst-vs-typical). An opt-in `TAIL_RISK_GATE` kills (or caps
+  at `watch`) a stable, well-deflated strategy whose payoff is bounded-up / unbounded-down (negative
+  skew, fat left tail) — the short-vol / positive-carry blind spot the other gates miss. Default-off, so
+  no existing verdict moves; `tail_asymmetric` is a structural kill for principle formation.
+- **Contrastive principles.** A second distiller learns from the survivor-vs-kill boundary: when a
+  structural failure mode recurs in one domain but other domains yield survivors, it proposes an advisory
+  contrastive principle (e.g. "regime_fragile is specific to trend-following; carry survives it").
+  Additive (recurrence principles unchanged); surfaced via `views.principles()` and the read-only MCP.
+- **Point-in-time futures data adapter** (`pysystemtrade`). A fail-open BYO local vendor that reads
+  pysystemtrade adjusted-price CSVs, always resamples intraday→daily through the granularity gate before
+  the data can reach verdict logic, and tags provenance back-adjusted + resampled. Instrument names are
+  restricted to safe characters (no path traversal). Inactive/harmless when no futures dir is configured.
+- **Agent-readable principle surface.** `views.principles()` and `views.proposals()` expose the
+  distilled principle candidates and the propose-only store as structured read-only data, so an agent
+  can pull and discuss "what candidates exist" without the dashboard. The read-only MCP routes its
+  `penrose_principles` / `penrose_proposals` tools through these accessors (one read path, no drift);
+  promotion to the approved brain still requires human P9.
+- **`trend-following` domain** in cross-run principle inference, so trend / EWMAC claims cluster as
+  trend-following instead of falling through to `other`.
+- **Data-granularity verification** (`penrose.data.granularity`). Infers a series' empirical sampling
+  frequency from its index and flags a mismatch with the expected frequency (e.g. intraday bars where a
+  rule assumes daily, which silently corrupts every downstream statistic). The input-side analogue of
+  the existing output `bars_per_year`-vs-span check. `DataBundle.granularity_warnings()` surfaces it;
+  advisory and fail-open by default (no verdict change).
+
+### Fixed
+- **Trusted operator modules now ship in every clone.** The public `.gitignore` (`modules/*`) was
+  dropping the reviewed `crypto_funding_carry` and `macro_vol_btc` modules from published clones, so a
+  fresh clone failed the `PROVENANCE-SHELF` eval invariant (92/93) even though the README documents both.
+  The two trusted modules now ship (generated `_auto` modules stay ignored); a cold clone passes 93/93.
+- **Graceful capacity on low-turnover strategies.** `capacity_ci` raised `OverflowError` converting an
+  infinite modeled capacity (a strategy that barely trades drives turnover toward zero) into an integer,
+  crashing the entire backtest. It now drops non-finite resamples and reports capacity as undefined,
+  consistent with the fail-visibly contract. Regression-tested.
+- **Public test bar.** A `test_cli` check read `Makefile.public`, which the public build renames to
+  `Makefile`, so the shipped test failed in the distribution it ships to. It now reads whichever exists;
+  the public pytest bar is a clean 137 passed / 2 skipped.
+
+### Docs
+- Quickstart uses the real clone URL and surfaces the process-conditional worked example as the
+  recommended first reproduction; eval count corrected to 93/93 in AGENTS.md / CLAUDE.md.
+- Companion-paper bibliographies verified against publisher / arXiv records.
+
 ## [0.2.0] — 2026-06-25
 
 A correctness-and-coverage release. Every change was implemented and adversarially swarm-audited;

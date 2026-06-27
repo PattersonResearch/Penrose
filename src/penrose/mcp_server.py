@@ -30,8 +30,6 @@ def build_server():
         raise ImportError(_MCP_MISSING_MSG) from e
 
     from . import views
-    from .proposals import read_proposals
-    from .learning import distill_principles
 
     server = FastMCP("penrose")
 
@@ -45,13 +43,13 @@ def build_server():
     def penrose_proposals() -> list[dict]:
         """The propose-only principle proposals (status: proposed). READ-ONLY; promotion
         to the approved brain requires the human P9 review path, not this server."""
-        return read_proposals()
+        return views.proposals()
 
     @server.tool()
     def penrose_principles() -> list[dict]:
         """Distilled cross-run advisory principle proposals from the full corpus.
         READ-ONLY compute; never writes the approved brain."""
-        return distill_principles()
+        return views.principles()
 
     @server.tool()
     def penrose_data_requests() -> list[dict]:

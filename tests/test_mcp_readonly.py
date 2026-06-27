@@ -42,6 +42,19 @@ def test_accessors_return_structured_data(tmp_path, monkeypatch):
     assert views.status()["pipeline_status"] == "running"
 
 
+def test_proposal_and_principle_accessors_are_readonly_lists(tmp_path, monkeypatch):
+    from penrose import config, views
+
+    monkeypatch.setattr(config, "PROPOSALS_LOG", tmp_path / "proposals.jsonl")
+    monkeypatch.setattr(config, "DECISIONS_LOG", tmp_path / "decisions.jsonl")
+    monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "analysis_index.jsonl")
+
+    # fail-open on an empty corpus
+    assert views.proposals() == []
+    assert views.principles() == []
+    assert isinstance(views.principles(limit=5), list)
+
+
 def test_mcp_server_module_imports_without_mcp_dependency():
     # The module must import even when `mcp` is absent (the import is lazy in build_server).
     mod = importlib.import_module("penrose.mcp_server")

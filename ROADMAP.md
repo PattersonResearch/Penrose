@@ -12,13 +12,15 @@ others can adopt, audit, and extend, plus a growing, shared **corpus of invalida
 new claim cheaper to judge than the last. Penrose is the referee layer; it does not generate alpha and
 makes no profitability claims, and that will not change.
 
-## Where v0.1.0 stands
+## Where v0.3.0 stands
 
 The falsification pipeline, the power-aware verdict taxonomy, the self-calibration battery, the
-discovery/confirmation firewall with a single-use locked holdout, the corpus, and Pennie (the
-corpus-grounded chat assistant) all ship and run today. Costs and capacity are modeled rather than
-measured, several data domains lack production adapters, and independent replication is not yet
-automated. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full status.
+discovery/confirmation firewall with a single-use locked holdout, the corpus (now with contrastive
+principles), an opt-in tail-risk gate, an input-side data-granularity check, an agent-readable
+principle surface, and Pennie (the corpus-grounded chat assistant) all ship and run today. Costs and
+capacity are still modeled rather than measured, several data domains lack production adapters, and
+independent replication is not yet automated. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md)
+for the full status.
 
 ## Directions we are pursuing
 
@@ -26,8 +28,9 @@ automated. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full s
   strategy. Stronger reconstruction and a first-class path for code-complete candidates (where this risk
   disappears) is the highest-leverage area.
 - **Point-in-time data adapters.** Leakage-safe adapters for more domains (equities, futures, FX,
-  macro). One reference adapter ships; the contract is in `src/penrose/data/`. This is the most
-  valuable place to contribute.
+  macro). Several ship today (FRED, Stooq, Databento, and a BYO-local `pysystemtrade` futures adapter
+  that resamples intraday→daily through the granularity gate); the contract is in `src/penrose/data/`.
+  More sources (and a fuller futures-roll/point-in-time treatment) are the most valuable place to contribute.
 - **Independent replication and fresh-data confirmation.** A workflow that lets a generated or
   borderline claim graduate beyond `watch` only after confirmation on data it never touched during
   discovery.
@@ -36,11 +39,25 @@ automated. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full s
 - **Sequential and power-aware evaluation.** Turning the `underpowered` verdict from a label into a
   decision: how much more data or cross-sectional breadth would resolve a marginal edge, drawing on the
   optimal-stopping literature (see references [8] and [9] in the README).
-- **Agent integration.** An optional MCP server so coding agents can run the referee directly. It would
-  ship as an extra (`pip install penrose[mcp]`), not in the core, once the tool surface stabilizes.
-- **A public corpus commons.** An opt-in, anonymized way to share invalidations so the corpus compounds
-  across users rather than per-clone. Opt-in and privacy-preserving by design; infrastructure is not
-  built yet.
+- **Agent-first operation.** The most powerful way to drive Penrose is to point an agent at it: ingest a
+  paper or repo, reconstruct claims, register an honest cohort, run the grid, and read what survives, at
+  a scale a human clicking a UI cannot match. The read-only MCP server ships today; the direction is to
+  add **human-gated management and run tools** to it (register a cohort, run a claim, fetch a verdict) so
+  an agent can operate the referee end to end, while never crossing the P9 authorization gate, the
+  orchestrator still cannot write the approved corpus, only a human can. In that model the **dashboard
+  becomes mostly an overview and authorization surface** rather than the primary control panel; Pennie is
+  wired to the MCP so you can manage and run the pipeline directly from the dashboard; and running Penrose
+  inside a proper external agent harness is a first-class, recommended path alongside it. The tool surface
+  ships as an extra (`pip install penrose[mcp]`), never in the core, and the management tools land only
+  once the surface stabilizes and the human gate is provably un-crossable.
+- **A public corpus commons (opt-in `penrose share`).** A way to pool anonymized invalidations so the
+  corpus compounds across users rather than per-clone, and so the gates can be calibrated against real
+  field usage. The trust posture is the whole point and is non-negotiable: it is an **explicit,
+  preview-before-send command** a user runs deliberately (never silent telemetry, nothing leaves the
+  machine behind your back), it reuses the publish-path leak-check to **strip anything sensitive** (raw
+  claim text, strategy code, keys, machine paths), and it sends only **anonymized structured records**
+  (verdict distributions, kill reasons, domains, versions, gate-fire counts) to a small serverless
+  collector. Default off; opt-in; auditable. Infrastructure is not built yet.
 
 ## Non-goals (and they will stay non-goals)
 

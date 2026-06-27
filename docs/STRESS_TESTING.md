@@ -11,6 +11,9 @@ The relevant scripts are in `scripts/` and run on a clean, keyless install.
   A referee that certifies noise is worthless; this one doesn't.
 - **Injection (sensitivity).** A *planted* signal is recovered: as injected signal strength rises, verdicts
   move from `kill`/`underpowered` through `watch` to `research-supported` at the expected threshold.
+- **Tail-risk (widow-maker) control.** The tail detector flags **100%** of planted widow-maker payoffs
+  (small steady gains, rare large losses) as tail-asymmetric and **false-flags 0%** of benign symmetric
+  payoffs (`scripts/calibration_tail.py`). The gate itself is opt-in; this validates the detector under it.
 - **Process-conditional verdict.** A single, byte-identical return series is certified or killed depending
   only on the declared search lineage that produced it — the multiple-testing problem made concrete and
   runnable (`scripts/worked_example_process_conditional.py`). This is the cleanest demonstration of why

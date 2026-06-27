@@ -164,6 +164,20 @@ class DataBundle:
         return any(isinstance(v, Series) and v.provenance == "synthetic"
                    for v in self.series.values())
 
+    def granularity_warnings(self, expected: str = "daily") -> list[dict]:
+        """Advisory: report any available series whose inferred sampling frequency does not match
+        `expected`. A wrong-frequency input (e.g. intraday bars where a rule assumes daily) silently
+        corrupts every downstream statistic; this surfaces it at the data boundary. Non-gating and
+        fail-open (a series whose frequency cannot be inferred is never flagged)."""
+        from .granularity import check_granularity
+        out = []
+        for k, v in self.series.items():
+            if isinstance(v, Series) and getattr(v, "data", None) is not None:
+                chk = check_granularity(v.data, expected=expected)
+                if not chk["ok"]:
+                    out.append({"name": k, **chk})
+        return out
+
 
 def _unique_alias_hit(target: str, index: dict[str, list[str]], all_keys=None) -> str | None:
     """Resolve only a unique high-confidence alias hit.

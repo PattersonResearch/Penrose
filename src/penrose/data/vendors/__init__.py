@@ -34,7 +34,7 @@ EXPERIMENTAL skeletons until verified against a live key.
 from __future__ import annotations
 
 from ..contract import _norm_key, _unique_alias_hit
-from . import alpaca, alphavantage, fred, polygon, stooq, tiingo
+from . import alpaca, alphavantage, fred, polygon, pysystemtrade, stooq, tiingo
 
 # Adapter registry: NAME -> module. Each module implements the protocol above.
 ADAPTERS = {
@@ -44,6 +44,7 @@ ADAPTERS = {
     alpaca.NAME: alpaca,
     alphavantage.NAME: alphavantage,
     stooq.NAME: stooq,
+    pysystemtrade.NAME: pysystemtrade,
 }
 
 # Logical bundle key -> {"vendor": <NAME>, ...vendor-specific spec}.
@@ -89,6 +90,23 @@ DEFAULT_SERIES: dict[str, dict] = {
         "vendor": "stooq",
         "symbol": "iwm.us",
         "field": "close",
+        "unit": "usd",
+    },
+    # Local pysystemtrade adjusted futures. Active only when PENROSE_FUTURES_DIR
+    # or PYSYS_DIR points at a pysystemtrade-shaped directory; otherwise absent.
+    "futures_sp500": {
+        "vendor": "pysystemtrade",
+        "instrument": "SP500",
+        "unit": "index",
+    },
+    "futures_us10": {
+        "vendor": "pysystemtrade",
+        "instrument": "US10",
+        "unit": "price",
+    },
+    "futures_gold": {
+        "vendor": "pysystemtrade",
+        "instrument": "GOLD",
         "unit": "usd",
     },
 }

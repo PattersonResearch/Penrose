@@ -138,3 +138,25 @@ def distill_principles(
         )
     ]
 
+
+def distill_contrastive_principles(
+    records: Iterable[Record] | None = None,
+    *,
+    decisions_path: str | Path | None = None,
+    analysis_path: str | Path | None = None,
+    current_year: int = 2026,
+) -> list[dict]:
+    """Distill survivor-vs-kill boundary principle proposals from the corpus.
+
+    Proposed rows only; this never writes approved principle storage.
+    """
+    recs = list(records) if records is not None else load_decision_records(decisions_path, analysis_path)
+    if not recs:
+        return []
+    out = []
+    for row in brain_connect.propose_contrastive_principles(recs, current_year=current_year):
+        proposal = dict(row)
+        proposal["source"] = "distilled-contrastive"
+        proposal["status"] = "proposed"
+        out.append(proposal)
+    return out
