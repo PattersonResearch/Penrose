@@ -1,0 +1,40 @@
+# ModuleSpec — OPERATOR-WRITTEN trusted module (not auto-generated).
+# First module authored to produce a Stage-0 verdict on REAL data.
+module_id: crypto_funding_carry
+version: 1
+category: A                       # carry / risk-premium harvest
+strategy_class: crypto-funding-carry
+status: implemented
+author: operator
+
+claim_translation: >
+  Classic crypto perpetual funding-carry: a delta-neutral position (long spot /
+  short perp, or the reverse) harvests the funding rate. Because the legs' price
+  moves cancel, the position's PnL is the funding stream it collects. Claim under
+  test: that funding carry earns a positive risk-adjusted return NET of realistic
+  perp+spot rebalance costs, and survives DSR + 3-fold + regime + bootstrap +
+  permutation + a single-use locked holdout.
+
+inputs:                           # F7a contract vocabulary (REAL catalog series)
+  - funding_btc                   # binance-funding daily rate (provenance: binance-funding)
+  - funding_eth                   # fallback
+  - funding_sol                   # fallback
+
+signal_logic: >
+  signal_t = sign(funding[t-1])  (decision uses only PAST funding — no look-ahead).
+  realized carry_t = signal_t * funding[t]. Charge a full delta-neutral rebalance
+  cost (cost_frac) ONLY when the position flips. Daily settlement; bars_per_year=365.
+  Zero free parameters -> nothing to overfit.
+
+kill_criterion: >
+  KILL if OOS DSR < 0.90 OR 3-fold Sharpe sign-unstable OR regime-fragile OR
+  bootstrap edge CI includes zero OR walk-forward drift. WATCH in [0.90, 0.95]
+  (and capped at WATCH while costs are modeled, not measured — E2). research-supported
+  only above 0.95 AND single-use holdout confirms.
+
+expected_data_needs: daily perp funding rate over the live window (2024-12..2026-06)
+expected_runtime_seconds: 2
+cost_model: >
+  cost_frac = 0.0010 (10 bps) — a conservative modeled round-trip for a delta-neutral
+  BTC rebalance (spot + perp, both sides, liquid venue taker). MODELED, not measured,
+  so any survivor is capped at WATCH (E2) until replaced with traded fills.

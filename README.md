@@ -162,14 +162,15 @@ returns a calibrated verdict. Use it *alongside* those tools, not instead of the
 ## Quickstart
 
 ```bash
-git clone <repo> && cd Penrose
+git clone https://github.com/PattersonResearch/Penrose && cd Penrose
 pip install -e .             # editable: Penrose runs the scripts that ship in the clone
 
 # the guided demo runs the clean-room path (no key, no external data for the core):
 jupyter notebook notebooks/penrose_demo.ipynb
 
 # or from the command line (no key needed):
-penrose eval                 # ground-truth: planted strategies with known verdicts
+penrose eval                 # ground-truth: planted strategies with known verdicts (93/93)
+python scripts/worked_example_process_conditional.py  # start here: identical returns, opposite verdicts by search scope
 make calib-nulls            # the 5-null specificity battery (0/300)
 make calib-sensitivity      # the detection-threshold sweep
 make connections            # the brain's advisory connection-discovery

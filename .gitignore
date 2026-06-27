@@ -35,6 +35,10 @@ modules/*
 !modules/__init__.py
 !modules/_specs/
 modules/_specs/
+# Reviewed, trusted operator modules DO ship: they are documented in the README and
+# back the PROVENANCE-SHELF eval invariants, so a cold clone must contain them.
+!modules/crypto_funding_carry/
+!modules/macro_vol_btc/
 
 # papers dropped at root for testing (normally go in inbox/, also gitignored)
 /*.pdf

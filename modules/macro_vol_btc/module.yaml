@@ -1,0 +1,42 @@
+# ModuleSpec — generated at P6 for source 2604.01431v1 (cold-start, first module).
+# This is the F10 artifact: what the paper's claim becomes as a falsifiable,
+# tradeable test. Reviewed/implemented by the operator (or agent swarm) at P9.
+module_id: macro_vol_btc
+version: 1
+category: A            # binary/event-adjacent; PM-native macro signal -> crypto vol
+strategy_class: macro-signal-volatility-forecast
+status: implemented
+
+source: 2604.01431v1
+claim_translation: >
+  The paper claims daily |Δ probability| in Kalshi macro contracts forecasts
+  5-day-ahead BTC realized volatility (Fed channel in-sample t=3.63 but no OOS
+  gain; recession channel OOS-stable, MSFE ratio 0.979, Clark-West p=0.020).
+  Tradeable translation (per operator decision 2026-06-18): time the BTC
+  volatility risk premium with the signal — go long realized-vs-implied vol when
+  the macro signal predicts rising RV, short when it predicts falling RV. Test
+  whether the timing edge survives DSR + locked holdout + Deribit vol-trade costs.
+
+inputs:                # F7a contract vocabulary
+  - kxfed_signal           # |Δvw| monetary-policy channel (daily)
+  - kxrecssnber_signal     # |Δvw| recession channel (daily)
+  - btc_realized_vol_5d    # 5d realized vol (annualized)
+  - btc_implied_vol        # Deribit DVOL (annualized) — entry implied vol
+
+signal_logic: >
+  Per channel: standardize the signal on in-sample data (z-score). Every 5
+  trading days (non-overlapping, no look-ahead) enter a vol position sized by
+  clip(z,-1,1). Payoff per unit vega = pos * (realized_vol[t..t+5] - implied_vol[t]).
+  Subtract a Deribit round-trip vol-trade cost.
+
+kill_criterion: >
+  KILL if OOS DSR/PSR < 0.90 OR 3-fold Sharpe is sign-unstable OR OOS edge_t < 1.0
+  OR capacity_usd is None/negligible. WATCH in [0.90, 0.95]. research-supported
+  only above 0.95 AND holdout confirms (single-use).
+
+expected_data_needs: daily macro signal + RV + IV over the paper window (2023-2026)
+expected_runtime_seconds: 5
+unknowns:
+  - Kalshi macro signal is SYNTHETIC in this run (live candlestick aggregation is
+    the data-fidelity task for 2026-06-19). Verdict provenance is tagged accordingly.
+  - Vol-trade cost is a placeholder (8 bps of vega); replace with paper-traded fills.

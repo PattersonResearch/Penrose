@@ -32,14 +32,14 @@ Penrose addresses that systems problem. Its design target is a claim-level pipel
 
 ```text
 source
-  → sanitized ingestion
-  → grounded claim extraction
-  → falsifiability and economic preflight
-  → trusted-module routing or claim-scoped reconstruction
-  → sandboxed execution where required
-  → power-aware statistical and economic evaluation
-  → provenance-rich report and review proposal
-  → human-authorized corpus entry
+  -> sanitized ingestion
+  -> grounded claim extraction
+  -> falsifiability and economic preflight
+  -> trusted-module routing or claim-scoped reconstruction
+  -> sandboxed execution where required
+  -> power-aware statistical and economic evaluation
+  -> provenance-rich report and review proposal
+  -> human-authorized corpus entry
 ```
 
 The system is designed as a reference implementation of an implementation-neutral evidence protocol. The associated standard should define what evidence a performance claim must disclose and how results should be reported. Penrose demonstrates one way to operationalize that standard. A paper need not use Penrose to satisfy the protocol, and Penrose's output does not determine publication, truth, or investment suitability.
