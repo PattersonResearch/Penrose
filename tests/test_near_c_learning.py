@@ -71,6 +71,8 @@ def test_distill_principles_cross_run_finds_what_per_run_rule_misses(tmp_path, m
     decisions = tmp_path / "decisions.jsonl"
     monkeypatch.setattr(config, "DECISIONS_LOG", decisions)
     monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "reports" / "analysis_index.jsonl")
+    # PEN-17: this test intentionally exercises the distillation entry point.
+    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
 
     rows = []
     for run_idx in range(3):
@@ -117,6 +119,8 @@ def test_distill_principles_empty_or_corrupt_corpus_fails_open(tmp_path, monkeyp
     decisions = tmp_path / "decisions.jsonl"
     monkeypatch.setattr(config, "DECISIONS_LOG", decisions)
     monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "reports" / "analysis_index.jsonl")
+    # PEN-17: this test intentionally exercises the distillation entry point.
+    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
 
     assert distill_principles() == []
     decisions.write_text("{bad json\n")
@@ -134,6 +138,8 @@ def test_cli_proposals_reads_and_principles_distills_to_propose_only_store(tmp_p
     monkeypatch.setattr(config, "DECISIONS_LOG", decisions)
     monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "reports" / "analysis_index.jsonl")
     monkeypatch.setattr(config, "PRINCIPLES_LOG", approved)
+    # PEN-17: this test intentionally exercises CLI distillation.
+    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
 
     _write_jsonl(decisions, [{
         "decision_id": f"d{i}",

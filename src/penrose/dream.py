@@ -371,6 +371,9 @@ def _write_source(root: Path, run_id: str, normalized: list[dict]) -> Path:
 def run_dream(*, n: int = 10, generate_only: bool = False,
               run_id: str | None = None) -> dict:
     """Generate, register, and optionally falsify one dream search."""
+    if not config.GENERATIVE_LAYER_ENABLED:
+        raise RuntimeError("the generative layer is frozen (PEN-17): the verdict corpus is being "
+                           "recalibrated; set PENROSE_GENERATIVE_LAYER=1 to override")
     if n < 1 or n > 100:
         raise ValueError("n must be between 1 and 100")
     run_id = _validate_run_id(

@@ -176,10 +176,17 @@ def test_rerun_supersedes_same_source_decisions_only(tmp_path, monkeypatch):
     own = [row for row in rows if row.get("source_id") == "synthetic_source"]
     other = [row for row in rows if row.get("source_id") == "other_source"]
 
-    assert len(own) == 1
-    assert own[0]["claim_id"] == "synthetic_source-c1"
-    assert own[0]["verdict"] == "watch"
-    assert own[0]["run_id"] == forced["idempotency"]["run_id"]
+    # v0.4.1 (FIX 1, append-only supersede): BOTH runs' physical rows are preserved --
+    # decisions.jsonl never loses a line. Since the claim/decision_id is deterministic and
+    # both runs reached the same "watch" verdict, no supersession marker is needed either
+    # (append order alone makes the forced run's row the latest state for this decision_id).
+    assert len(own) == 2
+    assert all(row["claim_id"] == "synthetic_source-c1" for row in own)
+    assert own[0]["run_id"] == first["idempotency"]["run_id"]
+    assert own[-1]["run_id"] == forced["idempotency"]["run_id"]
+    assert own[-1]["verdict"] == "watch"
+    assert not any(row.get("type") == "supersession_marker" for row in own)
+    assert forced["idempotency"]["superseded_decisions"] == 0
     assert len(other) == 1 and other[0]["claim_id"] == "other-c1"
     assert skipped["note"] == "already processed (unchanged); use --force to re-run"
     assert skipped["idempotency"]["skipped"] is True
@@ -240,68 +247,80 @@ def test_crash_before_completion_preserves_prior_decision_rows(tmp_path, monkeyp
     assert rows == [prior]
 
 
-def test_decision_supersede_uses_atomic_tmp_replace(tmp_path, monkeypatch):
+def test_decision_supersede_never_writes_or_replaces_the_file(tmp_path, monkeypatch):
+    """v0.4.1 (FIX 1, P0 data-loss incident 2026-07-04): supersede must be non-destructive
+    and append-only. This REPLACES the pre-v0.4.1 test of the same intent, which asserted
+    the OLD (now-removed) truncate-and-tmp-replace mechanism that erased
+    funding_drift_claim's decisions.jsonl rows under --force. See
+    tests/test_supersede_append_only.py for the full non-destructive contract; this test
+    just pins that neither write_text nor replace() is ever called on the file."""
     from penrose import config
     from penrose.pipeline import run as runmod
 
     path = tmp_path / "decisions.jsonl"
     monkeypatch.setattr(config, "DECISIONS_LOG", path)
-    runmod._append_jsonl(path, {"claim_id": "source-c1", "source_id": "source",
-                                "run_id": "old", "verdict": "kill"})
-    runmod._append_jsonl(path, {"claim_id": "source-c1", "source_id": "source",
-                                "run_id": "new", "verdict": "watch"})
-    runmod._append_jsonl(path, {"claim_id": "other-c1", "source_id": "other",
-                                "run_id": "old", "verdict": "kill"})
+    runmod._append_jsonl(path, {"decision_id": "source-c1-d1", "claim_id": "source-c1",
+                                "source_id": "source", "run_id": "old", "verdict": "kill"})
+    runmod._append_jsonl(path, {"decision_id": "other-c1-d1", "claim_id": "other-c1",
+                                "source_id": "other", "run_id": "old", "verdict": "kill"})
 
     original_write_text = Path.write_text
     original_replace = Path.replace
-    replaced = []
 
     def guarded_write_text(self, *args, **kwargs):
         if self == path:
-            raise AssertionError("supersede must not truncate decisions.jsonl directly")
+            raise AssertionError("supersede must never truncate/rewrite decisions.jsonl")
         return original_write_text(self, *args, **kwargs)
 
-    def spy_replace(self, target):
-        replaced.append((self, Path(target)))
+    def guarded_replace(self, target):
+        if self == path or Path(target) == path:
+            raise AssertionError("supersede must never replace() decisions.jsonl")
         return original_replace(self, target)
 
     monkeypatch.setattr(Path, "write_text", guarded_write_text)
-    monkeypatch.setattr(Path, "replace", spy_replace)
+    monkeypatch.setattr(Path, "replace", guarded_replace)
 
-    removed = runmod._supersede_decision_rows("source", "new")
+    marked = runmod._supersede_decision_rows("source", "new")
 
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    assert removed == 1
-    assert [row["run_id"] for row in rows if row["source_id"] == "source"] == ["new"]
+    assert marked == 1
+    # the ORIGINAL "source" row is still physically present -- never removed
+    assert any(row.get("decision_id") == "source-c1-d1" and row["verdict"] == "kill" for row in rows)
+    # a new marker row was appended for it
+    assert any(row.get("decision_id") == "source-c1-d1" and row.get("verdict") == "superseded"
+              for row in rows)
     assert any(row["source_id"] == "other" for row in rows)
-    assert replaced and replaced[0][0].name.startswith("decisions.jsonl.")
-    assert replaced[0][1] == path
     source = inspect.getsource(runmod._supersede_decision_rows)
     assert "fcntl.flock" in source
-    assert "tmp.replace(path)" in source
+    assert "path.write_text(" not in source and "path.replace(" not in source
 
 
 def test_legacy_decision_without_source_id_is_superseded_by_claim_prefix(tmp_path, monkeypatch):
+    """Non-destructive equivalent of the pre-v0.4.1 test: a legacy row lacking source_id is
+    still matched by claim_id prefix, and (since its identity's latest state already IS the
+    new run's own row) no destructive rewrite or duplicate marker occurs -- every original
+    line stays exactly as written."""
     from penrose import config
     from penrose.pipeline import run as runmod
 
     path = tmp_path / "decisions.jsonl"
     monkeypatch.setattr(config, "DECISIONS_LOG", path)
-    runmod._append_jsonl(path, {"claim_id": "legacy_source-c1", "verdict": "kill"})
-    runmod._append_jsonl(path, {"claim_id": "legacy_source-c1", "source_id": "legacy_source",
-                                "run_id": "new", "verdict": "watch"})
-    runmod._append_jsonl(path, {"claim_id": "other_source-c1", "verdict": "kill"})
+    row1 = {"claim_id": "legacy_source-c1", "verdict": "kill"}
+    row2 = {"claim_id": "legacy_source-c1", "source_id": "legacy_source",
+           "run_id": "new", "verdict": "watch"}
+    row3 = {"claim_id": "other_source-c1", "verdict": "kill"}
+    runmod._append_jsonl(path, row1)
+    runmod._append_jsonl(path, row2)
+    runmod._append_jsonl(path, row3)
 
-    removed = runmod._supersede_decision_rows("legacy_source", "new")
+    marked = runmod._supersede_decision_rows("legacy_source", "new")
 
     rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-    assert removed == 1
-    assert rows == [
-        {"claim_id": "legacy_source-c1", "source_id": "legacy_source",
-         "run_id": "new", "verdict": "watch"},
-        {"claim_id": "other_source-c1", "verdict": "kill"},
-    ]
+    # nothing removed, nothing rewritten -- all three original lines preserved verbatim
+    assert rows == [row1, row2, row3]
+    # no marker needed: row2 (claim_id "legacy_source-c1", run_id "new") is already the
+    # latest state for that identity (rows without a decision_id fall back to claim_id)
+    assert marked == 0
 
 
 def test_fidelity_timeout_records_unknown_and_run_continues(tmp_path, monkeypatch):

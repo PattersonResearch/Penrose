@@ -19,8 +19,31 @@ CLAIM_TYPES = frozenset({
     "descriptive_statistical",
     "trading_strategy",
     "structural_proposition",
+    "provided_series_statistic",
 })
 DEFAULT_CLAIM_TYPE = "trading_strategy"
+
+# 6g: "test the statistic of a provided/pre-computed series" is a FIRST-CLASS claim type,
+# distinct from (and checked before) descriptive_statistical/trading_strategy. It fires on
+# claims that declare a single pooled/cohort statistic over series the claim itself names
+# (e.g. a pre-registered cohort-mean test) -- the exact shape that made spec-gen either
+# invent gates the claim never stated (over-specification) or fall back to an empty
+# trading-strategy stub (under-specification), because a provided-series-statistics claim
+# was otherwise misrouted as trading_strategy.
+_PROVIDED_SERIES_STAT_PATTERNS = [
+    r"\bpooled mean\b",
+    r"\bpooled\s+(?:one[- ]sample\s+)?statistic\b",
+    r"\bcohort[- ]level mean\b",
+    r"\bcohort[- ]mean\b",
+    r"\bone[- ]sample\b",
+    r"\bsingle (?:pooled )?statistic\b",
+    r"\bone (?:pooled )?statistic\b",
+    r"\bdeclared series\b",
+    r"\bprovided series\b",
+    r"\bpre-?computed series\b",
+    r"\bone deflation cohort\b",
+    r"\bsingle deflation cohort\b",
+]
 
 _DESCRIPTIVE_PATTERNS = [
     r"\bunconditional\s+(?:mean|average|bias|frequency|correlation)\b",
@@ -72,6 +95,14 @@ def classify_claim_type(claim) -> str:
         return DEFAULT_CLAIM_TYPE
     if not text.strip():
         return DEFAULT_CLAIM_TYPE
+
+    # Checked FIRST and independently of the descriptive/trading tally: a claim that
+    # names itself as a pooled/cohort/one-sample statistic over provided series is this
+    # type regardless of incidental trading-flavored words it also contains (e.g. "net
+    # P&L", "long-only") -- exactly the EXP-1/EXP-1b phrasing that used to fall through
+    # to trading_strategy and get either over- or under-specified (6g).
+    if any(re.search(pat, text) for pat in _PROVIDED_SERIES_STAT_PATTERNS):
+        return "provided_series_statistic"
 
     descriptive = sum(1 for pat in _DESCRIPTIVE_PATTERNS if re.search(pat, text))
     trading = sum(1 for pat in _TRADING_PATTERNS if re.search(pat, text))

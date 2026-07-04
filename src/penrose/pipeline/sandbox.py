@@ -110,10 +110,10 @@ def run_in_container(module_path: str, bundle, claim, cost_frac: float, timeout:
     """Execute module.run() for an untrusted module inside the sandbox container.
 
     Returns the contract result dict (with net/positions etc. as pd.Series), or
-    {"ok": False, "reason": "data_unavailable: ..."} on ANY failure. Never raises into the caller,
+    {"ok": False, "reason": "..."} on ANY failure. Never raises into the caller,
     never runs the module in this process."""
     if not docker_available() or not ensure_image():
-        return {"ok": False, "reason": "data_unavailable: docker sandbox unavailable (auto-impl requires Docker)"}
+        return {"ok": False, "reason": "engine_error: docker sandbox unavailable (auto-impl requires Docker)"}
     _WORK_ROOT.mkdir(exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="sbx_", dir=_WORK_ROOT))
     try:
@@ -138,10 +138,10 @@ def run_in_container(module_path: str, bundle, claim, cost_frac: float, timeout:
         r = subprocess.run(cmd, capture_output=True, timeout=timeout, text=True)
         rp = work / "out/result.json"
         if not rp.exists():
-            return {"ok": False, "reason": f"data_unavailable: sandbox run failed rc={r.returncode}: {(r.stderr or '')[:200]}"}
+            return {"ok": False, "reason": f"engine_error: sandbox run failed rc={r.returncode}: {(r.stderr or '')[:200]}"}
         out = json.load(open(rp))
         if not out.get("ok"):
-            return {"ok": False, "reason": out.get("reason", "data_unavailable: module not-ok in sandbox")}
+            return {"ok": False, "reason": out.get("reason", "module returned not-ok in sandbox (no reason given)")}
         res = {"ok": True, "bars_per_year": out.get("bars_per_year"), "n_trades": out.get("n_trades")}
         for key in ("net", "positions", "payoff", "position_signed"):
             p = work / f"out/{key}.parquet"
@@ -153,8 +153,8 @@ def run_in_container(module_path: str, bundle, claim, cost_frac: float, timeout:
             res["wf_frame"] = pd.read_parquet(wfp)
         return res
     except subprocess.TimeoutExpired:
-        return {"ok": False, "reason": "data_unavailable: sandbox timeout"}
+        return {"ok": False, "reason": "engine_error: sandbox timeout"}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "reason": f"data_unavailable: sandbox error {type(e).__name__}: {e}"}
+        return {"ok": False, "reason": f"engine_error: sandbox error {type(e).__name__}: {e}"}
     finally:
         shutil.rmtree(work, ignore_errors=True)

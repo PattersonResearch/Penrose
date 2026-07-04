@@ -167,6 +167,17 @@ _strip_fences = _extract_code
 
 def _template_guidance(spec: dict) -> str:
     claim_type = str(spec.get("claim_type") or "trading_strategy")
+    if claim_type == "provided_series_statistic":
+        return (
+            "PROVIDED_SERIES_STATISTIC (6g): pool the declared input series into ONE sample and "
+            "compute EXACTLY the one-sample statistic/test the spec's statistic_logic describes, "
+            "then apply the claim's own stated decision rule. Do NOT add a significance threshold "
+            "(e.g. p<=0.05), a data-quality/minimum-observation kill, or an extra deflation/"
+            "multiplicity method unless the claim itself states it. Do NOT build entry/exit rules, "
+            "positions, or a trading backtest -- there is no signal to trade, only a statistic to "
+            "test. Expose a minimal contract-valid result for the engine (as with "
+            "descriptive_statistical)."
+        )
     if claim_type == "descriptive_statistical":
         return (
             "DESCRIPTIVE_STATISTICAL: compute the stated statistic directly over the requested "

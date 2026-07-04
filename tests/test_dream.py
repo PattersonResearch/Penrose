@@ -38,6 +38,8 @@ def test_interrupted_registered_run_resumes(tmp_path, monkeypatch):
     run_root = archive_root / "resume-test"
     monkeypatch.setattr(config, "DREAM_ARCHIVES", archive_root)
     monkeypatch.setattr(config, "DREAM_RUNS", tmp_path / "dream_runs.jsonl")
+    # PEN-17: this test exercises the end-to-end dream entry point intentionally.
+    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
     monkeypatch.setattr(p7, "LEDGER", tmp_path / "ledger.tsv")
 
     dream.create_manifest(

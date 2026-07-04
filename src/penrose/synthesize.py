@@ -129,6 +129,9 @@ def _source(root: Path, run_id: str, normalized: list[dict]) -> Path:
 
 def run_synthesis(*, n: int = 10, generate_only: bool = False,
                   run_id: str | None = None) -> dict:
+    if not config.GENERATIVE_LAYER_ENABLED:
+        raise RuntimeError("the generative layer is frozen (PEN-17): the verdict corpus is being "
+                           "recalibrated; set PENROSE_GENERATIVE_LAYER=1 to override")
     if not 1 <= n <= 100:
         raise ValueError("n must be between 1 and 100")
     run_id = _validate_run_id(run_id or

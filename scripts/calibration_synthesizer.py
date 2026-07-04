@@ -102,7 +102,7 @@ def main() -> None:
 
     killed = extract({
         "claim_id": "known-kill", "statement": "noise has a durable pattern",
-        "verdict": "kill", "kill_reason": "negative_dsr", "run_at": "2026-01-01",
+        "verdict": "kill", "kill_reason": "low_edge_t", "run_at": "2026-01-01",
         "metrics": {"dsr": 0.1, "n_oos": 200},
         "competing_explanations": [{
             "explanation": "noise is a supported mechanism", "verdict": "survives"}],

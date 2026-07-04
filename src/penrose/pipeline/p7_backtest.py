@@ -49,22 +49,41 @@ def _claim_holdout_lock(name: str) -> Path:
 
 
 def _trial_stats(family: str | None = None, strategy: str | None = None,
-                 registered_trials: int | None = None) -> tuple[int, float]:
+                 registered_trials: int | None = None, *,
+                 generation_source: str = "paper",
+                 search_cohort_id: str | None = None) -> tuple[int, float]:
     """n_trials + cross-trial Sharpe variance for DSR deflation.
 
     C1: trials are scoped to the FAMILY (strategy_class + data_domain), so testing 500 crypto
     ideas doesn't make an unrelated weather strategy unbeatable. A trial is a DISTINCT strategy,
     not a run (dedup), and the CURRENT strategy is counted exactly once (B-016: no +1 double
     count on a re-run)."""
+    prior = getattr(config, "DEFLATION_PRIOR", {})
+    floor = int(prior.get(
+        "external_min_trials" if generation_source == "paper" else "generated_min_trials",
+        1,
+    ))
+    sr_var_prior = float(prior.get("sr_var_prior", 0.0))
+    min_scored = int(prior.get("min_scored_for_empirical_var", 0))
+
+    def _with_prior(n_raw: int, var_raw: float, n_scored: int) -> tuple[int, float]:
+        n = max(1, n_raw, floor)
+        var = float(var_raw)
+        if min_scored > 0 and n_scored < min_scored:
+            var = max(var, sr_var_prior)
+        elif min_scored > 0 and sr_var_prior > 0:
+            var = ((n_scored * var) + (min_scored * sr_var_prior)) / (n_scored + min_scored)
+        return n, var
+
     if not LEDGER.exists():
-        return (1 if strategy else 1), 0.0
+        return _with_prior(1 if strategy else 1, 0.0, 0)
     try:
         # Tolerate a ragged ledger (schema drift from the C1 `family` column, or a half-written
         # row): a corrupt trial ledger must NEVER raise into a real backtest. Skip bad lines and
         # fall back to "current strategy only" if the file is unreadable.
         df = pd.read_csv(LEDGER, sep="\t", engine="python", on_bad_lines="skip")
     except Exception:  # noqa: BLE001
-        return (1 if strategy else 1), 0.0
+        return _with_prior(1 if strategy else 1, 0.0, 0)
     if family is not None and "family" in df.columns:
         df = df[df["family"].astype(str) == family]      # deflate within the family only
     if "strategy" in df.columns:
@@ -72,7 +91,6 @@ def _trial_stats(family: str | None = None, strategy: str | None = None,
     strategies = set(df["strategy"].astype(str)) if "strategy" in df.columns else set()
     if strategy:
         strategies.add(strategy)                          # current strategy counted once (B-016)
-    sr = pd.to_numeric(df.get("per_trade_sharpe", pd.Series(dtype=float)), errors="coerce").dropna()
     # Registered generator searches may contain candidates that never reached P7 (duplicate,
     # conceptual-only, needs-data, failed auto-impl). They still belong to the search and must
     # count in the DSR denominator. Each cohort stores its declared denominator on every row;
@@ -89,8 +107,14 @@ def _trial_stats(family: str | None = None, strategy: str | None = None,
                 int(cohorts.groupby("search_cohort_id")["search_denominator"].max().sum()),
             )
     n = max(1, len(strategies), registered)
+    scored = df
+    if search_cohort_id and "search_cohort_id" in scored.columns:
+        # PEN-06: same-run cohort members must see the same empirical variance. Use only prior
+        # cohorts/outside rows; the current cohort's scoring order cannot move DSR.
+        scored = scored[scored["search_cohort_id"].astype(str) != str(search_cohort_id)]
+    sr = pd.to_numeric(scored.get("per_trade_sharpe", pd.Series(dtype=float)), errors="coerce").dropna()
     var = float(sr.var(ddof=1)) if len(sr) > 1 else 0.0
-    return n, var
+    return _with_prior(n, var, len(sr))
 
 
 _LEDGER_COLS = [
@@ -143,6 +167,30 @@ def register_trials(rows: list[dict]) -> None:
         except Exception:  # noqa: BLE001
             old = pd.DataFrame(columns=_LEDGER_COLS)
         incoming = pd.DataFrame(rows).reindex(columns=_LEDGER_COLS)
+        if not old.empty and not incoming.empty:
+            old_last = old.drop_duplicates(subset=["strategy"], keep="last").set_index("strategy")
+            kept = []
+            for row in incoming.to_dict("records"):
+                strategy = row.get("strategy")
+                if strategy in old_last.index:
+                    existing = old_last.loc[strategy].to_dict()
+                    if all(str(existing.get(col, "")) == str(row.get(col, "")) for col in _LEDGER_COLS):
+                        kept.append(row)
+                        continue
+                    scored = not pd.isna(pd.to_numeric(existing.get("per_trade_sharpe"), errors="coerce"))
+                    if scored:
+                        print(
+                            f"penrose: warning: registration for scored strategy '{strategy}' ignored",
+                            file=sys.stderr,
+                        )
+                        continue
+                    old_den = pd.to_numeric(existing.get("search_denominator"), errors="coerce")
+                    new_den = pd.to_numeric(row.get("search_denominator"), errors="coerce")
+                    old_den = 0 if pd.isna(old_den) else int(old_den)
+                    new_den = 0 if pd.isna(new_den) else int(new_den)
+                    row["search_denominator"] = max(old_den, new_den)
+                kept.append(row)
+            incoming = pd.DataFrame(kept).reindex(columns=_LEDGER_COLS)
         merged = pd.concat([old, incoming], ignore_index=True)
         merged = merged.drop_duplicates(subset=["strategy"], keep="last")
         _write_ledger(merged)
@@ -200,17 +248,26 @@ def _append_ledger(name: str, stats: dict, family: str | None = None, *,
 def _three_fold(net: np.ndarray) -> dict:
     """Sign-stable Sharpe across 3 contiguous folds (overfit smell test)."""
     if len(net) < 30:
-        return {"folds": [], "consistent": False, "note": "too few trades for 3-fold"}
+        return {"folds": [], "consistent": False, "note": "too few trades for 3-fold",
+                "fold_n": [], "fold_t": [], "min_fold_t": None}
     folds = np.array_split(net, 3)
     sh = []
+    fold_t = []
     for f in folds:
         if len(f) >= 5 and f.std(ddof=1) > 0:
-            sh.append(round(float(f.mean() / f.std(ddof=1) * math.sqrt(len(f))), 3))
+            t = round(float(f.mean() / (f.std(ddof=1) / math.sqrt(len(f)))), 3)
+            sh.append(t)
+            fold_t.append(t)
         else:
             sh.append(None)
+            fold_t.append(None)
     valid = [s for s in sh if s is not None]
+    valid_t = [t for t in fold_t if t is not None]
     consistent = len(valid) == 3 and all(s > 0 for s in valid)
-    return {"folds": sh, "consistent": consistent}
+    return {"folds": sh, "consistent": consistent,
+            "fold_n": [len(f) for f in folds],
+            "fold_t": fold_t,
+            "min_fold_t": min(valid_t) if valid_t else None}
 
 
 def _turnover_from_position(pos: pd.Series) -> pd.Series:
@@ -324,7 +381,9 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     full = net.values                 # descriptive metrics ONLY (full_sharpe/total_net), never a gate
 
     n_trials, sr_var = _trial_stats(
-        family, name, registered_trials=search_denominator)  # current + registered search
+        family, name, registered_trials=search_denominator,
+        generation_source=generation_source,
+        search_cohort_id=search_cohort_id)  # current + registered search
     # Regime kill-lens (Punisher) on the NON-HOLDOUT window. Calendar buckets always; the
     # pre-registered point-in-time vol/trend labels (extra_schemes) join when supplied so the
     # lens also catches edges concentrated in one MARKET regime. Each populated partition is an
@@ -423,8 +482,7 @@ def final_holdout_eval(name: str, net_per_trade: pd.Series, bars_per_year: float
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
-            reason = lock.read_text().strip() if lock.exists() else "holdout already claimed"
-            return {"refused": True, "reason": reason or "holdout evaluation in progress"}
+            return {"refused": True, "reason": f"holdout already burned for this claim (lock {lock.name})"}
         else:
             with os.fdopen(fd, "w") as f:
                 f.write(f"strategy={name} evaluation=in-progress")
@@ -440,8 +498,9 @@ def final_holdout_eval(name: str, net_per_trade: pd.Series, bars_per_year: float
     try:
         res = {"holdout_sharpe": round(H.sharpe(hold, bars_per_year), 3),
                "holdout_psr": round(H.probabilistic_sharpe(hold), 4), "nbars": len(hold)}
-        lock.write_text(f"strategy={name} bars={len(hold)} "
-                        f"holdout_sharpe={res['holdout_sharpe']}")
+        digest = hashlib.sha256(repr(res).encode()).hexdigest()[:16]
+        burned_at = pd.Timestamp.now(tz="UTC").isoformat()
+        lock.write_text(f"strategy={name} bars={len(hold)} digest={digest} burned_at={burned_at}")
     except Exception as e:  # noqa: BLE001
         if claimed:
             lock.unlink(missing_ok=True)

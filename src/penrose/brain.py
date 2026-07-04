@@ -15,6 +15,8 @@ typed edges.
 from __future__ import annotations
 
 import json
+import math
+import re
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 
@@ -112,9 +114,29 @@ class Claim:
     raw_hypothesis_id: Optional[str] = None
     data_provenance: dict = field(default_factory=dict)
     declared_regime: Optional[dict] = None
+    sample_period: Optional[dict] = None
+    expected_edge: Optional[float] = None
 
     def __post_init__(self) -> None:
         self.source_type = validate_source_type(self.source_type)
+        if self.expected_edge is not None:
+            edge = float(self.expected_edge)
+            if not math.isfinite(edge) or edge < 0:
+                raise ValueError("expected_edge must be a non-negative finite fraction")
+            self.expected_edge = edge
+        if self.sample_period is not None:
+            if not isinstance(self.sample_period, dict):
+                raise ValueError("sample_period must be a mapping with start and end ISO dates")
+            start = self.sample_period.get("start")
+            end = self.sample_period.get("end")
+            iso = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+            if not isinstance(start, str) or not iso.match(start):
+                raise ValueError("sample_period.start must be an ISO date YYYY-MM-DD")
+            if not isinstance(end, str) or not iso.match(end):
+                raise ValueError("sample_period.end must be an ISO date YYYY-MM-DD")
+            if start >= end:
+                raise ValueError("sample_period.start must be before sample_period.end")
+            self.sample_period = {"start": start, "end": end}
         if self.declared_regime is not None:
             if not isinstance(self.declared_regime, dict):
                 raise ValueError("declared_regime must be a mapping with scheme and label")
@@ -132,7 +154,7 @@ class Claim:
 class Decision:
     decision_id: str
     claim_id: str
-    verdict: str                # kill | watch | research-supported | insufficient_data
+    verdict: str                # kill | underpowered | watch | research-supported | routing states
     kill_reason: Optional[str]  # S6 enum value
     rationale: str
     metrics: dict = field(default_factory=dict)
@@ -153,7 +175,7 @@ class Principle:
 
 KILL_REASONS = [
     "unfalsifiable", "fee_curve", "dedup", "no_oos_edge", "in_sample_only",
-    "negative_dsr", "capacity_too_small", "data_unavailable", "execution_infeasible",
+    "low_edge_t", "capacity_too_small", "data_unavailable", "execution_infeasible",
     # future: emerge from regime-conditional analysis (P7), not pre-baked detection.
     # "regime_dependent", "loss_clustering", — add when regime splits are live and
     # a real pattern is observed, then extract as a principle.

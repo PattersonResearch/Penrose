@@ -6,7 +6,7 @@ similarity edges) as METADATA. It MUST NEVER feed back into the verdict path (p8
 new claim is always tested independently on its own data; the corpus only contextualizes the result
 for the human, it never pre-rejects an idea. Guardrails baked in:
   * Principles are drawn ONLY from genuine STRUCTURAL kills (in_sample_only / regime_fragile /
-    walk_forward_drift / no_signal_alignment / negative_dsr). NEVER from `underpowered`
+    walk_forward_drift / no_signal_alignment). NEVER from `underpowered`
     (below_detection_floor): "we couldn't resolve it" must not become "this neighborhood is dead."
   * Every principle carries n, the power of its supporting kills, a date, and a confidence that
     DECAYS with age — a kill is conditional ("died under THESE conditions"), not eternal.
@@ -25,7 +25,7 @@ from typing import Optional
 # Genuine STRUCTURAL kills — power-INDEPENDENT (an edge that is actually broken). Only these inform
 # suppressive priors. `below_detection_floor` (underpowered) is excluded ON PURPOSE.
 STRUCTURAL_KILLS = {"in_sample_only", "regime_fragile", "walk_forward_drift",
-                    "no_signal_alignment", "negative_dsr", "tail_asymmetric"}
+                    "no_signal_alignment", "tail_asymmetric"}
 
 # Coarse research-domain inference from a claim's text — for CROSS-DOMAIN links (a failure mode that
 # crosses research areas is more interesting than one confined to a single paper).

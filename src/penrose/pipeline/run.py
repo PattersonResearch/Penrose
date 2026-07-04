@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -24,6 +25,8 @@ import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pandas as pd
 
 from .. import config
 from .. import regime as regime_lib
@@ -113,34 +116,90 @@ def _decision_row_source_id(row: dict) -> str:
 
 
 def _supersede_decision_rows(source_id: str, run_id: str) -> int:
-    """Remove prior decision rows for this source_id only, preserving this run's rows."""
+    """Non-destructive supersede (P0 fix, 2026-07-04 decisions-loss incident).
+
+    decisions.jsonl is APPEND-ONLY: a line once written to it is NEVER deleted or
+    rewritten. Before this fix, this function truncated the file, removing every prior
+    row for `source_id` written by a different run -- called BEFORE any replacement row
+    necessarily existed (the zero-claims / off-domain early-return paths called it too),
+    so a --force re-run that (for any reason) produced no new decisions permanently
+    erased the prior ones. That is exactly what happened to the two funding_drift_claim
+    rows on 2026-07-04.
+
+    Now: for every prior ACTIVE decision belonging to `source_id` from a different run,
+    APPEND one supersession-marker row (never touch the old bytes). The marker reuses the
+    original `decision_id` so decision-id-keyed readers (e.g. brainstore's rebuild, which
+    upserts by id) naturally treat it as that decision's latest state, but the original
+    line's bytes remain in the file forever -- recoverable by anyone who scans history
+    instead of only the latest state per id. A row that is itself the CURRENT latest state
+    for its identity because this run wrote a fresh row with the same decision_id (the
+    common case: the same claim re-verdicted) needs no marker at all -- the append order
+    already makes the new row win; nothing is marked twice, and nothing is ever removed.
+    """
     path = config.DECISIONS_LOG
     if not path.exists():
         return 0
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = Path(str(path) + ".lock")
-    keep: list[str] = []
-    removed = 0
+    marked = 0
     with lock_path.open("a+") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        rows: list[dict] = []
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
             try:
-                row = json.loads(line)
+                rows.append(json.loads(line))
             except json.JSONDecodeError:
-                keep.append(line)
+                continue  # unparseable lines are left alone; never touched, never lost
+
+        # Latest known state per identity (decision_id, falling back to claim_id for
+        # legacy rows lacking one) -- so a decision that already has a fresher row in the
+        # file (this run's own re-verdict, or an earlier marker) is never re-marked.
+        latest: dict[str, dict] = {}
+        order: list[str] = []
+        for row in rows:
+            ident = str(row.get("decision_id") or row.get("claim_id") or "")
+            if not ident:
                 continue
-            if _decision_row_source_id(row) == source_id and row.get("run_id") != run_id:
-                removed += 1
-            else:
-                keep.append(line)
-        if removed:
-            tmp = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
-            tmp.write_text(("\n".join(keep) + "\n") if keep else "")
-            tmp.replace(path)
+            if ident not in latest:
+                order.append(ident)
+            latest[ident] = row
+
+        to_mark: list[dict] = []
+        for ident in order:
+            row = latest[ident]
+            if _decision_row_source_id(row) != source_id:
+                continue
+            if row.get("run_id") == run_id:
+                continue  # this run's own row -- nothing to supersede
+            if row.get("verdict") == "superseded":
+                continue  # already marked; do not re-mark
+            to_mark.append(row)
+
+        if to_mark:
+            now = _now()
+            lines_to_append = []
+            for row in to_mark:
+                marker = dict(row)
+                marker["verdict"] = "superseded"
+                marker["kill_reason"] = None
+                marker["prior_verdict"] = row.get("verdict")
+                marker["prior_run_id"] = row.get("run_id")
+                marker["rationale"] = (
+                    f"superseded by run {run_id} for source {source_id}; the prior decision "
+                    f"row (verdict={row.get('verdict')!r}) is preserved above, never deleted"
+                )
+                marker["run_id"] = run_id
+                marker["superseded_by_run_id"] = run_id
+                marker["type"] = "supersession_marker"
+                marker["logged_at"] = now
+                lines_to_append.append(json.dumps(marker, default=str))
+                marked += 1
+            with path.open("a") as f:  # APPEND ONLY -- never write_text/replace the file
+                f.write("\n".join(lines_to_append) + "\n")
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
-    return removed
+    return marked
 
 
 def _inbox_pdfs() -> list[Path]:
@@ -267,6 +326,10 @@ def _family(claim, module) -> str:
         return f"generated::{_data_domain(claim)}"
     cls = (getattr(claim, "applicable_strategy_class", "") or
            getattr(module, "__strategy_class__", "") or "unknown")
+    # PEN-07: only the operator-registered controlled vocabulary may define a family. A
+    # self-declared novel class would mint a fresh n=1 family per paper (denominator reset).
+    if _canonical_strategy_class(cls) not in _REGISTRY_CANONICAL_OWNERS:
+        return f"external::{_data_domain(claim)}"
     return f"{cls}::{_data_domain(claim)}"
 
 
@@ -448,7 +511,10 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             print(f"[penrose] off-domain, skipping P2+: {rel.get('reason')}", file=sys.stderr)
             _progress(None)
             out = _finish_offdomain(source, source_id, rel, run_log)
-            run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
+            # FIX 1 (2026-07-04 data-loss incident): an off-domain classification does not
+            # re-adjudicate any specific claim, so no prior decision for this source is
+            # touched here — superseding on a non-result is exactly the destructive pattern
+            # that erased funding_drift_claim's rows. Nothing to mark; nothing removed.
             _append_jsonl(config.ROOT / "runs.jsonl", run_log)
             _record_processed_source(source_id, paper_path, source.text_sha256)
             return out
@@ -478,6 +544,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             print(f"[penrose] P2 LLM call failed ({e}); falling back to manual", file=sys.stderr)
             claims, p2_prov = extract.fallback_claims(source)
             p2_prov["mode"] = "fallback-after-error"
+            p2_prov["extraction_error"] = str(e)
     else:
         claims, p2_prov = extract.fallback_claims(source)
         p2_prov["mode"] = "manual"
@@ -485,7 +552,16 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     run_log["p2"] = p2_prov
     if not claims:
         run_log["note"] = "no claims extracted; pipeline ends here"
-        run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
+        # FIX 3 (fail-soft violation, 2026-07-04 incident): a 0-claim result on a
+        # non-trivial source is surfaced LOUDLY (an engine_error decision + review-queue
+        # entry), never treated as a silent success — see _zero_extraction_is_suspicious.
+        if _zero_extraction_is_suspicious(source, p2_prov):
+            _zero_extraction_engine_error(source, source_id, p2_prov, run_log)
+            run_log["engine_error"] = True
+        # FIX 1: no claim was re-adjudicated by a zero-extraction result, so no prior
+        # decision for this source is superseded here — this exact call, on this exact
+        # branch, is what erased funding_drift_claim's rows on 2026-07-04. Never call it
+        # on a non-result.
         _append_jsonl(config.ROOT / "runs.jsonl", run_log)
         _record_processed_source(source_id, paper_path, source.text_sha256)
         _progress(None)
@@ -528,7 +604,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             continue
 
         # ---- P4: fee curve ------------------------------------------------ #
-        p4 = stages.p4_fee_curve(claim, expected_edge=0.02)
+        p4 = stages.p4_fee_curve(claim, expected_edge=claim.expected_edge)
         rec["stages"]["P4"] = p4
         if p4["killed"]:
             decisions.append(_kill(claim, p4["reason"], p4["note"], synthetic, rec, run_log))
@@ -641,6 +717,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             mres = _run_module_once(module, bundle, claim, cost_frac, is_auto)
             if not isinstance(mres, dict) or not mres.get("ok"):
                 mres = mres if isinstance(mres, dict) else {"ok": False, "reason": "module returned non-dict"}
+                if not _is_data_unavailable_reason(mres.get("reason")):
+                    decisions.append(_engine_error(
+                        claim, "module run", RuntimeError(str(mres.get("reason") or "module returned not-ok")),
+                        rec, run_log))
+                    continue
                 # A module that can't get its data is NOT a falsified claim — it's a data
                 # BLOCKER. Record a structured request to the data backlog and mark the claim
                 # needs_data (re-runnable once the catalog gains the series), never kill it.
@@ -658,6 +739,12 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     mres = retry.get("mres")
                     if isinstance(mres, dict) and mres.get("ok"):
                         pass
+                    elif not isinstance(mres, dict) or not _is_data_unavailable_reason(mres.get("reason")):
+                        decisions.append(_engine_error(
+                            claim, "module run",
+                            RuntimeError(str(retry.get("reason") or "module retry returned not-ok")),
+                            rec, run_log))
+                        continue
                     else:
                         decisions.append(_needs_data(
                             claim, retry.get("reason", mres.get("reason")), rec, run_log,
@@ -713,9 +800,25 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     regime_schemes=reg_schemes,
                     declared_regime=claim.declared_regime)
             except Exception as e:  # noqa: BLE001 — C-005: one bad backtest must not abort the paper
-                decisions.append(_needs_data(
-                    claim, f"data_unavailable: backtest raised {type(e).__name__}: {e}", rec, run_log))
+                decisions.append(_engine_error(claim, "P7 backtest", e, rec, run_log))
                 continue
+            if claim.source_type == "external_source":
+                sample_end = (claim.sample_period or {}).get("end") if claim.sample_period else None
+                data_end = None
+                post_years = None
+                try:
+                    data_end_ts = mres["net"].dropna().index.max()
+                    data_end = str(data_end_ts.date())
+                    if sample_end:
+                        post_years = (data_end_ts.tz_localize(None) - pd.Timestamp(sample_end)).days / 365.25
+                except Exception:  # noqa: BLE001 - non-datetime or empty indices leave cap conservative
+                    post_years = None
+                bt["post_sample"] = {
+                    "sample_end": sample_end,
+                    "data_end": data_end,
+                    "post_years": post_years,
+                    "declared": claim.sample_period is not None,
+                }
             rec["stages"]["P7"] = bt
             if _claim_budget_exceeded(claim_started):
                 decisions.append(_skip(claim, "timeout",
@@ -740,8 +843,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
                 dec.metrics["corpus_isolation"] = stages.corpus_isolation(claim, reader)
             except Exception as e:  # noqa: BLE001 — C-005: a verdict-stage error isolates to this claim
-                decisions.append(_needs_data(
-                    claim, f"data_unavailable: verdict stage raised {type(e).__name__}: {e}", rec, run_log))
+                decisions.append(_engine_error(claim, "P8 verdict", e, rec, run_log))
                 continue
             rec["stages"]["holdout"] = holdout
 
@@ -831,6 +933,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     "periods": ([{"start": str(bundle.requested_window[0]),
                                   "end": str(bundle.requested_window[1])}]
                                 if getattr(bundle, "requested_window", None) else []),
+                    "fallback_substitutions": list(getattr(bundle, "fallback_substitutions", [])),
                     "bundle": provenance,
                 },
                 "source_type": claim.source_type,
@@ -993,18 +1096,60 @@ def _open_data_requests() -> list[dict]:
     return out
 
 
+# Non-data tokens the missing-series extractor must never log as a dataset: English
+# prose fragments and status markers an auto-impl emits in its reason string. Without
+# this guard the backlog fills with phantom requests like 'the' / 'cannot_operationalize'
+# (observed live), polluting the data shopping list the whole flywheel depends on.
+_MISSING_SERIES_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "by", "from",
+    "as", "at", "is", "are", "be", "this", "that", "these", "those", "it", "its",
+    "long", "short", "leg", "legs", "side", "only", "both", "net", "gross",
+    "cannot_operationalize", "unspecified", "none", "nan", "null", "tbd", "unknown", "the_",
+})
+
+
+@functools.lru_cache(maxsize=1)
+def _catalog_series_names() -> frozenset:
+    """Known catalog series names (fail-open to empty), to whitelist real requests."""
+    try:
+        dd = str(config.DATA_DIR)
+        if dd not in sys.path:
+            sys.path.insert(0, dd)
+        import loader as catalog  # type: ignore
+        return frozenset(catalog.available()) if hasattr(catalog, "available") else frozenset()
+    except Exception:  # noqa: BLE001 — never break parsing on a catalog hiccup
+        return frozenset()
+
+
+def _looks_like_series(tok: str) -> bool:
+    """Real series keys are snake_case / dotted / carry a digit; bare prose words don't."""
+    return ("_" in tok) or ("." in tok) or any(c.isdigit() for c in tok)
+
+
 def _parse_missing_series(reason: str) -> list[str]:
-    """Pull the series names out of a module's 'data_unavailable: a, b, c' reason."""
+    """Pull the series names out of a module's 'data_unavailable: a, b, c' reason.
+
+    Drops non-data tokens: stopwords/status-markers, and bare prose words that are
+    neither a known catalog series nor structured like a series key. A legitimate
+    request for data we do NOT hold (e.g. 'crsp_daily_stock_returns') still passes,
+    because it is structured even though it is absent from the catalog.
+    """
     r = str(reason or "")
     tail = r.split("data_unavailable:", 1)[1] if "data_unavailable:" in r else r
-    parts = re.split(r"[,;]", tail)
-    out = []
-    for p in parts:
-        # keep an identifier-ish token (series keys look like snake_case / dotted paths)
+    catalog = _catalog_series_names()
+    out, seen = [], set()
+    for p in re.split(r"[,;]", tail):
         m = re.search(r"[a-zA-Z][a-zA-Z0-9_.]{2,}", p)
-        if m:
-            out.append(m.group(0).strip(" ._"))
-    return out or ([r.strip()[:80]] if r.strip() else ["unspecified"])
+        if not m:
+            continue
+        tok = m.group(0).strip(" ._")
+        low = tok.lower()
+        if not tok or low in _MISSING_SERIES_STOPWORDS:
+            continue
+        if (tok in catalog or low in catalog or _looks_like_series(tok)) and low not in seen:
+            seen.add(low)
+            out.append(tok)
+    return out or ["unspecified"]
 
 
 def _run_module_once(module, bundle, claim, cost_frac, is_auto: bool):
@@ -1018,9 +1163,13 @@ def _run_module_once(module, bundle, claim, cost_frac, is_auto: bool):
         try:
             return _run_legacy_module(module, bundle, claim, cost_frac)
         except Exception as e:  # noqa: BLE001
-            return {"ok": False, "reason": f"data_unavailable: legacy module raised {type(e).__name__}: {e}"}
+            return {"ok": False, "reason": f"engine_error: legacy module raised {type(e).__name__}: {e}"}
     except Exception as e:  # noqa: BLE001 — a buggy module must not abort the whole paper (A-027)
-        return {"ok": False, "reason": f"data_unavailable: module raised {type(e).__name__}: {e}"}
+        return {"ok": False, "reason": f"engine_error: module raised {type(e).__name__}: {e}"}
+
+
+def _is_data_unavailable_reason(reason) -> bool:
+    return str(reason or "").startswith("data_unavailable:")
 
 
 def _auto_fetch_and_retry_missing_series(
@@ -1094,6 +1243,85 @@ def _auto_fetch_and_retry_missing_series(
             "reason": retry_res.get("reason", mres.get("reason"))}
 
 
+# FIX 3 / 2026-07-04 incident: minimum non-trivial paper size (chars) below which a
+# zero-claim extraction is treated as a legitimate "nothing here" result rather than a
+# suspicious engine failure. Guards trivial/blank test fixtures while still catching the
+# regression class the incident surfaced: a real paper (funding_drift_claim-sized or
+# larger) that silently produced zero claims.
+MIN_CHARS_FOR_LOUD_ZERO_EXTRACTION = 80
+
+
+def _zero_extraction_is_suspicious(source, p2_prov: dict) -> bool:
+    """True when a 0-claim extraction result must be a LOUD engine_error rather than a
+    quiet "no claims extracted" note (FIX 3, 2026-07-04 decisions-loss incident).
+
+    Two suspicious signatures, either sufficient on its own:
+      1. mode == "fallback-after-error": extract_claims itself RAISED (network error,
+         un-parseable/truncated JSON after retries, etc.) and run_source silently
+         downgraded to the manual claims.py fallback, which returns [] whenever (as in
+         every agentic/paper run) no hand-authored claims.py exists for this source. An
+         ENGINE failure wearing a "no claims" costume, not a genuinely empty paper.
+      2. mode == "llm" with n_extracted == 0 on a NON-TRIVIAL source: the model itself
+         returned an empty claims list for real body text. This can be a correct
+         judgment, but it is exactly the vocabulary-confusion failure documented for
+         admin/pre-registration-styled sources (verdict/supersedes/kill_reason prose
+         reads as an audit log, not a research paper) -- silently trusting either
+         explanation is the fail-soft violation. Always surface it for a human.
+    Fails open (False, i.e. quiet) for a trivial/empty source — nothing to extract in the
+    first place — and never raises.
+    """
+    try:
+        mode = str((p2_prov or {}).get("mode") or "")
+        if mode == "fallback-after-error":
+            return True
+        n_chars = int(getattr(source, "n_chars", 0) or 0)
+        return mode == "llm" and n_chars >= MIN_CHARS_FOR_LOUD_ZERO_EXTRACTION
+    except Exception:  # noqa: BLE001 — the loud-failure guard must itself never crash the run
+        return False
+
+
+def _zero_extraction_engine_error(source, source_id: str, p2_prov: dict, run_log: dict):
+    """Loud, human-readable engine_error decision for a suspicious zero-claim extraction.
+
+    Written as a SOURCE-level decision (there is no Claim object — extraction itself is
+    what failed) so the run can never look like a silent success. Deliberately does NOT
+    call _supersede_decision_rows: no claim was re-adjudicated here, so no prior decision
+    for this source is superseded by this non-result (that ordering is FIX 1)."""
+    from ..brain import Decision
+    claim_id = f"{source_id}-c0"
+    mode = str((p2_prov or {}).get("mode") or "unknown")
+    detail = str((p2_prov or {}).get("extraction_error") or (p2_prov or {}).get("error") or "").strip()
+    rationale = (
+        f"engine error: P2 claim extraction returned ZERO claims for a non-trivial source "
+        f"({getattr(source, 'n_chars', 0)} chars, p2_mode={mode})"
+        + (f": {detail}" if detail else "")
+        + ". Very likely an extraction failure (LLM/network hiccup, or a vocabulary-"
+          "confusion misjudgment reading the source as an admin/report document rather "
+          "than a research paper) — not an empty paper. Needs operator review; re-run "
+          "once the cause is addressed."
+    )
+    dec = Decision(decision_id=f"{claim_id}-err", claim_id=claim_id, verdict="engine_error",
+                   kill_reason=None, rationale=rationale[:600],
+                   metrics={"stage": "P2 extraction", "p2_mode": mode,
+                           "n_chars": getattr(source, "n_chars", 0)})
+    run_log["claims"].append({"claim_id": claim_id,
+                              "stages": {"P2": p2_prov,
+                                        "P8": {"verdict": "engine_error", "stage": "P2 extraction"}}})
+    meta = {"source_id": source_id,
+            "run_id": (run_log.get("idempotency") or {}).get("run_id", ""),
+            "logged_at": _now()}
+    _append_jsonl(config.DECISIONS_LOG, asdict(dec) | meta)
+    _append_jsonl(config.REVIEW_QUEUE,
+                  {"type": "engine_error", "queued_at": _now(), "status": "pending",
+                   "proposal_id": f"{claim_id}-err", "name": source_id,
+                   "claim_id": claim_id, "claim_statement": "(P2 extraction produced no claims)",
+                   "rationale": dec.rationale, **asdict(dec)})
+    print(f"[penrose] engine error (P2 extraction) for {source_id}: zero claims extracted "
+          f"(p2_mode={mode}); see decisions.jsonl / review_queue.jsonl ({claim_id}-err)",
+          file=sys.stderr)
+    return dec
+
+
 def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     """Module returned data_unavailable -> record a structured data REQUEST
     and return a `needs_data` blocker decision. Not a kill (the claim isn't falsified, just
@@ -1136,6 +1364,30 @@ def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
+    return dec
+
+
+def _engine_error(claim, stage: str, err: BaseException, rec, run_log):
+    """Internal failures are review items, not data blockers and not verdict kills."""
+    from ..brain import Decision
+    err_text = f"{type(err).__name__}: {err}"
+    rationale = (
+        f"engine error during {stage}: {err_text}"[:300]
+        + " — needs operator attention; claim untested."
+    )
+    dec = Decision(decision_id=f"{claim.claim_id}-err", claim_id=claim.claim_id,
+                   verdict="engine_error", kill_reason=None, rationale=rationale,
+                   metrics={"stage": stage, "error": err_text[:500]})
+    rec["stages"]["P8"] = {"verdict": "engine_error", "stage": stage, "error": err_text[:240]}
+    run_log["claims"].append(rec)
+    _append_jsonl(config.DECISIONS_LOG,
+                  asdict(dec) | _decision_log_metadata(claim, run_log))
+    _append_jsonl(config.REVIEW_QUEUE,
+                  {"type": "engine_error", "queued_at": _now(), "status": "pending",
+                   "proposal_id": f"{claim.claim_id}-err", "name": _short_name(claim),
+                   "claim_id": claim.claim_id, "claim_statement": claim.statement,
+                   "rationale": dec.rationale, **asdict(dec)})
+    print(f"[penrose] engine error ({stage}) for {claim.claim_id}: {err_text}", file=sys.stderr)
     return dec
 
 
@@ -1425,6 +1677,7 @@ def _write_live(source_title, source_id, decisions, provenance, principle,
             "supported": sum(getattr(d, "verdict", "") == "research-supported" for d in decisions),
             "pending_module": sum(getattr(d, "verdict", "") == "pending_module" for d in decisions),
             "needs_data": sum(getattr(d, "verdict", "") == "needs_data" for d in decisions),
+            "engine_errors": sum(getattr(d, "verdict", "") == "engine_error" for d in decisions),
             "principles": 1 if principle else 0,
             "modules": len(REGISTRY),
             "specs_pending": specs_generated if isinstance(specs_generated, int) else len(specs_generated),

@@ -84,6 +84,34 @@ def test_capacity_ci_graceful_when_capacity_diverges():
     print("ok: capacity_ci returns a graceful note when capacity diverges")
 
 
+def test_regime_fragility_permutation_confirms_planted_weekend_edge():
+    rng = np.random.default_rng(7)
+    idx = pd.date_range("2020-01-01", periods=220, freq="D")
+    net = pd.Series(rng.normal(0.0, 0.004, len(idx)), index=idx)
+    weekend = idx.dayofweek >= 5
+    net[weekend] += rng.normal(0.05, 0.01, int(weekend.sum()))
+    out = R.regime_split(net, bars_per_year=252)
+    assert out["fragile"] is True
+    assert out["fragility_p"]["weekend"] < 0.05
+    assert "perm p=" in out["fragile_reason"]
+
+
+def test_regime_fragility_permutation_rejects_marginal_noise_concentration():
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2020-01-01", periods=240, freq="D")
+    net = pd.Series(rng.normal(0.05, 1.0, len(idx)), index=idx)
+    out = R.regime_split(net, bars_per_year=252)
+    assert out["fragile"] is False
+    assert out["fragility_p"]["day_of_week"] >= 0.05
+
+
+def test_regime_fragility_permutation_is_deterministic():
+    rng = np.random.default_rng(0)
+    idx = pd.date_range("2020-01-01", periods=240, freq="D")
+    net = pd.Series(rng.normal(0.05, 1.0, len(idx)), index=idx)
+    assert R.regime_split(net, bars_per_year=252) == R.regime_split(net, bars_per_year=252)
+
+
 def test_verdict_gate_marks_ambiguous_thin_null_underpowered():
     from penrose.pipeline.stages import p8_verdict
     from penrose.brain import Claim

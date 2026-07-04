@@ -555,6 +555,7 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
     # is a second independent layer, so this only needs to catch clear concentration.
     SURVIVAL_FRAC = 0.25
     schemes, n_partitions, fragile, reason = {}, 0, False, None
+    fragility_p = {}
     declared_present = False
     declared_exempted = False
     declared_note = None
@@ -605,13 +606,43 @@ def regime_split(net, bars_per_year: float, min_bucket: int = 8, extra_schemes=N
                         declared_note = (f"declared regime concentration exempted for "
                                          f"{name}={best}; other schemes still tested")
                         continue
+                    rfg = getattr(config, "REGIME_FRAGILITY", {"n_perm": 0, "p_kill": 1.0, "seed": 0})
+                    n_perm = int(rfg.get("n_perm", 0) or 0)
+                    p_kill = float(rfg.get("p_kill", 0.05))
+                    p = 0.0
+                    if len(vals) >= 20 and n_perm > 0:
+                        rng = np.random.default_rng(int(rfg.get("seed", 0)))
+                        hits = 0
+                        for _ in range(n_perm):
+                            perm_labels = rng.permutation(labels)
+                            perm_buckets = [lab for lab in pd.unique(perm_labels)
+                                            if int((perm_labels == lab).sum()) >= min_bucket]
+                            if len(perm_buckets) < 2:
+                                continue
+                            perm_contrib = {lab: float(vals[perm_labels == lab].sum())
+                                            for lab in perm_buckets}
+                            perm_best = max(perm_contrib, key=perm_contrib.get)
+                            perm_rest = vals[perm_labels != perm_best]
+                            perm_rest_edge = (
+                                float(perm_rest.mean()) if len(perm_rest) >= min_bucket else 0.0
+                            )
+                            if perm_rest_edge <= rest_edge:
+                                hits += 1
+                        p = hits / n_perm
+                        fragility_p[name] = round(float(p), 4)
+                    if len(vals) >= 20 and n_perm > 0 and p >= p_kill:
+                        continue
                     fragile = True
                     reason = (f"edge concentrated in '{best}' ({name}): only "
                               f"{rest_edge:.5f}/trade survives without it "
-                              f"({rest_edge / overall * 100:.0f}% of {overall:.5f})")
+                              f"({rest_edge / overall * 100:.0f}% of {overall:.5f})"
+                              + (f" (perm p={p:.4f} < {p_kill})"
+                                 if len(vals) >= 20 and n_perm > 0 else ""))
     out = {"applicable": True, "overall_edge": round(overall, 6),
            "schemes": schemes, "n_partitions": int(n_partitions),
            "fragile": bool(fragile), "fragile_reason": reason}
+    if fragility_p:
+        out["fragility_p"] = fragility_p
     if declared_norm is not None:
         if adherence is None:
             adherence = {"trade_share": 0.0, "edge_share": 0.0, "declared_edge": 0.0,

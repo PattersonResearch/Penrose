@@ -9,13 +9,13 @@ Live sources attempted:
   * Kalshi macro      -> elections.kalshi.com candlesticks (best-effort; shallow)
   * BTC implied vol   -> Deribit DVOL (best-effort)
 
-The synthetic generator embeds a MODEST true relationship (macro signal weakly
-forecasts next-5d realized vol) plus a volatility risk premium, so the pipeline's
-verdict is earned by DSR/holdout/fees rather than rigged either way.
+The synthetic generator is an EDGE-FREE fallback plus a volatility risk premium;
+any edge found on the fallback macro series is a bug.
 """
 from __future__ import annotations
 
 import json
+import sys
 import urllib.request
 from datetime import datetime, timezone
 
@@ -108,7 +108,7 @@ def _deribit_dvol_daily(start: str, end: str) -> Series | Unavailable:
 
 
 # --------------------------------------------------------------------------- #
-# Synthetic generator (tagged) — embeds a modest true signal + vol risk premium
+# Synthetic generator (tagged) — edge-free fallback + vol risk premium
 # --------------------------------------------------------------------------- #
 def _synthetic_bundle(start: str, end: str, btc_close: pd.Series | None) -> dict:
     rng = np.random.default_rng(_SEED)
@@ -123,29 +123,18 @@ def _synthetic_bundle(start: str, end: str, btc_close: pd.Series | None) -> dict
         regime[i] = max(0.15, min(1.6, state))
     base_rv = 0.45 + 0.55 * regime          # annualized realized vol, ~0.4–1.2
 
-    # Macro signals: |Δ^vw| daily. Each loads on the regime with noise, plus
-    # event spikes (FOMC / data prints). Fed channel leads realized vol; recession
-    # channel is slower / steadier (matches the paper's OOS-stability finding).
-    def signal(persist, load, spike_p, lead):
-        s = np.zeros(n)
-        prev = 0.0
-        for i in range(n):
-            drift = load * (regime[(i + lead) % n] - 0.6)
-            prev = persist * prev + (1 - persist) * abs(rng.normal(drift, 0.04))
-            if rng.random() < spike_p:
-                prev += abs(rng.normal(0.10, 0.05))
-            s[i] = max(0.0, prev)
-        return pd.Series(s, index=days)
+    # Macro signals: |Δ^vw| daily. PEN-11 makes the fallback a no-signal control:
+    # if this series produces an edge, the detector is wrong.
+    def signal():
+        return pd.Series(np.zeros(n), index=days)
 
-    kxfed = signal(persist=0.5, load=0.18, spike_p=0.04, lead=3)        # leads RV by ~3d
-    kxrec = signal(persist=0.8, load=0.10, spike_p=0.01, lead=5)        # slower, steadier
+    kxfed = signal()
+    kxrec = signal()
 
-    # Realized vol actually depends (modestly) on the lagged signals + regime.
+    # PEN-11: realized vol does not depend on the synthetic macro signals. The fallback
+    # is edge-free; any discovered predictive edge on it is a bug.
     eps = rng.normal(0, 0.06, n)
-    rv = (base_rv
-          + 0.35 * pd.Series(kxfed).shift(3).fillna(0).values        # true predictive load
-          + 0.25 * pd.Series(kxrec).shift(5).fillna(0).values
-          + eps)
+    rv = base_rv + eps
     rv = np.clip(rv, 0.10, 2.0)
     realized_vol = pd.Series(rv, index=days, name="btc_realized_vol_5d")
 
@@ -191,9 +180,9 @@ def _synthetic_bundle(start: str, end: str, btc_close: pd.Series | None) -> dict
 
     return {
         "kxfed_signal": Series("kxfed_signal", kxfed, "synthetic", "abs_prob_change",
-                               note="monetary-policy channel |Δvw|; embeds modest true RV load"),
+                               note="EDGE-FREE synthetic fallback; any edge found on this series is a bug"),
         "kxrecssnber_signal": Series("kxrecssnber_signal", kxrec, "synthetic", "abs_prob_change",
-                                     note="recession channel |Δvw|; slower/steadier"),
+                                     note="EDGE-FREE synthetic fallback; any edge found on this series is a bug"),
         "btc_realized_vol_5d": Series("btc_realized_vol_5d", realized_vol,
                                       "binance-derived" if btc_close is not None else "synthetic",
                                       "annualized_vol_frac", note="5d rolling realized vol"),
@@ -208,7 +197,6 @@ def _kalshi_signal(name: str, start: str, end: str) -> "Series | None":
     is unavailable or too short, so the caller falls back to the synthetic generator (and tags
     provenance honestly). This is the one pre-collected series with no free live API; everything
     else uses keyless live venues or a keyed vendor adapter."""
-    import sys
     from .. import config
     dd = str(config.DATA_DIR)
     try:
@@ -216,7 +204,9 @@ def _kalshi_signal(name: str, start: str, end: str) -> "Series | None":
             sys.path.insert(0, dd)
         import loader as catalog
         r = catalog.load_series(name)
-    except Exception:  # noqa: BLE001 — a bad reference must never crash the bundle
+    except Exception as e:  # noqa: BLE001 — a bad reference must never crash the bundle
+        print(f"[penrose] WARNING: real catalog series '{name}' failed to load: {e}",
+              file=sys.stderr)
         return None
     if r is None:
         return None
@@ -249,7 +239,14 @@ def fetch_bundle(start: str = WINDOW[0], end: str = WINDOW[1]) -> DataBundle:
     # tag from any verdict whose module reads the macro signal where real data now exists.
     for _nm in ("kxfed_signal", "kxrecssnber_signal"):
         _real = _kalshi_signal(_nm, start, end)
-        bundle.series[_nm] = _real if _real is not None else syn[_nm]
+        if _real is not None:
+            bundle.series[_nm] = _real
+        else:
+            print(f"[penrose] WARNING: real catalog series '{_nm}' unavailable — "
+                  "substituting EDGE-FREE synthetic (verdicts will be provisional)",
+                  file=sys.stderr)
+            bundle.fallback_substitutions.append(_nm)
+            bundle.series[_nm] = syn[_nm]
     rv = syn["btc_realized_vol_5d"]
     if btc_close is not None:
         rv.provenance = f"{btc.provenance.split('-')[0]}-derived"   # match real price source
@@ -260,6 +257,7 @@ def fetch_bundle(start: str = WINDOW[0], end: str = WINDOW[1]) -> DataBundle:
         bundle.series["btc_implied_vol"] = dvol
     else:
         bundle.series["btc_implied_vol"] = syn["btc_implied_vol_syn"]
+        bundle.fallback_substitutions.append("btc_implied_vol")
         if isinstance(dvol, Unavailable):
             bundle.series["btc_implied_vol"].note += f" (deribit fallback: {dvol.reason})"
 
@@ -349,14 +347,14 @@ def _add_catalog_series(bundle: DataBundle) -> None:
     PENROSE_DATA_DIR) to the bundle, so auto-implemented modules can request real
     SOL/LINK/funding/weather/etc. Never overrides a series penrose already populated; silently
     skips if the catalog or a referenced file is missing (the module just sees data_unavailable)."""
-    import sys
     from .. import config
     dd = str(config.DATA_DIR)
     try:
         if dd not in sys.path:
             sys.path.insert(0, dd)
         import loader as catalog  # <PENROSE_DATA_DIR>/loader.py
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        print(f"[penrose] WARNING: data catalog unavailable: {e}", file=sys.stderr)
         return
     if not hasattr(catalog, "available") or not hasattr(catalog, "load_series"):
         return
@@ -365,7 +363,9 @@ def _add_catalog_series(bundle: DataBundle) -> None:
             continue
         try:
             r = catalog.load_series(name)
-        except Exception:  # noqa: BLE001
+        except Exception as e:  # noqa: BLE001
+            print(f"[penrose] WARNING: catalog series '{name}' failed to load: {e}",
+                  file=sys.stderr)
             continue
         if r is None:
             continue

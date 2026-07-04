@@ -73,7 +73,7 @@ def test_pysystemtrade_fetch_rejects_path_traversal(tmp_path, monkeypatch):
 def test_pysystemtrade_defaults_fold_into_bundle_when_available(tmp_path, monkeypatch):
     _write_intraday_fixture(tmp_path, instrument="SP500")
     monkeypatch.setenv("PENROSE_FUTURES_DIR", str(tmp_path))
-    for name in ("fred", "polygon", "tiingo", "alpaca", "alphavantage", "stooq"):
+    for name in ("fred", "polygon", "tiingo", "alpaca", "alphavantage", "stooq", "kenfrench"):
         monkeypatch.setattr(vendors.ADAPTERS[name], "available", lambda: False)
 
     bundle = DataBundle(requested_window=("2024-01-01", "2024-01-10"))

@@ -34,17 +34,19 @@ EXPERIMENTAL skeletons until verified against a live key.
 from __future__ import annotations
 
 from ..contract import _norm_key, _unique_alias_hit
-from . import alpaca, alphavantage, fred, polygon, pysystemtrade, stooq, tiingo
+from . import alpaca, alphavantage, fred, kenfrench, polygon, pysystemtrade, stooq, tiingo, tiingo_iex
 
 # Adapter registry: NAME -> module. Each module implements the protocol above.
 ADAPTERS = {
     fred.NAME: fred,
     polygon.NAME: polygon,
     tiingo.NAME: tiingo,
+    tiingo_iex.NAME: tiingo_iex,
     alpaca.NAME: alpaca,
     alphavantage.NAME: alphavantage,
     stooq.NAME: stooq,
     pysystemtrade.NAME: pysystemtrade,
+    kenfrench.NAME: kenfrench,
 }
 
 # Logical bundle key -> {"vendor": <NAME>, ...vendor-specific spec}.
@@ -91,6 +93,34 @@ DEFAULT_SERIES: dict[str, dict] = {
         "symbol": "iwm.us",
         "field": "close",
         "unit": "usd",
+    },
+    # Ken French keyless research returns (daily, decimal). General infrastructure
+    # for U.S. equity factor/anomaly claims; the momentum trio below is what the
+    # intramonth-momentum paper's claims are expressed against. Values are daily
+    # returns (percent / 100). WML = winners-minus-losers momentum factor; the
+    # Lo/Hi PRIOR decile portfolios let a module study the loser-leg asymmetry.
+    "us_equity_momentum_wml": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Momentum_Factor_daily",
+        "column": "Mom",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_momentum_decile_lo": {
+        "vendor": "kenfrench",
+        "dataset": "10_Portfolios_Prior_12_2_Daily",
+        "column": "Lo PRIOR",
+        "section": 0,
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_momentum_decile_hi": {
+        "vendor": "kenfrench",
+        "dataset": "10_Portfolios_Prior_12_2_Daily",
+        "column": "Hi PRIOR",
+        "section": 0,
+        "start": "1990-01-01",
+        "unit": "ret",
     },
     # Local pysystemtrade adjusted futures. Active only when PENROSE_FUTURES_DIR
     # or PYSYS_DIR points at a pysystemtrade-shaped directory; otherwise absent.

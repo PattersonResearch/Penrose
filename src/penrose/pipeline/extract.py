@@ -8,6 +8,7 @@ the decision record so a hand-authored run is never mistaken for an LLM run.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import asdict
 from typing import Optional
@@ -37,7 +38,12 @@ not literature review. Reject hand-waving.
 
 Output JSON: {{"claims": [{{"statement": str, "mechanism": str, "scope": str,
 "horizon": str, "source_span": str (verbatim quote), "claimed_metric_quote": str
-or null, "applicable_strategy_class": str}}]}}
+or null, "applicable_strategy_class": str, "expected_edge": float or null,
+"sample_period": {{"start": str, "end": str}} or null}}]}}
+expected_edge is the paper's own claimed net edge per trade as a fraction,
+only if numerically stated; else null.
+sample_period is the paper's own evaluation window (data start/end),
+verbatim-derived; null if not stated.
 {vocab}
 Paper text (truncated):
 ---
@@ -67,6 +73,16 @@ def span_in_text(span: str, text: str) -> bool:
     if not span_n:
         return False
     return span_n in _norm_ws(text)
+
+
+def _expected_edge_or_none(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        edge = float(value)
+    except (TypeError, ValueError):
+        return None
+    return edge if math.isfinite(edge) and edge >= 0 else None
 
 
 def extract_claims(source, known_classes: dict | None = None) -> tuple[list[Claim], dict]:
@@ -110,21 +126,40 @@ def extract_claims(source, known_classes: dict | None = None) -> tuple[list[Clai
             # source text. A non-empty-but-fabricated span (hallucinated, injected,
             # or from a scanned/empty PDF) is dropped here, not trusted.
             continue
-        claims.append(Claim(
-            claim_id=f"{source.source_id}-c{i+1}",
-            statement=statement,
-            mechanism=(c.get("mechanism") or "").strip(),
-            scope=(c.get("scope") or "").strip(),
-            horizon=(c.get("horizon") or "").strip(),
-            source_id=source.source_id,
-            source_span=span,
-            # B-014: claimed_metric_quote is also "verbatim" per the prompt — verify it occurs in
-            # the source text; drop a fabricated metric (it flows into spec_gen/report otherwise).
-            claimed_metric_quote=(lambda q: q if (q and span_in_text(q, source.text)) else "")(
-                (c.get("claimed_metric_quote") or "").strip()),
-            applicable_strategy_class=(c.get("applicable_strategy_class")
-                                       or "unspecified"),
-        ))
+        try:
+            claim = Claim(
+                claim_id=f"{source.source_id}-c{i+1}",
+                statement=statement,
+                mechanism=(c.get("mechanism") or "").strip(),
+                scope=(c.get("scope") or "").strip(),
+                horizon=(c.get("horizon") or "").strip(),
+                source_id=source.source_id,
+                source_span=span,
+                # B-014: claimed_metric_quote is also "verbatim" per the prompt — verify it occurs in
+                # the source text; drop a fabricated metric (it flows into spec_gen/report otherwise).
+                claimed_metric_quote=(lambda q: q if (q and span_in_text(q, source.text)) else "")(
+                    (c.get("claimed_metric_quote") or "").strip()),
+                applicable_strategy_class=(c.get("applicable_strategy_class")
+                                           or "unspecified"),
+                sample_period=c.get("sample_period"),
+                expected_edge=_expected_edge_or_none(c.get("expected_edge")),
+            )
+        except ValueError:
+            claim = Claim(
+                claim_id=f"{source.source_id}-c{i+1}",
+                statement=statement,
+                mechanism=(c.get("mechanism") or "").strip(),
+                scope=(c.get("scope") or "").strip(),
+                horizon=(c.get("horizon") or "").strip(),
+                source_id=source.source_id,
+                source_span=span,
+                claimed_metric_quote=(lambda q: q if (q and span_in_text(q, source.text)) else "")(
+                    (c.get("claimed_metric_quote") or "").strip()),
+                applicable_strategy_class=(c.get("applicable_strategy_class")
+                                           or "unspecified"),
+                expected_edge=_expected_edge_or_none(c.get("expected_edge")),
+            )
+        claims.append(claim)
 
     prov = {
         "role": "claim_extractor", "model": resp.model, "in_tokens": resp.in_tokens,

@@ -24,7 +24,7 @@ def test_process_conditional_divergence():
     example = worked.build_example(write_markdown=False)
     assert example.process_a.verdict in {"research-supported", "watch"}
     assert example.process_b.verdict == "kill"
-    assert example.process_b.kill_reason in {"no_oos_edge", "negative_dsr"}
+    assert example.process_b.kill_reason in {"no_oos_edge", "low_edge_t"}
     assert example.process_a.verdict != example.process_b.verdict
 
 

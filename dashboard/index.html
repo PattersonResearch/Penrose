@@ -1106,7 +1106,7 @@ const GLOSSARY = [
   {cat:'pipeline', term:'Firewall', def:'Backtests author proposals; humans commit; dreaming and chat cannot author at all. Enforced via two-OAuth pattern.'},
   {cat:'pipeline', term:'Holdout (locked)', def:'A final time window reserved for one-time validation. First call burns the lock; subsequent peeks refused.'},
   {cat:'pipeline', term:'Kill', def:'A verdict that the claim did not survive the discipline stack. Every kill carries a kill_reason from the enum.'},
-  {cat:'pipeline', term:'Kill reason', def:'Enum tag explaining why a claim was killed: fee_curve, dedup, no_oos_edge, in_sample_only, negative_dsr, capacity_too_small, regime_fragile, data_unavailable, etc.'},
+  {cat:'pipeline', term:'Kill reason', def:'Enum tag explaining why a claim was killed: fee_curve, dedup, no_oos_edge, in_sample_only, low_edge_t, capacity_too_small, regime_fragile, data_unavailable, etc.'},
   {cat:'pipeline', term:'regime_fragile', def:'Kill: a positive edge that collapses (keeps <25% of its per-trade edge) once its single best calendar regime — weekday/weekend, day-of-week, or intraday session — is removed. The signal is real but lives in one regime, so it is fragile in production. Each regime partition is also counted as a trial in the DSR deflation.'},
   {cat:'pipeline', term:'Module', def:'An implementation of a testable strategy class. Lives at modules/<id>/impl.py. Discovered via __strategy_class__ aliases.'},
   {cat:'pipeline', term:'ModuleSpec', def:'YAML document describing what a module should do: claim translation, inputs, signal logic, kill criterion, unknowns.'},

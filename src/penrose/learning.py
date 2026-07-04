@@ -125,6 +125,9 @@ def distill_principles(
     not the conservative same-run ``stages.propose_principle`` rule. It returns
     proposed rows only and never writes approved principle storage.
     """
+    if not config.GENERATIVE_LAYER_ENABLED:
+        raise RuntimeError("the generative layer is frozen (PEN-17): the verdict corpus is being "
+                           "recalibrated; set PENROSE_GENERATIVE_LAYER=1 to override")
     recs = list(records) if records is not None else load_decision_records(decisions_path, analysis_path)
     if not recs:
         return []
@@ -150,6 +153,9 @@ def distill_contrastive_principles(
 
     Proposed rows only; this never writes approved principle storage.
     """
+    if not config.GENERATIVE_LAYER_ENABLED:
+        raise RuntimeError("the generative layer is frozen (PEN-17): the verdict corpus is being "
+                           "recalibrated; set PENROSE_GENERATIVE_LAYER=1 to override")
     recs = list(records) if records is not None else load_decision_records(decisions_path, analysis_path)
     if not recs:
         return []

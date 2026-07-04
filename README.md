@@ -6,7 +6,7 @@
 
 _Most edges don't survive. Penrose finds the few that do, and records why the rest didn't._
 
-[![Version](https://img.shields.io/badge/version-0.3.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.4.1-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -106,8 +106,18 @@ with an adherence-gated declared-regime scope, combinatorial purged cross-valida
 CI, a permutation test, an opt-in tail-risk gate, capacity/impact, a fee curve, and a fidelity check
 that the code faithfully tests the claim. Input series are also frequency-checked at the data boundary
 (so intraday data can never be silently treated as daily); data adapters include keyless crypto and
-equity venues plus a bring-your-own futures adapter. Untrusted auto-generated code **only ever runs
-inside a Docker sandbox,** never in Penrose's own process.
+equity venues plus bring-your-own futures and Tiingo IEX intraday adapters. Tiingo IEX is price-only
+by default: its volume is single-venue, not consolidated tape volume, so volume-gated intraday claims
+route to `needs_data` unless a consolidated intraday feed such as paid Polygon is supplied. Untrusted
+auto-generated code **only ever runs inside a Docker sandbox,** never in Penrose's own process.
+
+For cross-sectional claims, the data layer also has a `Panel` contract (UTC dates x entity columns)
+and pure `xsection` transforms for point-in-time reconstruction: as-of panel assembly, deterministic
+cross-sectional ranks/z-scores, liquidity screens, and long-short factor formation. These are referee
+primitives for rebuilding what a claim describes; they are not signal-generation tools and make no
+claim that any factor is profitable. SEC EDGAR is available as a keyless, point-in-time fundamentals
+panel source for public company filings; set `SEC_EDGAR_UA` to your contact string for SEC fair-access
+requests, or Penrose uses a generic project contact.
 
 The **brain** accumulates verdicts and finds structure across them (shared failure modes,
 cross-domain links, principles). Hard rule: these connections **inform, they never gate.** The
@@ -175,7 +185,7 @@ pip install -e .             # editable: Penrose runs the scripts that ship in t
 jupyter notebook notebooks/penrose_demo.ipynb
 
 # or from the command line (no key needed):
-penrose eval                 # ground-truth: planted strategies with known verdicts (93/93)
+penrose eval                 # ground-truth: planted strategies with known verdicts (97/97)
 python scripts/worked_example_process_conditional.py  # start here: identical returns, opposite verdicts by search scope
 make calib-nulls            # the 5-null specificity battery (0/300)
 make calib-sensitivity      # the detection-threshold sweep
@@ -200,15 +210,23 @@ An agent can query Penrose over the [Model Context Protocol](https://modelcontex
 ```
 pip install -e ".[mcp]"
 penrose-mcp                 # runs the read-only MCP server
+penrose-mcp --management    # opt-in proposal/bookkeeping management tools
 ```
 
 It exposes five **read-only** tools: `penrose_verdicts`, `penrose_proposals`,
 `penrose_principles` (distilled cross-run proposals), `penrose_data_requests`, and `penrose_status`.
 
+With `--management` (or `PENROSE_MCP_MANAGEMENT=1`), it also exposes guarded management tools:
+`penrose_fetch_verdict`, `penrose_register_cohort`, and `penrose_run_claim`. These can fetch one
+verdict, write deflation-ledger bookkeeping, or run a paper/claim through the normal sandboxed pipeline;
+they only return proposals/bookkeeping.
+
 By design it **exposes operations, not escape hatches**: every tool only reads results Penrose already
-produced. Nothing over MCP can approve or promote a verdict (the P9 sign-off stays human), write the
-approved corpus, run a paper, or run a module — so an agent can pull what Penrose found without being
-able to make Penrose fool itself. `mcp` is an optional extra; the core install never requires it.
+produced unless management mode is explicitly enabled. Nothing over MCP can approve or promote a
+verdict (the P9 sign-off stays human), write the approved corpus, run a model-written module outside
+the Docker sandbox, or touch the single-use holdout outside the guarded pipeline path — so an agent can
+operate Penrose without being able to make Penrose fool itself. `mcp` is an optional extra; the core
+install never requires it.
 
 ## Results
 

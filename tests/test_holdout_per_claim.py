@@ -1,3 +1,5 @@
+import json
+
 import numpy as np
 import pandas as pd
 
@@ -27,6 +29,25 @@ def test_holdout_lock_is_per_distinct_claim(tmp_path, monkeypatch):
     assert repeat.get("refused") is True
     assert "claim-a" in repeat["reason"]
     assert len(list(tmp_path.glob(".holdout_burned.*.lock"))) == 3
+
+
+def test_holdout_burn_refusal_does_not_echo_stats(tmp_path, monkeypatch):
+    from penrose.pipeline import p7_backtest as p7
+
+    monkeypatch.delenv("PENROSE_HOLDOUT_LOCK", raising=False)
+    monkeypatch.delenv("PENROSE_HOLDOUT_MODE", raising=False)
+    monkeypatch.setattr(p7, "HOLDOUT_LOCK", tmp_path / ".holdout_burned")
+    net = _net()
+
+    first = p7.final_holdout_eval("claim-leak-check", net, 252.0)
+    second = p7.final_holdout_eval("claim-leak-check", net, 252.0)
+    lock_text = next(tmp_path.glob(".holdout_burned.*.lock")).read_text()
+
+    assert "holdout_sharpe" in first
+    assert second.get("refused") is True
+    # PEN-14: burned locks and refusal payloads must never echo holdout statistics.
+    assert "holdout_sharpe" not in lock_text
+    assert "holdout_sharpe" not in json.dumps(second)
 
 
 def test_holdout_readonly_blocks_even_force(tmp_path, monkeypatch):

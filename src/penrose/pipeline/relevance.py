@@ -1,15 +1,17 @@
-"""Relevance gate (pre-P2): is this paper testable against penrose's data domains?
+"""Scope gate (pre-P2): does this paper contain a falsifiable quantitative performance claim?
 
-The loop's paper-grabber can pull off-domain papers (a CERN physics paper slipped
-through once). Extracting claims + auto-implementing modules for a paper whose data we
-can never source just burns LLM budget and clutters the data-request backlog. This is a
-cheap pre-screen on the abstract: if NO claim is plausibly testable with the data we have
-(or could realistically collect), the paper is flagged off_domain and skipped before the
-expensive stages.
+The loop's paper-grabber can pull genuinely out-of-scope papers (a CERN physics paper slipped
+through once). Extracting claims + auto-implementing modules for a paper with NO tradable
+performance claim just burns LLM budget. This is a cheap pre-screen on the abstract that judges
+SCOPE, not data availability: a paper with at least one falsifiable performance claim is relevant
+even when we do not currently hold its data — that becomes a `needs_data` result downstream, NOT an
+off-domain rejection. Only papers with no tradable empirical performance claim at all (pure theory,
+a governance/survey study, physics) are flagged off_domain and skipped before the expensive stages.
+The currently-held data domains are still passed to the model as INFORMATIONAL context (so it can
+tag which a claim maps to), but absence from that list is never grounds for off_domain.
 
-Fail-OPEN: any error (LLM down, parse fail) returns relevant=True — we never silently
-drop a paper because the screener hiccuped; the worst case is we fall back to the old
-behavior (extract + needs_data).
+Fail-OPEN: any error (LLM down, parse fail) returns relevant=True — we never silently drop a paper
+because the screener hiccuped; the worst case is we fall back to extract + needs_data.
 """
 from __future__ import annotations
 
@@ -64,16 +66,30 @@ def _data_domains() -> list[str]:
 
 def _system_prompt() -> str:
     return (
-        "You are a relevance gate for a quantitative-research pipeline. The pipeline can only "
-        "backtest a claim if it can be expressed against one of these data domains:\n"
+        "You are a SCOPE gate for a quantitative-research falsification pipeline. The pipeline "
+        "evaluates falsifiable claims about investment PERFORMANCE: abnormal or risk-adjusted "
+        "return, return predictability, a tradeable signal, a factor, a trading strategy, or any "
+        "claim that a rule produces a measurable edge in asset returns.\n\n"
+        "Given a paper's title and abstract, decide whether it contains AT LEAST ONE such "
+        "falsifiable, quantitative performance claim that could in principle be tested on market "
+        "data. Judge SCOPE, NOT data availability: do NOT answer 'not relevant' merely because the "
+        "specific dataset would be hard to obtain or is outside what the pipeline currently holds "
+        "— whether the data exists is decided LATER in the pipeline (it becomes a 'needs_data' "
+        "result, not an off-domain rejection).\n\n"
+        "RELEVANT (in scope): a momentum, value, carry, reversal, or anomaly claim in ANY asset "
+        "class (equities, futures, FX, crypto, rates, commodities); a return-predictability or "
+        "market-timing claim; a trading-strategy performance claim; a prediction-market efficiency "
+        "or volatility-edge claim. In scope even if the asset class is one the pipeline does not "
+        "currently have data for.\n\n"
+        "NOT RELEVANT (out of scope): a paper with NO tradable, quantitative performance claim at "
+        "all — pure theory or mathematics, a corporate-governance or survey study, an accounting "
+        "or causal-inference result with no return prediction, physics, etc.\n\n"
+        "For context only, the pipeline currently holds or can readily collect data for:\n"
         + "\n".join(f"  - {d}" for d in _data_domains())
-        + "\nGiven a paper's title and abstract, decide whether AT LEAST ONE of its empirical "
-        "claims could plausibly be tested with that data (directly, or via a close proxy we "
-        "could collect). A paper about, say, nuclear physics, corporate-bond default intensity, "
-        "or pure martingale theory with no tradable empirical claim is NOT relevant. A paper "
-        "about crypto returns/volatility/funding, prediction-market efficiency, or weather "
-        "markets IS relevant. Respond ONLY with JSON: "
-        '{"relevant": true|false, "domains": [<matching domain keywords>], '
+        + "\n(This list is INFORMATIONAL — a claim outside it is still in scope; it just routes to "
+        "needs_data later.)\n\n"
+        "Respond ONLY with JSON: "
+        '{"relevant": true|false, "domains": [<held-data domains the claim maps to, if any>], '
         '"reason": "<one sentence>"}.'
     )
 

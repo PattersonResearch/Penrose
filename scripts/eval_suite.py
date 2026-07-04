@@ -29,10 +29,11 @@ from penrose.pipeline import p7_backtest as P7   # noqa: E402 (self-adds harness
 from penrose.pipeline import run as RUN          # noqa: E402
 from penrose.pipeline import stages              # noqa: E402
 from penrose.brain import Claim                  # noqa: E402
+from penrose import config                       # noqa: E402
 
 # --- isolation: pin the trial count so a verdict depends only on the strategy ------- #
 _REAL_TRIAL_STATS = P7._trial_stats          # keep the real one for the A-004/C1 tests
-P7._trial_stats = lambda *a, **k: (1, 0.0)   # pin (now takes family, strategy)
+P7._trial_stats = lambda *a, **k: (1, 0.0)   # pin (now takes family, strategy, generation_source)
 
 BPY = 365.0 / 5.0           # bars/year for a 5-day hold (realistic, not daily)
 
@@ -101,7 +102,8 @@ def build_thin(rng):
 
 # (name, builder, expected verdict(s), expected kill_reason substring or None)
 CASES = [
-    ("overfit (IS-only)",        build_overfit,        ("kill",),                          None),
+    # PEN-01: the low-power 3-fold failure may reclassify; this planted case must not survive.
+    ("overfit (IS-only)",        build_overfit,        ("kill", "underpowered"),            None),
     ("robust edge",              build_robust,         ("watch", "research-supported"),     None),
     ("regime-fragile (weekend)", build_regime_fragile, ("kill",),                           "regime_fragile"),
     ("random noise",             build_random,         ("kill",),                           None),
@@ -135,6 +137,15 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("regime: weekend-concentrated -> fragile", R.regime_split(frag, BPY).get("fragile") is True))
     unif = pd.Series(rng.normal(0.010, 0.008, n), index=iz)
     out.append(("regime: uniform edge -> not fragile",      R.regime_split(unif, BPY).get("fragile") is False))
+    # PEN-02: seed 0 is a marginal uniform edge where the old drop-best rule fires, but the
+    # permutation null shows the concentration is ordinary noise-selection (p=0.5).
+    rng_marg = np.random.default_rng(0)
+    marg = pd.Series(rng_marg.normal(0.05, 1.0, 240),
+                     index=pd.date_range("2020-01-01", periods=240, freq="D"))
+    marg_regime = R.regime_split(marg, BPY)
+    out.append(("PEN-02: marginal uniform day-of-week concentration is not fragile",
+                marg_regime.get("fragile") is False
+                and (marg_regime.get("fragility_p") or {}).get("day_of_week", 0.0) >= 0.05))
 
     # --- fidelity refuter errors are inconclusive, never permission to trust a module -------- #
     from penrose.pipeline import fidelity
@@ -163,13 +174,35 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("POWER: underpowered exposes marginal more_oos_bars_needed",
                 isinstance(_res_up.get("more_oos_bars_needed"), int)
                 and _res_up.get("more_oos_bars_needed") >= 0))
-    # Structural kills are power-INDEPENDENT: a THIN sample with sign-unstable 3-fold still KILLS.
+    _bt_low_t = dict(bt)
+    _bt_low_t.update({"dsr": 0.95, "edge_t": 0.5, "n_oos": 60})
+    _d_low_t = stages.p8_verdict(_claim(), _bt_low_t, {}, False)
+    out.append(("PEN-03: low edge-t + thin sample -> underpowered",
+                _d_low_t.verdict == "underpowered"
+                and _d_low_t.kill_reason == "below_detection_floor"))
+    _bt_low_t_big = dict(_bt_low_t)
+    _bt_low_t_big["n_oos"] = 5000
+    _d_low_t_big = stages.p8_verdict(_claim(), _bt_low_t_big, {}, False)
+    out.append(("PEN-03: low edge-t + ample sample -> kill(low_edge_t)",
+                _d_low_t_big.verdict == "kill" and _d_low_t_big.kill_reason == "low_edge_t"))
+    # PEN-01: structural 3-fold failures now need either fold-level power or a significantly
+    # negative fold t-stat; this synthetic case pins the latter.
     _bt_st = {"psr": 0.5, "dsr": 0.5, "edge_t": 0.2, "n_oos": 60, "oos_sharpe": 0.3, "bars_per_year": 252,
-              "three_fold": {"folds": [1, -1, 1], "consistent": False}, "capacity_usd": 1e6,
+              "three_fold": {"folds": [1, -1, 1], "consistent": False,
+                             "fold_n": [20, 20, 20], "fold_t": [1.0, -2.0, 1.0],
+                             "min_fold_t": -2.0}, "capacity_usd": 1e6,
               "bootstrap": {}, "permutation": {}, "regime": {}}
     _d_st = stages.p8_verdict(_claim(), _bt_st, {}, False)
     out.append(("POWER: structural kill (3-fold unstable) stays kill even when thin (power-independent)",
                 _d_st.verdict == "kill" and _d_st.kill_reason == "in_sample_only"))
+    _bt_amb_tf = dict(_bt_st)
+    _bt_amb_tf["three_fold"] = {"folds": [1, -0.3, 1], "consistent": False,
+                                "fold_n": [20, 20, 20], "fold_t": [1.0, -0.3, 1.0],
+                                "min_fold_t": -0.3}
+    _d_amb_tf = stages.p8_verdict(_claim(), _bt_amb_tf, {}, False)
+    out.append(("PEN-01: low-power 3-fold failure -> underpowered",
+                _d_amb_tf.verdict == "underpowered"
+                and _d_amb_tf.kill_reason == "below_detection_floor"))
 
     # --- A-002: the locked holdout tail must not influence the 3-fold/regime gates ---- #
     n = 250
@@ -190,9 +223,10 @@ def invariants() -> list[tuple[str, bool]]:
     old = P7.LEDGER
     P7.LEDGER = tmp
     try:
-        n_distinct, _ = _REAL_TRIAL_STATS()                       # no current strategy
-        n_rerun, _ = _REAL_TRIAL_STATS(strategy="a")             # re-run of existing 'a'
-        n_new, _ = _REAL_TRIAL_STATS(strategy="c")              # a genuinely new strategy
+        # PEN-06: generated source keeps these dedup/scoping mechanics isolated from paper floors.
+        n_distinct, _ = _REAL_TRIAL_STATS(generation_source="generated")             # no current strategy
+        n_rerun, _ = _REAL_TRIAL_STATS(strategy="a", generation_source="generated")  # re-run of existing 'a'
+        n_new, _ = _REAL_TRIAL_STATS(strategy="c", generation_source="generated")    # a genuinely new strategy
     finally:
         P7.LEDGER = old
     out.append(("A-004: 5 rows / 2 distinct strategies -> 2 trials (deduped)", n_distinct == 2))
@@ -200,8 +234,9 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("B-016: a new strategy 'c' counts once -> 3", n_new == 3))
 
     # 5c: paper/ad-hoc runs pre-register P7-ready claims as a per-family cohort, so the
-    # DSR denominator is fixed before any backtest reads it. This is a correctness tightening:
-    # first-vs-last order cannot change n_trials or verdict, while single-claim cohorts remain n=1.
+    # DSR denominator is fixed before any backtest reads it. PEN-06 adds the external effective-
+    # trials floor and prior-cohort variance rule: first-vs-last order cannot change n_trials,
+    # DSR, or verdict, while a single paper claim floors at config.DEFLATION_PRIOR.
     def _eval_claim(cid: str) -> Claim:
         return Claim(claim_id=cid, statement="BTC eval cohort", mechanism="",
                      scope="", horizon="", source_id="eval", source_span="",
@@ -250,7 +285,8 @@ def invariants() -> list[tuple[str, bool]]:
         _last_family_n = _bt_last["n_trials"] - int(_bt_last["regime"].get("n_partitions", 0))
         _order_ok = (
             _bt_first["n_trials"] == _bt_last["n_trials"]
-            and _first_family_n == _last_family_n == 5
+            and _first_family_n == _last_family_n == config.DEFLATION_PRIOR["external_min_trials"]
+            and _bt_first["dsr"] == _bt_last["dsr"]
             and _v_first == _v_last
         )
 
@@ -264,16 +300,20 @@ def invariants() -> list[tuple[str, bool]]:
         RUN._register_run_cohorts(_single_ready, "eval-source")
         _bt_single, _ = _cohort_score(_single_claim, _single_ready[0]["family"])
         _single_family_n = _bt_single["n_trials"] - int(_bt_single["regime"].get("n_partitions", 0))
-        _single_ok = _bt_single == _bt_base and _single_family_n == 1
+        # PEN-06: a paper-source single claim is deflated with the configured external floor.
+        _single_ok = (
+            _bt_single == _bt_base
+            and _single_family_n == config.DEFLATION_PRIOR["external_min_trials"]
+        )
     finally:
         P7.LEDGER = _old_ledger
         P7._trial_stats = _old_stats
         for _p in (_order_a, _order_b, _single_l, _base_l):
             _p.unlink(missing_ok=True)
             Path(str(_p) + ".lock").unlink(missing_ok=True)
-    out.append(("5c: same strategy first-vs-last in a paper cohort has identical n_trials + verdict",
+    out.append(("5c: same strategy first-vs-last in a paper cohort has identical n_trials + DSR + verdict",
                 _order_ok))
-    out.append(("5c: single-claim paper cohort stays byte-identical at n=1", _single_ok))
+    out.append(("5c: PEN-06 single-claim paper cohort is byte-identical at external floor", _single_ok))
 
     # ===================== Wave 2/3 audit-fix regression guards ===================== #
     import tempfile
@@ -356,7 +396,9 @@ def invariants() -> list[tuple[str, bool]]:
                   "per_trade_sharpe": [1, 1, 2, 2], "dsr": [0] * 4, "n": [100] * 4}).to_csv(_ft, sep="\t", index=False)
     _ol = P7.LEDGER; P7.LEDGER = _ft
     try:
-        nX, _ = _REAL_TRIAL_STATS("X", "new"); nAll, _ = _REAL_TRIAL_STATS(None, "new")
+        # PEN-06: generated source keeps these scoping mechanics isolated from paper floors.
+        nX, _ = _REAL_TRIAL_STATS("X", "new", generation_source="generated")
+        nAll, _ = _REAL_TRIAL_STATS(None, "new", generation_source="generated")
     finally:
         P7.LEDGER = _ol
     out.append(("C1: family X scoping -> 2 in-family + current = 3", nX == 3))
@@ -639,7 +681,8 @@ def invariants() -> list[tuple[str, bool]]:
              "search_denominator": 7}
             for i in range(5)
         ])
-        _dn, _ = _REAL_TRIAL_STATS("dream-eval::crypto", "dream-test-c1")
+        _dn, _ = _REAL_TRIAL_STATS("dream-eval::crypto", "dream-test-c1",
+                                   generation_source="generated")
         _ddf = pd.read_csv(_dl, sep="\t")
     finally:
         P7.LEDGER = _old_dl; _dl.unlink(missing_ok=True)
@@ -672,7 +715,8 @@ def invariants() -> list[tuple[str, bool]]:
                  "search_denominator": 3}
                 for i in range(3)
             ])
-        _accum_n, _ = _REAL_TRIAL_STATS("generated::crypto", "r2-c0")
+        _accum_n, _ = _REAL_TRIAL_STATS("generated::crypto", "r2-c0",
+                                        generation_source="generated")
     finally:
         P7.LEDGER = _old_dl2; _dl2.unlink(missing_ok=True)
     out.append(("DREAM-FAMILY: repeated dream cohorts accumulate in one persistent strategy family",

@@ -10,15 +10,15 @@ Penrose is a **falsification referee for quantitative trading claims**. It inges
 thesis, a code-complete strategy, or a machine-generated hypothesis), reconstructs it in a sandbox,
 runs it through a robustness and power stack, validates its own detector, and returns a calibrated
 verdict. It is **not** a backtester and **not** an alpha generator, and it makes **no claim that any
-strategy is profitable**. DSR deflation scales with the search Penrose has actually seen; a first
-single-claim family run is scored by PSR plus the robustness stack until more family trials
-accumulate. See [docs/GATES.md](docs/GATES.md) for every gate in plain language.
+strategy is profitable**. DSR deflation scales with the search Penrose has actually seen, floored by
+a conservative effective-trials prior for external claims (config.DEFLATION_PRIOR). See
+[docs/GATES.md](docs/GATES.md) for every gate in plain language.
 
 ## Setup and the green bar
 
 ```bash
 pip install -e .                              # editable install; Penrose runs scripts from the clone
-python scripts/eval_suite.py                  # invariant suite — must print 93/93 passed
+python scripts/eval_suite.py                  # invariant suite — must print 97/97 passed
 python -m pytest -q                           # unit tests — must stay green
 python scripts/calibration_placebo.py         # placebo: no no-edge signal may be certified
 ```

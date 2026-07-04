@@ -9,6 +9,7 @@ import math
 import sys
 
 import numpy as np
+from scipy.stats import norm
 
 from .. import config
 from ..brain import Claim, Decision, Principle, BrainReader, source_is_unanchored
@@ -116,7 +117,7 @@ def p3_falsifiability(claim: Claim) -> dict:
 
 
 # --- P4 fee-curve filter ---------------------------------------------------- #
-def p4_fee_curve(claim: Claim, expected_edge: float, trade_price: float = 0.5,
+def p4_fee_curve(claim: Claim, expected_edge: float | None, trade_price: float = 0.5,
                  venue: str = "kalshi") -> dict:
     """For a binary-priced trade the fee is C*fee_rate*p(1-p). The tradeable
     translation here is a VOL trade (Deribit), not a 50c binary, so the binary
@@ -126,12 +127,17 @@ def p4_fee_curve(claim: Claim, expected_edge: float, trade_price: float = 0.5,
     binary_fee = H.pm_fee_frac(trade_price, cfg["fee_rate"], cfg["C"])
     vol_cost = config.VOL_TRADE_COST["deribit_roundtrip_bps_of_vega"] / 1e4
     killed = expected_edge is not None and expected_edge < vol_cost
+    evaluated = expected_edge is not None
+    note = ("vol trade dodges the 50c binary fee wall; must clear "
+            f"{vol_cost:.4f} round-trip vega cost")
+    if not evaluated:
+        note = "no claimed edge stated; fee gate not evaluated (advisory only)"
     return {"stage": "P4", "killed": bool(killed),
             "reason": "fee_curve" if killed else None,
+            "evaluated": evaluated,
             "binary_fee_at_50c": round(float(binary_fee), 4),
             "vol_trade_cost_frac": round(vol_cost, 5),
-            "note": ("vol trade dodges the 50c binary fee wall; must clear "
-                     f"{vol_cost:.4f} round-trip vega cost")}
+            "note": note}
 
 
 # --- P5 dedup --------------------------------------------------------------- #
@@ -285,6 +291,27 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     # is strictly correct and only ever stricter.
     score = dsr
     reasons = []
+    fold_ns = folds.get("fold_n") or []
+    observed_ic = bt.get("per_trade_sharpe")
+    try:
+        observed_ic = float(observed_ic)
+    except (TypeError, ValueError):
+        observed_ic = None
+    # PEN-01 amendment: test 3-fold power against the DECLARED realistic-edge floor, never the
+    # observed in-sample Sharpe. The in-sample point estimate is upward-biased, so using it as the
+    # power reference is circular — it inflates the computed power and hard-kills true marginal
+    # edges that fail the all-signs test by chance. The power question is "could this data resolve
+    # a REALISTIC edge?", whose effect size is the frozen config floor (config.POWER). (Investigated
+    # 2026-07-03: 9/15 Part-A false-kills came through this inflated-power path.) observed_ic is
+    # retained only for the decision record, not for gating.
+    ic_ref = pw["realistic_ic_floor"]
+    three_fold_power = (
+        math.prod(norm.cdf(ic_ref * math.sqrt(n)) for n in fold_ns)
+        if len(fold_ns) == 3 and all(n >= 5 for n in fold_ns)
+        else None
+    )
+    min_fold_t = folds.get("min_fold_t")
+    ambiguous_three_fold = False
     if bt.get("n_oos", 0) < band["min_oos_bars"]:
         verdict, kill = "insufficient_data", "data_unavailable"
         reasons.append(f"only {bt.get('n_oos', 0)} OOS trades (< {band['min_oos_bars']} "
@@ -292,8 +319,14 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     elif not folds.get("consistent", False):
         verdict, kill = "kill", "in_sample_only"
         reasons.append(f"3-fold Sharpe not sign-stable: {folds.get('folds')}")
+        if min_fold_t is not None and min_fold_t <= pw["structural_fold_t"]:
+            pass
+        elif three_fold_power is not None and three_fold_power >= pw["three_fold_min_power"]:
+            pass
+        else:
+            ambiguous_three_fold = True
     elif score < band["kill_below_psr"] or edge_t < 1.0:
-        verdict, kill = "kill", ("no_oos_edge" if score < band["kill_below_psr"] else "negative_dsr")
+        verdict, kill = "kill", ("no_oos_edge" if score < band["kill_below_psr"] else "low_edge_t")
         reasons.append(f"OOS score {score:.3f} (<{band['kill_below_psr']}), edge_t {edge_t}")
     elif score < band["watch_band"][1]:
         verdict, kill = "watch", None
@@ -394,6 +427,20 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
         verdict = "watch"
         reasons.append(f"{source_type} lacks an external anchor — capped at watch until "
                        "independent forward/external confirmation")
+    post_sample_missing = False
+    ps = bt.get("post_sample") or {}
+    post_cfg = getattr(config, "POST_SAMPLE", {})
+    if (ps and post_cfg.get("enabled") and source_type == "external_source"
+            and verdict in ("watch", "research-supported")):
+        min_post_years = float(post_cfg.get("min_post_years", 1.0))
+        post_years = ps.get("post_years")
+        if (not ps.get("declared")) or post_years is None or post_years < min_post_years:
+            if verdict == "research-supported":
+                verdict = "watch"
+            post_sample_missing = True
+            reasons.append(
+                "no post-sample evidence: bundle ends "
+                f"{ps.get('data_end')}, claim sample ends {ps.get('sample_end') or 'undeclared'}")
     csg = getattr(config, "COST_SENSITIVITY_GATE", {"enabled": False})
     cs = bt.get("cost_sensitivity") or {}
     if csg.get("enabled") and verdict in ("watch", "research-supported"):
@@ -411,13 +458,21 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
         reasons.append(f"capacity CI conditional on positive edge (p={cci.get('p_positive_edge')})")
 
     # --- POWER-AWARE RECLASSIFICATION ---------------------------------------------------------
-    # A NON-structural null — low DSR (`no_oos_edge`) or a bootstrap CI that includes zero
-    # (`edge_ci_zero`) — on data that could NOT resolve a realistic edge is NOT proven dead; it is
-    # below the detection floor. Relabel it `underpowered`. Structural kills (in_sample_only,
-    # regime_fragile, walk_forward_drift, no_signal_alignment, negative_dsr) are power-INDEPENDENT
-    # and stand. This is the fix for "a skeptic that rejects everything real == a broken always-no".
-    _AMBIGUOUS_NULL = {"no_oos_edge", "edge_ci_zero", "overfit_cpcv"}
-    if verdict == "kill" and kill in _AMBIGUOUS_NULL and not power_sufficient:
+    # A NON-structural null — low DSR (`no_oos_edge`), low edge t-stat (`low_edge_t`), or a
+    # bootstrap CI that includes zero (`edge_ci_zero`) — on data that could NOT resolve a realistic
+    # edge is NOT proven dead; it is below the detection floor. Relabel it `underpowered`.
+    # Structural kills (in_sample_only, regime_fragile, walk_forward_drift, no_signal_alignment)
+    # are power-INDEPENDENT and stand. This is the fix for "a skeptic that rejects everything real
+    # == a broken always-no".
+    _AMBIGUOUS_NULL = {"no_oos_edge", "edge_ci_zero", "overfit_cpcv", "low_edge_t"}
+    ambiguous_three_fold_underpowered = (
+        kill == "in_sample_only"
+        and ambiguous_three_fold
+        and (three_fold_power is None or three_fold_power < pw["three_fold_min_power"])
+    )
+    if (verdict == "kill"
+            and ((kill in _AMBIGUOUS_NULL and not power_sufficient)
+                 or ambiguous_three_fold_underpowered)):
         verdict, kill = "underpowered", "below_detection_floor"
         resolution = _power_resolution(_n_oos, _bpy, mde_ic, pw)
         reasons.append(
@@ -451,6 +506,9 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "oos_sharpe": bt.get("oos_sharpe"), "capacity_usd": cap,
                  "mde_ic": mde_ic, "mde_sharpe_ann": mde_sharpe_ann,   # power: smallest edge resolvable
                  "power_sufficient": power_sufficient,                  # could we have seen a realistic edge?
+                 "three_fold_power": three_fold_power,
+                 "min_fold_t": min_fold_t,
+                 "no_post_sample_data": post_sample_missing,
                  "resolution": resolution,
                  # B2 (in-sample replication proxy): a KILL is only corpus-worthy if the edge was
                  # first reproduced IN-SAMPLE (positive IS Sharpe) and then died OOS. If we never

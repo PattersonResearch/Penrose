@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT))
 
 from penrose.brain import Claim
+from penrose import config
 from penrose.data.contract import DataBundle
 from penrose.pipeline import p7_backtest as p7
 from penrose.pipeline import run as runmod
@@ -107,7 +108,9 @@ def test_run_cohort_makes_same_strategy_order_independent(tmp_path, monkeypatch)
     first_family_n = first_bt["n_trials"] - int(first_bt["regime"].get("n_partitions", 0))
     last_family_n = last_bt["n_trials"] - int(last_bt["regime"].get("n_partitions", 0))
     assert first_bt["n_trials"] == last_bt["n_trials"]
-    assert first_family_n == last_family_n == 5
+    # PEN-06: paper cohorts below the external effective-trials prior floor at 10.
+    assert first_family_n == last_family_n == config.DEFLATION_PRIOR["external_min_trials"]
+    assert first_bt["dsr"] == last_bt["dsr"]
     assert first_verdict == last_verdict
 
 
@@ -131,8 +134,8 @@ def test_trial_stats_never_discounts_distinct_strategies_or_unrelated_family(tmp
                 {"per_trade_sharpe": 0.1, "dsr": 0.5, "n": i + 1},
                 "unit::crypto",
             )
-        n, _ = p7._trial_stats("unit::crypto", "distinct-4")
-        unrelated_n, _ = p7._trial_stats("other::crypto", "other")
+        n, _ = p7._trial_stats("unit::crypto", "distinct-4", generation_source="generated")
+        unrelated_n, _ = p7._trial_stats("other::crypto", "other", generation_source="generated")
     finally:
         p7.LEDGER = old
 
@@ -158,7 +161,11 @@ def test_single_claim_cohort_is_byte_identical_to_running_count(tmp_path):
         p7.LEDGER = old
 
     assert cohort == baseline
-    assert cohort["n_trials"] - int(cohort["regime"].get("n_partitions", 0)) == 1
+    # PEN-06: paper-source single claims now use the external effective-trials floor.
+    assert (
+        cohort["n_trials"] - int(cohort["regime"].get("n_partitions", 0))
+        == config.DEFLATION_PRIOR["external_min_trials"]
+    )
 
 
 def test_run_cohort_registration_failure_falls_back_to_running_count(tmp_path, monkeypatch):
@@ -179,7 +186,10 @@ def test_run_cohort_registration_failure_falls_back_to_running_count(tmp_path, m
     finally:
         p7.LEDGER = old
 
-    assert bt["n_trials"] - int(bt["regime"].get("n_partitions", 0)) == 1
+    assert (
+        bt["n_trials"] - int(bt["regime"].get("n_partitions", 0))
+        == config.DEFLATION_PRIOR["external_min_trials"]
+    )
 
 
 def test_run_cohort_ignores_stale_claim_denominator(tmp_path):
@@ -192,7 +202,7 @@ def test_run_cohort_ignores_stale_claim_denominator(tmp_path):
     ready = _ready([stale, fresh])
     try:
         runmod._register_run_cohorts(ready, "unit-paper")
-        n, _ = p7._trial_stats(ready[0]["family"], "stale")
+        n, _ = p7._trial_stats(ready[0]["family"], "stale", generation_source="generated")
     finally:
         p7.LEDGER = old
 
@@ -229,7 +239,10 @@ def test_run_source_cleans_abandoned_paper_cohort_before_later_same_family_run(t
     finally:
         p7.LEDGER = old_ledger
 
-    assert bt["n_trials"] - int(bt["regime"].get("n_partitions", 0)) == 2
+    assert (
+        bt["n_trials"] - int(bt["regime"].get("n_partitions", 0))
+        == config.DEFLATION_PRIOR["external_min_trials"]
+    )
 
 
 def test_scored_prior_paper_strategy_still_counts_for_later_same_family_run(tmp_path):
@@ -249,7 +262,117 @@ def test_scored_prior_paper_strategy_still_counts_for_later_same_family_run(tmp_
     finally:
         p7.LEDGER = old
 
-    assert bt["n_trials"] - int(bt["regime"].get("n_partitions", 0)) == 3
+    assert (
+        bt["n_trials"] - int(bt["regime"].get("n_partitions", 0))
+        == config.DEFLATION_PRIOR["external_min_trials"]
+    )
+
+
+def test_deflation_prior_floor_applies_for_paper_source(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        bt, _ = _score(_claim("paper-floor"), "unit::crypto", log=False)
+    finally:
+        p7.LEDGER = old
+
+    assert bt["n_trials"] - int(bt["regime"].get("n_partitions", 0)) >= 10
+    assert bt["dsr"] < bt["psr"]
+
+
+def test_deflation_prior_floor_not_applied_for_generated_source(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        n, var = p7._trial_stats("generated::crypto", "candidate", generation_source="generated")
+    finally:
+        p7.LEDGER = old
+
+    assert n == config.DEFLATION_PRIOR["generated_min_trials"]
+    assert var == config.DEFLATION_PRIOR["sr_var_prior"]
+
+
+def test_variance_prior_active_with_no_scored_siblings(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        n, var = p7._trial_stats("unit::crypto", "first-paper")
+    finally:
+        p7.LEDGER = old
+
+    assert n == config.DEFLATION_PRIOR["external_min_trials"]
+    assert var == config.DEFLATION_PRIOR["sr_var_prior"]
+
+
+def test_current_cohort_excluded_from_empirical_variance(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        p7._append_ledger(
+            "prior-a", {"per_trade_sharpe": 0.01, "dsr": 0.1, "n": 10},
+            "unit::crypto", search_cohort_id="prior")
+        p7._append_ledger(
+            "prior-b", {"per_trade_sharpe": 0.03, "dsr": 0.1, "n": 10},
+            "unit::crypto", search_cohort_id="prior")
+        p7._append_ledger(
+            "current-a", {"per_trade_sharpe": 9.0, "dsr": 0.1, "n": 10},
+            "unit::crypto", search_cohort_id="current")
+        _, var_without_current = p7._trial_stats(
+            "unit::crypto", "current-b", search_cohort_id="current")
+        _, var_with_current = p7._trial_stats("unit::crypto", "current-b")
+    finally:
+        p7.LEDGER = old
+
+    assert var_without_current < var_with_current
+    assert var_without_current == config.DEFLATION_PRIOR["sr_var_prior"]
+
+
+def test_trial_registration_cannot_shrink_or_overwrite_scored_rows(tmp_path, capsys):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        p7.register_trials([{
+            "strategy": "s1",
+            "family": "unit::crypto",
+            "generation_source": "paper",
+            "search_cohort_id": "declared",
+            "search_denominator": 500,
+        }])
+        p7.register_trials([{
+            "strategy": "s1",
+            "family": "unit::crypto",
+            "generation_source": "paper",
+            "search_cohort_id": "declared",
+            "search_denominator": 5,
+        }])
+        row = p7._canonicalize_ledger().iloc[0]
+        n, _ = p7._trial_stats("unit::crypto", "s1", generation_source="generated")
+
+        p7._append_ledger(
+            "s1",
+            {"per_trade_sharpe": 0.12, "dsr": 0.4, "n": 100},
+            "unit::crypto",
+            generation_source="paper",
+            search_cohort_id="declared",
+            search_denominator=500,
+        )
+        p7.register_trials([{
+            "strategy": "s1",
+            "family": "unit::crypto",
+            "generation_source": "paper",
+            "search_cohort_id": "declared",
+            "search_denominator": 5,
+        }])
+        scored = p7._canonicalize_ledger().iloc[0]
+        warning = capsys.readouterr().err
+    finally:
+        p7.LEDGER = old
+
+    assert int(row["search_denominator"]) == 500
+    assert n == 500
+    assert float(scored["per_trade_sharpe"]) == 0.12
+    assert int(scored["search_denominator"]) == 500
+    assert "registration for scored strategy 's1' ignored" in warning
 
 
 class pytest_raises_abort:

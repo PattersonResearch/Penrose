@@ -77,7 +77,7 @@ def test_build_server_registers_five_readonly_tools_or_fails_gracefully():
             names = set(server._tool_manager._tools.keys())
         expected = {"penrose_verdicts", "penrose_proposals", "penrose_principles",
                     "penrose_data_requests", "penrose_status"}
-        assert expected.issubset(names), f"missing tools: {expected - names}"
+        assert names == expected
     else:
         with pytest.raises(ImportError) as e:
             mcp_server.build_server()
@@ -85,19 +85,18 @@ def test_build_server_registers_five_readonly_tools_or_fails_gracefully():
 
 
 def test_server_is_strictly_read_only():
-    # No mutate/run/approve/write reference is actually CALLED in the server module. We check
-    # code identifiers via the AST (not the docstring, which deliberately documents the constraint).
+    # The shared read accessors remain strictly read-only. The MCP module now also contains
+    # opt-in management wrappers, covered in test_mcp_management.py; the default server surface
+    # is checked above.
     import ast
-    import penrose.mcp_server as ms
     import penrose.views as vw
     used: set[str] = set()
-    for mod in (ms, vw):                     # guard the server AND the accessors it calls
-        tree = ast.parse(open(mod.__file__).read())
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Name):
-                used.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                used.add(node.attr)
+    tree = ast.parse(open(vw.__file__).read())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            used.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            used.add(node.attr)
     forbidden = {"run_source", "PRINCIPLES_LOG", "write_proposals", "run_in_container",
                  "final_holdout_eval", "final_holdout", "_append_jsonl", "_write_ledger",
                  "register_trials"}

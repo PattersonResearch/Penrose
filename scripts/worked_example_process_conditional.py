@@ -31,10 +31,12 @@ WINNER = "worked-example-winner"
 COHORT_A = "worked-example-preregistered"
 COHORT_B = "worked-example-200"
 N_TRIALS_B = 200
-SR_VARIANCE_B = 0.0005
 SEED = 20260623
 N_BARS = 4000
-EFFECT = 0.055
+# PEN-06: the example now clears the external effective-trials prior for process A while process B
+# still fails solely from the disclosed best-of-200 search variance.
+SR_VARIANCE_B = 0.0054
+EFFECT = 0.20
 
 
 @dataclass(frozen=True)
@@ -246,7 +248,7 @@ def build_example(write_markdown: bool = True) -> WorkedExample:
 
     assert process_a.verdict in {"research-supported", "watch"}, process_a
     assert process_b.verdict == "kill", process_b
-    assert process_b.kill_reason in {"no_oos_edge", "negative_dsr"}, process_b
+    assert process_b.kill_reason in {"no_oos_edge", "low_edge_t"}, process_b
     assert process_a.verdict != process_b.verdict, (process_a, process_b)
 
     example = WorkedExample(

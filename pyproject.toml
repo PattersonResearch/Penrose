@@ -11,7 +11,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "penrose"
-version = "0.3.0"
+version = "0.4.1"
 description = "Falsification-first research pipeline: ingest trading-strategy papers, test their claims under a robustness stack (deflated Sharpe, 3-fold, locked holdout, fee curve), and emit trustworthy verdicts."
 readme = "README.md"
 requires-python = ">=3.9"

@@ -12,15 +12,20 @@ others can adopt, audit, and extend, plus a growing, shared **corpus of invalida
 new claim cheaper to judge than the last. Penrose is the referee layer; it does not generate alpha and
 makes no profitability claims, and that will not change.
 
-## Where v0.3.0 stands
+## Where v0.4.0 stands
 
-The falsification pipeline, the power-aware verdict taxonomy, the self-calibration battery, the
-discovery/confirmation firewall with a single-use locked holdout, the corpus (now with contrastive
-principles), an opt-in tail-risk gate, an input-side data-granularity check, an agent-readable
-principle surface, and Pennie (the corpus-grounded chat assistant) all ship and run today. Costs and
-capacity are still modeled rather than measured, several data domains lack production adapters, and
-independent replication is not yet automated. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md)
-for the full status.
+The falsification pipeline, the power-aware verdict taxonomy (now tested against a frozen
+realistic-edge floor and enforced by a Monte-Carlo control), the anti-mining deflation and
+post-sample caps, the self-calibration battery, the discovery/confirmation firewall with a single-use
+locked holdout, the corpus with recurrence and contrastive principles, an opt-in tail-risk gate, an
+input-side data-granularity check, honest `engine_error` routing, an edge-free offline fallback, an
+agent-readable principle surface with an opt-in human-gated management MCP, and Pennie (the
+corpus-grounded chat assistant) all ship and run today. Two failure modes that a fresh audit surfaced,
+false-killing true marginal edges and passing best-of-K mined noise, are now closed and guarded as CI
+controls at the frozen floor. Costs and capacity are still modeled rather than measured, several data
+domains lack production adapters, independent replication is not yet automated, and the generative
+layer (dream, synthesize, distill) is frozen behind a default-off flag pending a corpus re-score under
+the new taxonomy. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full status.
 
 ## Directions we are pursuing
 
@@ -36,15 +41,20 @@ for the full status.
   discovery.
 - **Measured costs and capacity.** Replacing modeled fee/impact curves with paper-traded or observed
   fills, so survivors can be certified without the `watch` cap that modeled costs currently impose.
-- **Sequential and power-aware evaluation.** Turning the `underpowered` verdict from a label into a
-  decision: how much more data or cross-sectional breadth would resolve a marginal edge, drawing on the
-  optimal-stopping literature (see references [8] and [9] in the README).
+- **Sequential and power-aware evaluation.** The `underpowered` verdict is now a calibrated decision
+  rather than a label: a marginal edge the data cannot resolve is separated from a structurally dead
+  one, the power question is posed against a frozen realistic-edge floor rather than the observed
+  in-sample estimate (using the upward-biased in-sample estimate was circular), and the false-kill and
+  mined-noise-pass rates are enforced by a Monte-Carlo control. What remains is turning the resolution
+  guidance (how much more data or cross-sectional breadth would resolve a marginal edge) into a full
+  sequential design, drawing on the optimal-stopping literature (see references [8] and [9] in the
+  README).
 - **Agent-first operation.** The most powerful way to drive Penrose is to point an agent at it: ingest a
   paper or repo, reconstruct claims, register an honest cohort, run the grid, and read what survives, at
-  a scale a human clicking a UI cannot match. The read-only MCP server ships today; the direction is to
-  add **human-gated management and run tools** to it (register a cohort, run a claim, fetch a verdict) so
-  an agent can operate the referee end to end, while never crossing the P9 authorization gate, the
-  orchestrator still cannot write the approved corpus, only a human can. In that model the **dashboard
+  a scale a human clicking a UI cannot match. The read-only MCP server and an opt-in, human-gated
+  **management surface** (register a cohort, run a claim, fetch a verdict) both ship today, so an agent
+  can operate the referee end to end while never crossing the P9 authorization gate: the orchestrator
+  still cannot write the approved corpus, only a human can. In that model the **dashboard
   becomes mostly an overview and authorization surface** rather than the primary control panel; Pennie is
   wired to the MCP so you can manage and run the pipeline directly from the dashboard; and running Penrose
   inside a proper external agent harness is a first-class, recommended path alongside it. The tool surface

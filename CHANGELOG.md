@@ -3,6 +3,94 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.4.1] — 2026-07-04
+
+Building on 0.4.0 (an internal-only milestone, documented below), this is the first public release
+since 0.3.0. It is a correctness fix cycle: it hardens the append-only decisions log against a
+data-loss path, makes a silent empty run a loud error, and adds a first-class claim type for claims
+that supply their own statistics. Green bar: eval 97/97, pytest 267 passed.
+
+### Added
+- **First-class claim type for provided-series statistics.** A claim that supplies its own return or
+  statistic series is now routed distinctly, checked before the descriptive and trading tally, so its
+  verdict reflects what it actually asserts instead of being coerced into a descriptive or trading path.
+
+### Fixed
+- **Non-destructive, append-only supersession of decisions.** A re-run that superseded prior rows could
+  truncate and rewrite the append-only `decisions.jsonl`, risking loss of earlier decisions when the new
+  run then wrote nothing. Supersession is now strictly append-only (old rows are marked superseded, never
+  deleted), and the recovery utility (`scripts/restore_decisions.py`) re-appends recovered rows under the
+  engine's exclusive lock so it cannot interleave with a live run.
+- **Loud failure on an empty run.** A run that extracts zero claims, or writes zero decisions, now routes
+  to `engine_error` (a visible failure that needs attention) rather than completing silently. A silent
+  empty run is treated as an engine fault, not a success.
+
+## [0.4.0] — 2026-07-03 (internal-only; never published, superseded by 0.4.1)
+
+A verdict-calibration release: the referee is now honest in both directions, and it enforces that
+honesty as a permanent control. Monte-Carlo evidence (surfaced by refereeing an external code-complete
+framework and an adversarial review, then two rounds of swarm audit) showed the prior taxonomy inverted
+at realistic effect sizes: it hard-killed true marginal edges as structurally dead while letting
+best-of-K mined noise reach a survivor verdict. This release fixes both, adds honest error routing and
+an edge-free offline fallback, and freezes the generative layer pending a corpus re-score. Every item
+was adversarially swarm-audited, and the two calibration failure modes are now CI controls.
+
+### Added
+- **Enforcing power/mining calibration.** A Monte-Carlo control (`scripts/calibration_power_mining.py`)
+  now gates both failure modes on every run: a true marginal edge (per-trade IC 0.05) must not
+  structurally kill above 20 percent of seeds, and best-of-K mined noise submitted as a single claim
+  must never reach a survivor verdict. Measured at the frozen realistic-edge floor, false-kill is
+  10 percent and mined-noise-to-survivor is 0 percent. The config floor is frozen, so a breach means
+  fix the gate, not the floor.
+- **First-in-family deflation.** An external single claim is now deflated against a conservative
+  Harvey-Liu-style effective-trials floor plus a variance prior, and paper-path multiple-testing
+  families are canonicalized by domain, so a novel self-declared strategy class can no longer reset the
+  deflation denominator. Best-of-500 mined noise routes to `underpowered`, not `watch`.
+- **Post-sample survivor cap.** An external claim that declares its own evaluation window is capped at
+  `watch` unless the bundle extends past that window, so a claim re-scored on its own mined sample
+  cannot be certified.
+- **`engine_error` routing state.** An internal engine or sandbox failure routes to a review queue as
+  `engine_error` instead of masquerading as a data blocker; engine bugs no longer write phantom entries
+  to the data shopping list, and a genuine `data_unavailable` reason is matched by prefix so an exception
+  whose text merely contains those words is not misrouted.
+- **BYO Tiingo IEX intraday adapter** for price-only OHLC bars, with explicit single-venue tagging when
+  callers opt into IEX volume and no `DEFAULT_SERIES` wiring.
+- **Cross-sectional reconstruction primitives:** provenance-carrying `Panel`, point-in-time `xsection`
+  transforms, liquidity screens, and factor formation helpers, with no new dependencies.
+- **Keyless SEC EDGAR fundamentals adapter** for point-in-time company filings, with disk caching and an
+  optional `SEC_EDGAR_UA` contact override.
+- **Opt-in MCP management surface** (`penrose-mcp --management` / `PENROSE_MCP_MANAGEMENT=1`) with guarded
+  verdict fetch, deflation cohort registration, and claim/paper runs that return proposals only; the hard
+  invariant holds that MCP cannot cross P9, write approved knowledge, bypass the Docker sandbox, or touch
+  the holdout outside the guarded pipeline.
+
+### Changed
+- **Power-aware verdict taxonomy tested against a frozen floor.** The 3-fold consistency gate now asks
+  whether the data could resolve a realistic edge (per-trade IC 0.05, the declared config floor), not
+  whether it resolved the observed in-sample estimate. Using the upward-biased in-sample Sharpe as the
+  power reference was circular and hard-killed true marginal edges that failed the consistency test by
+  chance; a genuinely underpowered result is now labeled `underpowered` rather than a false `kill`. On a
+  true annualized-0.8-Sharpe edge the structural false-kill rate falls from roughly 55 percent to
+  roughly 10 percent (Monte-Carlo verified). The regime-fragility kill now requires a permutation-null
+  confirmation before it fires, and the mislabeled `negative_dsr` reason is renamed `low_edge_t` and
+  treated as an ambiguous, power-reclassifiable null.
+- **Generative layer frozen by default.** dream, synthesize, and principle distillation are gated behind
+  `PENROSE_GENERATIVE_LAYER` (default off) until the decision corpus is re-scored under the new taxonomy;
+  the read-only surfaces and per-run record-keeping are unaffected.
+
+### Fixed
+- **Edge-free offline fallback.** The synthetic fallback used when a real catalog series is unavailable
+  no longer contains a planted predictive signal (any edge found on it was a bug), and substitution warns
+  loudly so a degraded run is visible.
+- **Holdout no longer leaks its statistics.** The single-use holdout lock stores a digest and burn
+  timestamp, not the burned Sharpe, so a later reader of the decisions log cannot recover the held-out
+  result.
+- **Monotonic trial ledger.** A re-registration can no longer shrink a strategy's declared search
+  denominator or overwrite an already-scored row.
+- **Fee gate uses the claimed edge.** The P4 fee-curve gate reads the claim's stated expected edge
+  instead of a hardcoded constant, so it can actually fire, and records "not evaluated" when no numeric
+  edge is stated.
+
 ## [0.3.0] — 2026-06-27
 
 A robustness, agent-surface, and data release. Post-0.2.0 work, much of it surfaced by a fresh-clone

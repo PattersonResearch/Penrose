@@ -31,6 +31,10 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+# PEN-17: generative layer master switch. OFF by default until the M1 verdict recalibration
+# lands and the decision corpus is re-scored. Enable explicitly: PENROSE_GENERATIVE_LAYER=1
+GENERATIVE_LAYER_ENABLED = os.environ.get("PENROSE_GENERATIVE_LAYER", "0").lower() in (
+    "1", "true", "yes")
 BRAIN_HOME = ROOT / ".brain"
 BRAINSTORE_DB = ROOT / ".brainstore" / "atoms.db"
 ARCHIVES = ROOT / "archives"
@@ -196,12 +200,36 @@ HOLDOUT_CONFIRM_PSR = DSR_DECISION["kill_below_psr"]
 # relabeled `underpowered`, not `kill`. Structural kills (look-ahead, regime-fragile, no
 # signal-alignment, walk-forward drift) are power-INDEPENDENT and stand.
 POWER = {"realistic_ic_floor": 0.05,   # the effect size we want to be able to resolve (real daily IC 0.02-0.05)
-         "z_certify": 1.645}           # one-sided 95% — the band a verdict must clear to certify
+         "z_certify": 1.645,           # one-sided 95% — the band a verdict must clear to certify
+         # PEN-01: the all-signs-positive 3-fold test is only a STRUCTURAL kill when it had
+         # adequate power against a realistic edge. Below this power, a failed 3-fold is an
+         # ambiguous null (-> underpowered), unless a fold is SIGNIFICANTLY negative.
+         "three_fold_min_power": 0.60,
+         "structural_fold_t": -1.0}
+
+# PEN-05: external claims must demonstrate post-sample evidence before a survivor verdict is
+# trusted. If the bundle does not extend at least `min_post_years` beyond the claim's own
+# sample_period end (or the claim did not declare one), a would-be survivor is capped at watch.
+POST_SAMPLE = {"enabled": True, "min_post_years": 1.0}
+
+# PEN-06: Harvey-Liu-style effective-trials prior. An external claimant's search is invisible;
+# assume a conservative prior search size rather than n=1. sr_var_prior is the assumed
+# cross-trial variance of PER-TRADE Sharpe (units match per_trade_sharpe in the ledger);
+# it is blended with the empirical variance until >= min_scored trials exist.
+DEFLATION_PRIOR = {
+    "external_min_trials": 10,
+    "generated_min_trials": 1,
+    "sr_var_prior": 0.01,
+    "min_scored_for_empirical_var": 3,
+}
 
 # Empirical robustness layer (Monte-Carlo + walk-forward). Analytic DSR/PSR are
 # asymptotic; these add small-sample / fat-tail honesty (see pipeline/robustness.py).
 BOOTSTRAP = {"n_boot": 2000, "ci": 0.90, "block": None, "seed": 0}
 PERMUTATION = {"n_perm": 2000, "seed": 0}
+# PEN-02: regime fragility must be statistically distinguishable from noise-selection.
+# The drop-the-best statistic is compared against a permutation null (bucket labels shuffled).
+REGIME_FRAGILITY = {"n_perm": 500, "p_kill": 0.05, "seed": 0}
 WALK_FORWARD = {"n_windows": 4, "scheme": "anchored", "is_min": 0.30}
 CPCV = {"n_groups": 8, "k_test": 2, "embargo_frac": 0.01,
         "max_combos": 200, "seed": 0,

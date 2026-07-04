@@ -90,6 +90,7 @@ class DataBundle:
     """Everything one module run needs, each piece carrying its provenance."""
     series: dict = field(default_factory=dict)        # name -> Series | Unavailable
     requested_window: tuple = ("", "")
+    fallback_substitutions: list[str] = field(default_factory=list)
 
     def get(self, name: str):
         """Resolve a series by name, tolerating naming drift from auto-generated modules.

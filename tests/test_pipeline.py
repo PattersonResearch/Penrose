@@ -55,6 +55,21 @@ def test_pipeline_runs_and_proposes_only():
     print(f"ok: pipeline ran source {out['source_id']}; all proposals pending human commit")
 
 
+def test_missing_series_drops_phantom_tokens():
+    """needs_data must log real series only — never prose/status tokens an auto-impl emits.
+
+    Regression for the live case where a run logged missing_series ['cannot_operationalize',
+    'the']: bare prose / status markers must be dropped, real (even uncatalogued) series kept.
+    """
+    from penrose.pipeline.run import _parse_missing_series as f
+    assert f("data_unavailable: crsp_daily_stock_returns") == ["crsp_daily_stock_returns"]
+    assert f("data_unavailable: crsp_dlyret, the") == ["crsp_dlyret"]   # drop the article
+    assert f("data_unavailable: us_breakeven_10y; long") == ["us_breakeven_10y"]  # drop 'long'
+    # all-phantom reasons fall back to a single 'unspecified', never prose
+    assert f("data_unavailable: cannot_operationalize, the") == ["unspecified"]
+    assert f("data_unavailable: the realized loser returns") == ["unspecified"]
+
+
 def test_holdout_is_single_use():
     from penrose.pipeline import p7_backtest as p7
     import pandas as pd, numpy as np

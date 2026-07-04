@@ -223,6 +223,8 @@ def test_llm_synthesizer_grounds_in_planted_principle(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CORPUS_GRAPH", tmp_path / "corpus_graph.jsonl")
     monkeypatch.setattr(config, "SYNTHESIS_ARCHIVES", tmp_path / "syntheses")
     monkeypatch.setattr(config, "SYNTHESIS_RUNS", tmp_path / "synthesis_runs.jsonl")
+    # PEN-17: this test intentionally exercises the end-to-end synthesis entry point.
+    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
     monkeypatch.setattr(config, "CONFIRMATION_RESERVE", {
         "reserve_id": "hypothesis-recovery-reserve",
         "epochs": [{

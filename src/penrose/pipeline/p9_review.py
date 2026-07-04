@@ -40,6 +40,9 @@ def cmd_list(_args) -> None:
         if r["type"] == "decision":
             print(f"  [{i}] decision  {r['verdict'].upper():18s} {r['claim_id']}  "
                   f"(kill_reason={r.get('kill_reason')})")
+        elif r["type"] == "engine_error":
+            print(f"  [{i}] ENGINE ERROR {r.get('claim_id')}  "
+                  f"{str(r.get('rationale', ''))[:60]}")
         else:
             print(f"  [{i}] principle {r.get('principle_id')}  N={r.get('n_observations')}")
 
@@ -54,6 +57,8 @@ def cmd_approve(args) -> None:
         raise SystemExit("refuse: --approver required (this is the human commit gate)")
     rows = _load_queue()
     r = rows[args.idx]
+    if r["type"] == "engine_error":
+        raise SystemExit("refuse: engine errors are fixed in code, not approved")
     pc = PromotionClient(approved_by=args.approver)
 
     if r["type"] == "decision":

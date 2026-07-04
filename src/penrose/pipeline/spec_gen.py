@@ -154,7 +154,12 @@ def generate_spec(claim: Claim, source: IngestedSource,
     out_path = specs_dir / f"{claim.claim_id}.yaml"
 
     claim_type = classify_claim_type(claim)
-    if not use_llm:
+    if claim_type == "provided_series_statistic":
+        # 6g: a mechanical translation, not a creative one -- never touches the LLM, so it
+        # can neither invent gates (over-specification, EXP-1) nor fall back to an empty
+        # stub (under-specification, EXP-1b). See _provided_series_stat_spec.
+        spec = _provided_series_stat_spec(claim, source)
+    elif not use_llm:
         spec = _stub_spec(claim, source)
     else:
         try:
@@ -225,6 +230,84 @@ def _llm_spec(claim: Claim, source: IngestedSource, *, claim_type: str | None = 
     parsed["status"] = "spec-only"
     parsed["source"] = source.source_id
     return parsed
+
+
+def _declared_series_from_text(claim: Claim) -> list[str]:
+    """Deterministically pull any catalog series names that literally appear in the
+    claim's own text (statement/mechanism/source_span/claimed_metric_quote). No
+    invention, no LLM: a name is included only if it is BOTH a real catalog series AND
+    already named by the claim -- the same discipline as the #5a catalog-vocabulary
+    guard, applied without a model in the loop. Fail-open to [] on any catalog error."""
+    try:
+        catalog = load_catalog_loader(config.DATA_DIR)
+        names = list(catalog.available()) if hasattr(catalog, "available") else []
+    except Exception:  # noqa: BLE001
+        names = []
+    text = " ".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+    ])
+    return sorted({n for n in names if n and n in text})
+
+
+def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic (non-LLM) ModuleSpec for a `provided_series_statistic` claim (6g):
+    "test the statistic of a provided/pre-computed series." This claim class needs no
+    creative translation -- pool the claim's own declared series and apply exactly the
+    claim's own stated decision rule. Building it as a template rather than an LLM
+    generation is what makes both failure modes structurally impossible: there is no
+    generation step to invent a p<=0.05 gate, a data-quality kill, or a menu of deflation
+    methods (over-specification, EXP-1), and no generation step to fall back to an empty
+    stub (under-specification, EXP-1b).
+    """
+    inputs = _declared_series_from_text(claim)
+    decision_rule = (claim.claimed_metric_quote or claim.statement or "").strip()
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": claim.applicable_strategy_class or "unspecified",
+        "claim_type": "provided_series_statistic",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic one-sample test on the claim's own declared/provided series: pool "
+            "ALL declared series into one sample (no re-grouping, no sub-bucketing), compute "
+            "the sample mean and its one-sample test/CI, and apply EXACTLY the claim's stated "
+            "decision rule. No positions, no PnL simulation, no significance threshold, no "
+            "data-quality kill, and no additional deflation method beyond what the claim itself "
+            "declares."
+        ),
+        "inputs": inputs,
+        "statistic_logic": (
+            "one_sample_mean_test: pool the declared series into one sample; compute the mean, "
+            "its standard error, and a one-sample test against the claim's own stated decision "
+            "rule. If the claim declares a single cohort/deflation family, use exactly that one "
+            "method; never offer a menu of methods, and never add a significance threshold or "
+            "minimum-observation/data-quality kill the claim did not state."
+        ),
+        "signal_logic": "provided_series_statistic: compute the statistic directly; no positions/PnL.",
+        "kill_criterion": (
+            f"the claim's own stated decision rule is not met: {decision_rule}"[:400]
+            if decision_rule else
+            "the claim's own stated decision rule is not met (see claim_statement)"
+        ),
+        "expected_data_needs": "as declared by the claim; no additional window/frequency invented",
+        "unknowns": (
+            [] if inputs else
+            ["no catalog series literally matched the claim text; operator must confirm the "
+             "series names before implementing"]
+        ),
+        "implementation_notes": (
+            "Deterministically generated (no LLM) for a provided-series-statistics claim: this "
+            "claim type is a mechanical translation, not a creative one -- do not add gates."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
 
 
 def _stub_spec(claim: Claim, source: IngestedSource) -> dict:
