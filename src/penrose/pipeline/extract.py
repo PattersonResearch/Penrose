@@ -26,7 +26,7 @@ P2_SYSTEM = (
     "quote the exact sentence(s) it came from (the source_span). If you cannot "
     "quote the sentence, do not emit the claim. Never invent metrics or numbers; "
     "if the paper states a metric, copy it verbatim into claimed_metric_quote. "
-    "Respond strictly in JSON."
+    "Respond strictly in JSON only: no markdown fences, no analysis, no prose."
 )
 
 P2_USER_TMPL = """Paper: {title}
@@ -51,6 +51,11 @@ Paper text (truncated):
 ---
 """
 
+P2_RETRY_FRAMING = (
+    "\n\nRETRY INSTRUCTION: this document contains research/trading claims; extract them. "
+    "It is not an administrative, audit, supersession, or status document. Return JSON only."
+)
+
 # Defensive: cap source-text size to avoid blowing context. Most of the value is
 # in abstract + intro + findings anyway. The deep_reader role handles full text.
 MAX_CHARS_PER_PAPER = 24_000
@@ -61,18 +66,73 @@ def _norm_ws(s: str) -> str:
     return " ".join((s or "").split())
 
 
+_SPAN_FOLD = str.maketrans({
+    "\u2013": "-",   # en dash
+    "\u2014": "-",   # em dash
+    "\u2212": "-",   # minus sign
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u2026": "...",
+    "\u2192": "->",
+    "\u21d2": "->",
+    "\u27f6": "->",
+    "\u00a0": " ",
+    "\u2007": " ",
+    "\u2009": " ",
+    "\u200a": " ",
+    "\u202f": " ",
+})
+
+
+def _canonical_span_text(s: str) -> str:
+    """Canonicalize formatting-only span differences without changing words."""
+    folded = (s or "").translate(_SPAN_FOLD)
+    folded = folded.replace("**", "").replace("__", "").replace("`", "").replace("*", "")
+    return _norm_ws(folded)
+
+
+_SPAN_FRAGMENT_SPLIT_RE = re.compile(
+    r"(?<=[.!?])\s+|[\r\n]+\s*(?:[-*•]\s+|\d+[.)]\s+)?|\s+(?=(?:[-*•]|\d+[.)])\s+)"
+)
+_MIN_SUBSPAN_WORDS = 5
+_MIN_SUBSPAN_CHARS = 25
+
+
+def _substantive_span_fragments(span: str) -> list[str]:
+    fragments = []
+    for fragment in _SPAN_FRAGMENT_SPLIT_RE.split(span or ""):
+        fragment_n = _canonical_span_text(fragment.strip())
+        if not fragment_n:
+            continue
+        word_count = len(re.findall(r"\w+", fragment_n))
+        if word_count >= _MIN_SUBSPAN_WORDS or len(fragment_n) >= _MIN_SUBSPAN_CHARS:
+            fragments.append(fragment_n)
+    return fragments
+
+
 def span_in_text(span: str, text: str) -> bool:
     """Verbatim-span guarantee: does `span` actually occur in `text`?
 
-    Robust to minor whitespace differences: both sides are whitespace-normalized
-    before the substring check. An empty span never matches. This is what stops a
-    hallucinated / injected / scanned-PDF claim from passing the gate with a
-    fabricated source_span that isn't really in the paper.
+    Robust to formatting-only differences: both sides fold common Unicode
+    punctuation to ASCII, strip markdown emphasis/code markers, and then
+    whitespace-normalize before the substring check. This prevents false
+    zero-extraction on markdown/unicode sources where the model quotes rendered
+    prose, while preserving the anti-hallucination guarantee: invented words or
+    numbers still cannot align. An empty span never matches.
     """
-    span_n = _norm_ws(span)
+    span_n = _canonical_span_text(span)
     if not span_n:
         return False
-    return span_n in _norm_ws(text)
+    text_n = _canonical_span_text(text)
+    if span_n in text_n:
+        return True
+
+    fragments = _substantive_span_fragments(span)
+    if not fragments:
+        return False
+    return all(fragment in text_n for fragment in fragments)
 
 
 def _expected_edge_or_none(value) -> float | None:
@@ -85,32 +145,7 @@ def _expected_edge_or_none(value) -> float | None:
     return edge if math.isfinite(edge) and edge >= 0 else None
 
 
-def extract_claims(source, known_classes: dict | None = None) -> tuple[list[Claim], dict]:
-    """Run the P2 LLM role over an IngestedSource; return claims + provenance.
-
-    known_classes ({class_name: description}) are the strategy classes that already have
-    a module. The LLM is told to REUSE an existing class name verbatim when a claim
-    genuinely fits it (so P6 routes it to that module and it backtests), else propose a
-    new one. This is what lets the LLM path produce real backtests, not just specs.
-    """
-    body = source.text[:MAX_CHARS_PER_PAPER]
-    vocab = ""
-    if known_classes:
-        lines = "\n".join(f'- "{k}": {v}' for k, v in known_classes.items())
-        vocab = ("\nEXISTING strategy classes (a module already implements each). If a claim "
-                 "CLEARLY fits one, set applicable_strategy_class to its EXACT name (verbatim) "
-                 "so it routes to that module and gets backtested. Otherwise propose a new "
-                 "concise class.\n" + lines + "\n")
-    user = P2_USER_TMPL.format(title=source.title, source_id=source.source_id,
-                               body=body, vocab=vocab)
-    parsed, resp = llm.call_json(
-        "claim_extractor",
-        [{"role": "system", "content": P2_SYSTEM},
-         {"role": "user",   "content": user}],
-        temperature=0.1,
-        timeout=240,   # P2 over a full paper with a thinking model legitimately runs long
-    )
-
+def _claims_from_parsed(source, parsed) -> tuple[list[Claim], int]:
     raw = parsed.get("claims", []) if isinstance(parsed, dict) else []
     claims: list[Claim] = []
     for i, c in enumerate(raw):
@@ -160,13 +195,61 @@ def extract_claims(source, known_classes: dict | None = None) -> tuple[list[Clai
                 expected_edge=_expected_edge_or_none(c.get("expected_edge")),
             )
         claims.append(claim)
+    return claims, len(raw)
+
+
+def extract_claims(source, known_classes: dict | None = None,
+                   *, retry_on_zero: bool = True) -> tuple[list[Claim], dict]:
+    """Run the P2 LLM role over an IngestedSource; return claims + provenance.
+
+    known_classes ({class_name: description}) are the strategy classes that already have
+    a module. The LLM is told to REUSE an existing class name verbatim when a claim
+    genuinely fits it (so P6 routes it to that module and it backtests), else propose a
+    new one. This is what lets the LLM path produce real backtests, not just specs.
+    """
+    body = source.text[:MAX_CHARS_PER_PAPER]
+    vocab = ""
+    if known_classes:
+        lines = "\n".join(f'- "{k}": {v}' for k, v in known_classes.items())
+        vocab = ("\nEXISTING strategy classes (a module already implements each). If a claim "
+                 "CLEARLY fits one, set applicable_strategy_class to its EXACT name (verbatim) "
+                 "so it routes to that module and gets backtested. Otherwise propose a new "
+                 "concise class.\n" + lines + "\n")
+    user = P2_USER_TMPL.format(title=source.title, source_id=source.source_id,
+                               body=body, vocab=vocab)
+    attempts = []
+    claims = []
+    raw_count = 0
+    resp = None
+    for attempt in (1, 2):
+        retry = attempt == 2
+        parsed, resp = llm.call_json(
+            "claim_extractor",
+            [{"role": "system", "content": P2_SYSTEM},
+             {"role": "user", "content": user + (P2_RETRY_FRAMING if retry else "")}],
+            temperature=0.1,
+            timeout=240,   # P2 over a full paper with a thinking model legitimately runs long
+        )
+        claims, raw_count = _claims_from_parsed(source, parsed)
+        attempts.append({
+            "attempt": attempt,
+            "retry": retry,
+            "resolved_model": resp.model,
+            "finish_reason": resp.finish_reason,
+            "n_raw_claims": raw_count,
+            "n_extracted": len(claims),
+        })
+        if claims or not retry_on_zero or len(source.text) < 80:
+            break
 
     prov = {
-        "role": "claim_extractor", "model": resp.model, "in_tokens": resp.in_tokens,
+        "role": "claim_extractor", "model": resp.model, "resolved_model": resp.model,
+        "in_tokens": resp.in_tokens,
         "out_tokens": resp.out_tokens, "cost_usd": round(resp.cost_usd, 5),
         "cached": resp.cached, "n_extracted": len(claims),
-        "n_rejected_no_span": len(raw) - len(claims),
+        "n_rejected_no_span": raw_count - len(claims),
         "input_chars": len(body), "truncated": len(source.text) > len(body),
+        "attempts": attempts, "retry_on_zero": len(attempts) > 1,
     }
     return claims, prov
 

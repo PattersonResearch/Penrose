@@ -51,7 +51,8 @@ def _claim_holdout_lock(name: str) -> Path:
 def _trial_stats(family: str | None = None, strategy: str | None = None,
                  registered_trials: int | None = None, *,
                  generation_source: str = "paper",
-                 search_cohort_id: str | None = None) -> tuple[int, float]:
+                 search_cohort_id: str | None = None,
+                 preregistered_single_cohort: bool = False) -> tuple[int, float]:
     """n_trials + cross-trial Sharpe variance for DSR deflation.
 
     C1: trials are scoped to the FAMILY (strategy_class + data_domain), so testing 500 crypto
@@ -59,10 +60,13 @@ def _trial_stats(family: str | None = None, strategy: str | None = None,
     not a run (dedup), and the CURRENT strategy is counted exactly once (B-016: no +1 double
     count on a re-run)."""
     prior = getattr(config, "DEFLATION_PRIOR", {})
-    floor = int(prior.get(
-        "external_min_trials" if generation_source == "paper" else "generated_min_trials",
-        1,
-    ))
+    if generation_source == "provided_series_statistic" and preregistered_single_cohort:
+        floor = 1
+    else:
+        floor = int(prior.get(
+            "generated_min_trials" if generation_source == "generated" else "external_min_trials",
+            1,
+        ))
     sr_var_prior = float(prior.get("sr_var_prior", 0.0))
     min_scored = int(prior.get("min_scored_for_empirical_var", 0))
 
@@ -275,6 +279,13 @@ def _turnover_from_position(pos: pd.Series) -> pd.Series:
     return p.diff().abs().fillna(p.abs())
 
 
+def _align_to_index(series: pd.Series, index: pd.Index) -> pd.Series:
+    """Align a contract series while preserving duplicate timestamps when already aligned."""
+    if isinstance(series, pd.Series) and series.index.equals(index):
+        return series
+    return series.reindex(index)
+
+
 def _cost_sensitivity(net: pd.Series, positions: pd.Series, bars_per_year: float,
                       configured_cost_frac: float | None, n_trials: int, sr_var: float,
                       *, payoff: pd.Series | None = None,
@@ -291,14 +302,14 @@ def _cost_sensitivity(net: pd.Series, positions: pd.Series, bars_per_year: float
     try:
         base_idx = net.index
         if payoff is not None and position_signed is not None:
-            pay = payoff.reindex(base_idx).astype(float)
-            signed = position_signed.reindex(base_idx).fillna(0.0).astype(float)
+            pay = _align_to_index(payoff, base_idx).astype(float)
+            signed = _align_to_index(position_signed, base_idx).fillna(0.0).astype(float)
             turn = _turnover_from_position(signed)
 
             def at_cost(c: float) -> pd.Series:
                 return signed * pay - turn * c
         else:
-            pos = positions.reindex(base_idx).fillna(0.0).astype(float)
+            pos = _align_to_index(positions, base_idx).fillna(0.0).astype(float)
             turn = _turnover_from_position(pos)
 
             def at_cost(c: float) -> pd.Series:
@@ -347,6 +358,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
                  generation_source: str = "paper",
                  search_cohort_id: str | None = None,
                  search_denominator: int | None = None,
+                 preregistered_single_cohort: bool = False,
                  regime_schemes: dict | None = None,
                  declared_regime: dict | None = None) -> dict:
     """Score a strategy's per-trade net returns under full S4 discipline, plus the
@@ -383,13 +395,19 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     n_trials, sr_var = _trial_stats(
         family, name, registered_trials=search_denominator,
         generation_source=generation_source,
-        search_cohort_id=search_cohort_id)  # current + registered search
+        search_cohort_id=search_cohort_id,
+        preregistered_single_cohort=preregistered_single_cohort)  # current + registered search
     # Regime kill-lens (Punisher) on the NON-HOLDOUT window. Calendar buckets always; the
     # pre-registered point-in-time vol/trend labels (extra_schemes) join when supplied so the
     # lens also catches edges concentrated in one MARKET regime. Each populated partition is an
     # extra "look", so it inflates the DSR trial count before deflation (incl. the vol/trend buckets).
-    regime = R.regime_split(
-        seen, bars_per_year, extra_schemes=regime_schemes, declared=declared_regime)
+    # A provided-series statistic earns the regime-partition break only when the source explicitly
+    # declares a single pre-registered pooled cohort; classifier routing alone is not enough.
+    if generation_source == "provided_series_statistic" and preregistered_single_cohort:
+        regime = {"n_partitions": 0, "fragile": False, "provided_series_statistic": True}
+    else:
+        regime = R.regime_split(
+            seen, bars_per_year, extra_schemes=regime_schemes, declared=declared_regime)
     tail = R.tail_metrics(seen)
     n_trials += int(regime.get("n_partitions", 0))
 
@@ -416,7 +434,12 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
 
     # capacity: reuse harness linear-impact model — on the NON-HOLDOUT window only, so the
     # locked holdout never leaks into capacity / ann_ret either (B-001; A-002 made absolute).
-    pos_df = pd.DataFrame({"VOL:BTC": positions.reindex(seen.index).fillna(0.0)})
+    if positions.index.equals(net.index):
+        pos_seen = positions.iloc[:len(seen)].copy()
+        pos_seen.index = seen.index
+    else:
+        pos_seen = positions.reindex(seen.index)
+    pos_df = pd.DataFrame({"VOL:BTC": pos_seen.fillna(0.0)})
     ann_ret = float(seen.values.mean()) * bars_per_year
     out["ann_ret"] = round(ann_ret, 4)
     out["capacity_usd"] = H._capacity_usd(pos_df, ann_ret, bars_per_year,

@@ -58,9 +58,8 @@ def _max_drawdown(r: np.ndarray) -> float:
 def tail_metrics(net) -> dict:
     """Left-tail diagnostics for bounded-up / unbounded-down payoff shapes.
 
-    Advisory by default: the verdict gate reads these only when
-    config.TAIL_RISK_GATE["enabled"] is explicitly true. This function is
-    intentionally fail-open and never raises into P7.
+    The verdict gate reads these only when config.TAIL_RISK_GATE["enabled"] is
+    true. This function is intentionally fail-open and never raises into P7.
     """
     out = {
         "skew": None,
@@ -109,12 +108,27 @@ def tail_metrics(net) -> dict:
         skew = float(np.mean(((x - mu) / sd) ** 3))
         out["skew"] = skew
 
-        trg = getattr(config, "TAIL_RISK_GATE", {"max_skew": -0.5, "min_tail_ratio": 3.0})
+        trg = getattr(
+            config,
+            "TAIL_RISK_GATE",
+            {"max_skew": -0.5, "severe_skew": -3.0, "min_tail_ratio": 3.0},
+        )
         tail_ratio = out["tail_ratio"]
+        severe_skew = float(trg.get("severe_skew", -3.0))
+        max_skew = float(trg.get("max_skew", -0.5))
+        min_tail_ratio = float(trg.get("min_tail_ratio", 3.0))
+        severe_min_n = int(trg.get("severe_min_n", 40))
+        # J-3: the severe-skew arm flags on skew ALONE (no tail_ratio corroboration), so it needs
+        # an adequate sample -- sample skew is unstable at small n (SE ~ sqrt(6/n) ~ 0.55 at n=20).
+        # Require severe_min_n before trusting a skew-only widow-maker flag; below it, only the
+        # corroborated (skew AND tail_ratio) arm applies.
         out["asymmetric"] = bool(
-            skew <= float(trg.get("max_skew", -0.5))
-            and tail_ratio is not None
-            and tail_ratio >= float(trg.get("min_tail_ratio", 3.0))
+            (skew <= severe_skew and n >= severe_min_n)
+            or (
+                skew <= max_skew
+                and tail_ratio is not None
+                and tail_ratio >= min_tail_ratio
+            )
         )
         return out
     except Exception:  # noqa: BLE001

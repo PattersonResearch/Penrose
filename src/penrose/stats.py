@@ -18,7 +18,28 @@ import math
 
 import numpy as np
 import pandas as pd
-from scipy.stats import norm
+
+try:  # W4/6h + audit D-3: importable on a scipy-less venv; fail clearly at USE.
+    from scipy.stats import norm as _scipy_norm
+except (ModuleNotFoundError, ImportError):  # pragma: no cover — exercised via subprocess test
+    _scipy_norm = None
+
+
+class _NormProxy:
+    """Defers scipy to first use so `import penrose.stats` (and everything that
+    transitively pulls it, e.g. penrose.pipeline.run) imports on a lean venv. Any
+    actual statistical call without scipy raises one clear, actionable message."""
+
+    def __getattr__(self, attr: str):
+        if _scipy_norm is None:
+            raise RuntimeError(
+                "pip install scipy required for Sharpe/DSR statistics "
+                f"(scipy.stats.norm.{attr} was called but scipy is not installed)"
+            )
+        return getattr(_scipy_norm, attr)
+
+
+norm = _NormProxy() if _scipy_norm is None else _scipy_norm
 
 EULER = 0.5772156649
 

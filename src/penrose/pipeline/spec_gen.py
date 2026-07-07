@@ -9,6 +9,7 @@ pipeline continues, and the operator reviews it asynchronously.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -27,11 +28,18 @@ SPEC_SYSTEM = (
     "description of how to test the exact claim. If claim_type is "
     "descriptive_statistical, specify the statistic to compute and its uncertainty; "
     "do NOT translate it into a trading strategy. If claim_type is trading_strategy, "
-    "describe the signal, positions, PnL, DSR / 3-fold / locked-holdout / fee + "
-    "slippage + capacity discipline. If claim_type is structural_proposition, be "
+    "act as a translator, not a co-author: preserve the claim's signal exactly, do "
+    "not add unclaimed gates or kill conditions, and choose one explicit conventional "
+    "default for any unspecified required parameter. Describe the signal, positions, "
+    "PnL, DSR / 3-fold / locked-holdout / fee + slippage + capacity discipline. If "
+    "claim_type is structural_proposition, be "
     "honest about what cannot be operationalized. Be concrete: specify the inputs "
     "required (use the data contract vocabulary), the kill criterion, and the "
-    "unknowns. The operator (or an agent swarm) will implement your spec; vagueness "
+    "unknowns. If a claim requires data that is not in the available data vocabulary, "
+    "declare the true required input using a clear catalog-style series name and list "
+    "it in unknowns as unavailable; never fabricate, synthesize, derive, or proxy a "
+    "missing input from other series to make the spec runnable. The operator (or an "
+    "agent swarm) will implement your spec; vagueness "
     "costs them time. Respond strictly in JSON."
 )
 
@@ -46,6 +54,23 @@ claim_type: {claim_type}
 
 source_span (verbatim from paper): "{source_span}"
 claimed_metric: "{claimed_metric}"
+
+Translator-not-co-author constraints for trading_strategy claims:
+- Do NOT add any significance test, data-quality filter, minimum-observation gate, or
+  rejection/kill condition that the claim itself does not state. Required cost/fee
+  modeling is fine; invented pass/fail gates are not.
+- Preserve the claim's exact signal definition. If the claim states an absolute
+  directional rule, do not convert it to a cross-sectional, relative-value, ranked,
+  demeaned, normalized, or otherwise transformed signal unless the claim says to.
+  Likewise, do not convert a relative/ranked claim into an absolute directional rule.
+- For any required parameter the claim leaves unspecified (lookback, exit rule, sign
+  convention, venue), commit to one conventional default and state it explicitly. Never
+  emit a menu of alternatives in one field, and never leave a required field unresolved.
+- Data fidelity is part of faithful translation. If the exact input the claim requires is
+  not present in AVAILABLE DATA SERIES, do NOT synthesize, fabricate, derive, blend, or
+  proxy it from other series. Declare the true required input in `inputs` with a clear
+  catalog-style name (for example `bnb_spot_daily`) and include an `unknowns` entry saying
+  that series is unavailable. A faithful-but-data-blocked spec is correct.
 
 Output JSON with this exact shape:
 {{
@@ -122,8 +147,8 @@ Output JSON with this exact shape:
 """
 
 
-def classify_claim_type(claim: Claim) -> str:
-    return fidelity_memory.classify_claim_type(claim)
+def classify_claim_type(claim: Claim, source: IngestedSource | None = None) -> str:
+    return fidelity_memory.classify_claim_type(claim, source)
 
 
 def _catalog_vocab() -> str:
@@ -142,7 +167,8 @@ def _catalog_vocab() -> str:
 
 
 def generate_spec(claim: Claim, source: IngestedSource,
-                  *, use_llm: bool = True) -> dict:
+                  *, use_llm: bool = True,
+                  prior_divergences: list[str] | None = None) -> dict:
     """Generate a ModuleSpec for a claim. Returns the spec dict + writes YAML to disk.
 
     The YAML lands at modules/_specs/<claim_id>.yaml. The operator reviews it
@@ -153,7 +179,7 @@ def generate_spec(claim: Claim, source: IngestedSource,
     specs_dir.mkdir(parents=True, exist_ok=True)
     out_path = specs_dir / f"{claim.claim_id}.yaml"
 
-    claim_type = classify_claim_type(claim)
+    claim_type = classify_claim_type(claim, source)
     if claim_type == "provided_series_statistic":
         # 6g: a mechanical translation, not a creative one -- never touches the LLM, so it
         # can neither invent gates (over-specification, EXP-1) nor fall back to an empty
@@ -163,7 +189,8 @@ def generate_spec(claim: Claim, source: IngestedSource,
         spec = _stub_spec(claim, source)
     else:
         try:
-            spec = _llm_spec(claim, source, claim_type=claim_type)
+            spec = _llm_spec(claim, source, claim_type=claim_type,
+                             prior_divergences=prior_divergences)
         except Exception as e:  # noqa: BLE001
             # never let spec generation failure block the pipeline — fall back to stub
             spec = _stub_spec(claim, source)
@@ -179,7 +206,22 @@ def generate_spec(claim: Claim, source: IngestedSource,
     return spec
 
 
-def _base_prompt(claim: Claim, source: IngestedSource, claim_type: str) -> str:
+def _immediate_correction_guidance(prior_divergences: list[str] | None) -> str:
+    items = [str(d).strip() for d in (prior_divergences or []) if str(d).strip()]
+    if not items:
+        return ""
+    bullets = "\n".join(f"- {item[:500]}" for item in items[:8])
+    return (
+        "YOUR PREVIOUS SPEC FOR THIS CLAIM WAS REJECTED AS UNFAITHFUL for these "
+        "specific reasons:\n"
+        f"{bullets}\n"
+        "Produce a corrected spec that FIXES exactly these, WITHOUT introducing any new "
+        "divergence. Do not over-correct into a different claim.\n"
+    )
+
+
+def _base_prompt(claim: Claim, source: IngestedSource, claim_type: str,
+                 prior_divergences: list[str] | None = None) -> str:
     tmpl = {
         "descriptive_statistical": DESCRIPTIVE_SPEC_USER_TMPL,
         "structural_proposition": STRUCTURAL_SPEC_USER_TMPL,
@@ -198,21 +240,27 @@ def _base_prompt(claim: Claim, source: IngestedSource, claim_type: str) -> str:
         claim.applicable_strategy_class or "unspecified", claim_type)
     if guidance:
         user = guidance + "\n" + user
+    correction = _immediate_correction_guidance(prior_divergences)
+    if correction:
+        user = correction + "\n" + user
     vocab = _catalog_vocab()
     if vocab:
         user = (
-            "AVAILABLE DATA SERIES (use these EXACT names in `inputs` when they fit the claim; "
-            "only invent a new logical name if NOTHING here matches):\n"
+            "AVAILABLE DATA SERIES (use these EXACT names in `inputs` when they fit the claim):\n"
             + vocab + "\n\n" + user
-            + "\n\nPrefer inputs drawn from the AVAILABLE DATA SERIES list when one is provided; "
-            "exact-match the listed names."
+            + "\n\nUse inputs drawn from the AVAILABLE DATA SERIES list when one exactly satisfies "
+            "the claim. If the claim requires an input that is absent from this list, do NOT "
+            "fabricate, synthesize, derive, or proxy it from listed series. Instead, declare the "
+            "true required input in `inputs` using a clear catalog-style name and list it in "
+            "`unknowns` as unavailable."
         )
     return user
 
 
-def _llm_spec(claim: Claim, source: IngestedSource, *, claim_type: str | None = None) -> dict:
+def _llm_spec(claim: Claim, source: IngestedSource, *, claim_type: str | None = None,
+              prior_divergences: list[str] | None = None) -> dict:
     claim_type = claim_type or classify_claim_type(claim)
-    user = _base_prompt(claim, source, claim_type)
+    user = _base_prompt(claim, source, claim_type, prior_divergences=prior_divergences)
     parsed, _ = llm.call_json(
         "module_spec_generator",
         [{"role": "system", "content": SPEC_SYSTEM},
@@ -225,31 +273,92 @@ def _llm_spec(claim: Claim, source: IngestedSource, *, claim_type: str | None = 
     for k in required:
         if k not in parsed:
             parsed[k] = "" if k != "inputs" and k != "unknowns" else []
-    parsed["claim_type"] = parsed.get("claim_type") or claim_type
+    # Audit D-4 (2026-07-05): claim_type is a GATE-SELECTION switch (fidelity override +
+    # variable-coverage skip). It must come ONLY from the deterministic classifier —
+    # never from the LLM's spec JSON, which an over-eager model could set to
+    # provided_series_statistic and loosen two gates at once. Log any disagreement.
+    llm_claim_type = parsed.get("claim_type")
+    if llm_claim_type and llm_claim_type != claim_type:
+        print(f"[penrose] spec LLM proposed claim_type={llm_claim_type!r}; "
+              f"keeping deterministic {claim_type!r}")
+    parsed["claim_type"] = claim_type
     parsed["version"] = 0
     parsed["status"] = "spec-only"
     parsed["source"] = source.source_id
     return parsed
 
 
-def _declared_series_from_text(claim: Claim) -> list[str]:
+_SERIES_DECISION_EXCLUSION_CUES = (
+    "not part of the decision",
+    "reported, not",
+    "for reference",
+    "benchmark",
+    "control series",
+    "control:",
+    "comparison",
+    "compared to",
+    "baseline",
+    "reference series",
+    "context (",
+    "descriptive only",
+    "not a gate",
+    "reported only",
+    "informational",
+    "for context",
+    "as context",
+    "contextual",
+    "as reference",
+    "we also report",
+    "reported alongside",
+    "illustrative",
+)
+
+
+def _series_text_units(text: str) -> list[str]:
+    """Text units for the decision-exclusion scan. Split on BLANK-line paragraph
+    boundaries and JOIN soft-wrapped lines within each paragraph first, so a cue like
+    "Context (reported, not part of the decision):" stays attached to the series names
+    that wrap onto the following physical line(s). Emit each joined paragraph AND its
+    sentences, so a series named in a context paragraph/sentence is correctly excluded."""
+    units: list[str] = []
+    for para in re.split(r"\n\s*\n", text or ""):
+        joined = " ".join(para.split())     # collapse soft wraps + whitespace
+        if not joined:
+            continue
+        units.append(joined)
+        units.extend(s.strip() for s in re.split(r"(?<=[.!?])\s+", joined) if s.strip())
+    return units
+
+
+def _declared_series_from_text(claim: Claim, source: IngestedSource | None = None) -> list[str]:
     """Deterministically pull any catalog series names that literally appear in the
-    claim's own text (statement/mechanism/source_span/claimed_metric_quote). No
-    invention, no LLM: a name is included only if it is BOTH a real catalog series AND
-    already named by the claim -- the same discipline as the #5a catalog-vocabulary
-    guard, applied without a model in the loop. Fail-open to [] on any catalog error."""
+    claim/source text, excluding names that appear only in context/reference units.
+    No invention, no LLM: a name is included only if it is BOTH a real catalog series
+    AND already named by the claim/source -- the same discipline as the #5a
+    catalog-vocabulary guard, applied without a model in the loop. Fail-open to [] on
+    any catalog error."""
     try:
         catalog = load_catalog_loader(config.DATA_DIR)
         names = list(catalog.available()) if hasattr(catalog, "available") else []
     except Exception:  # noqa: BLE001
-        names = []
-    text = " ".join([
+        return []
+    text = "\n".join([
         getattr(claim, "statement", "") or "",
         getattr(claim, "mechanism", "") or "",
         getattr(claim, "source_span", "") or "",
         getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
     ])
-    return sorted({n for n in names if n and n in text})
+    matched = set()
+    for unit in _series_text_units(text):
+        lowered = unit.lower()
+        if any(cue in lowered for cue in _SERIES_DECISION_EXCLUSION_CUES):
+            continue
+        matched.update(
+            n for n in names
+            if n and re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", unit)
+        )
+    return sorted(matched)
 
 
 def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
@@ -262,7 +371,7 @@ def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
     methods (over-specification, EXP-1), and no generation step to fall back to an empty
     stub (under-specification, EXP-1b).
     """
-    inputs = _declared_series_from_text(claim)
+    inputs = _declared_series_from_text(claim, source)
     decision_rule = (claim.claimed_metric_quote or claim.statement or "").strip()
     return {
         "module_id": f"auto_{claim.claim_id}",
@@ -278,17 +387,16 @@ def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
             "Deterministic one-sample test on the claim's own declared/provided series: pool "
             "ALL declared series into one sample (no re-grouping, no sub-bucketing), compute "
             "the sample mean and its one-sample test/CI, and apply EXACTLY the claim's stated "
-            "decision rule. No positions, no PnL simulation, no significance threshold, no "
-            "data-quality kill, and no additional deflation method beyond what the claim itself "
-            "declares."
+            "decision rule. No positions, no PnL simulation, and no extra pass/fail filters "
+            "or deflation method beyond what the claim itself declares."
         ),
         "inputs": inputs,
         "statistic_logic": (
             "one_sample_mean_test: pool the declared series into one sample; compute the mean, "
             "its standard error, and a one-sample test against the claim's own stated decision "
             "rule. If the claim declares a single cohort/deflation family, use exactly that one "
-            "method; never offer a menu of methods, and never add a significance threshold or "
-            "minimum-observation/data-quality kill the claim did not state."
+            "method; never offer a menu of methods, and never add extra pass/fail filters the "
+            "claim did not state."
         ),
         "signal_logic": "provided_series_statistic: compute the statistic directly; no positions/PnL.",
         "kill_criterion": (
@@ -304,7 +412,8 @@ def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
         ),
         "implementation_notes": (
             "Deterministically generated (no LLM) for a provided-series-statistics claim: this "
-            "claim type is a mechanical translation, not a creative one -- do not add gates."
+            "claim type is a mechanical translation, not a creative one -- preserve the stated "
+            "decision rule exactly."
         ),
         "_llm_mode": "deterministic-template",
     }

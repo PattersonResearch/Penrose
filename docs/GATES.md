@@ -189,14 +189,15 @@ instead of penalized for being flat elsewhere. It is adherence-gated: the narrow
 when the strategy actually confines its activity to the declared regime, so nothing trades outside its
 stated scope while still claiming the easier exam.
 
-### 18. Tail-risk / widow-maker (opt-in)
+### 18. Tail-risk / widow-maker (default-on)
 **Catches:** a stable, well-deflated strategy that nonetheless has a bounded upside and an unbounded
 downside, the short-volatility / positive-carry profile that works 95% of the time and then a rare
 event annihilates it. **Dies here:** a fat-left-tail payoff (strongly negative skew, a left tail far
 heavier than the right) even when the average edge is positive and every other gate passes. **Why you
 want it:** the other gates catch overfitting and instability; they do *not* catch a genuinely stable
-edge whose payoff shape is a time bomb. This gate is off by default (so it never silently moves a
-verdict) and reports the tail diagnostics on every run; enable it to kill or cap such payoffs.
+edge whose payoff shape is a time bomb. It is **on by default** in cap-and-warn mode: it caps such a
+payoff at `watch` (it never *certifies* a widow-maker), emits an always-visible `tail_asymmetric`
+warning, and reports the tail diagnostics on every run. A hard kill is opt-in (`cap_only=False`).
 
 ### 19. Data-granularity check (at the input boundary)
 **Catches:** the silent, confident-but-wrong verdict that results from feeding data at the wrong

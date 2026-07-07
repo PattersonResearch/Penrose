@@ -3,6 +3,52 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.4.2] — 2026-07-07
+
+A capability-and-calibration release built around one theme: the referee should adjudicate a claim on
+exactly what the claim asserts, and it should refuse to be fooled by a payoff that looks good on average
+but is catastrophic in the tail. It completes the provided-series claim type introduced in 0.4.1, adds a
+widow-maker gate, and closes several routing and self-correction gaps. Every change was verified through
+an adversarial swarm-audit pass. Green bar: eval 101/101, pytest 340 passed.
+
+### Added
+- **Provided-series statistic path — complete build-out.** A claim that supplies its own pre-computed
+  return/statistic series is now executed by a deterministic (non-LLM) module that pools the declared
+  series and tests the stated statistic — no generated code stands between the claim and its verdict.
+  A deterministic spec builder extracts the *declared decision inputs* from the claim's source text
+  (and excludes context/benchmark/control series that are mentioned but not part of the decision), and a
+  fidelity check judges the module against only the claim's stated contract. Because the construction is
+  supplied rather than reproduced, these verdicts are provenance-capped: a provided series can be killed
+  or held at watch, but never certified `research-supported` until it is reconstructed from primitives.
+- **Tail-risk / widow-maker gate (default on).** The referee now flags bounded-up / unbounded-down
+  (short-vol) payoffs — the canonical "looks great, then blows up" trade — using skew and a downside/upside
+  tail ratio, with a severe-skew arm that fires on extreme skew alone (guarded by a minimum sample size).
+  By default it caps an otherwise-supported survivor at `watch` (it never *certifies* a widow-maker) and
+  always emits a visible `tail_asymmetric` warning, even when the verdict was already below the top tier;
+  operators may opt into a hard kill. For provided-series claims it adds a caveat that a pre-aggregated
+  series understates per-trade and cross-unit tail risk.
+
+### Changed
+- **Bounded self-correction across generation.** Both the spec generator and the implementation generator
+  now self-correct when a fidelity check rejects their output: the specific divergence is fed back and the
+  step retried within a bounded budget, instead of failing the run. This closes the last link in the
+  generate → check → repair loop.
+- **Deflation break decoupled from classification.** The reduced-deflation break for a single
+  pre-registered cohort is now gated on an explicit pre-registration assertion in the claim, not on the
+  (inherently spoofable) claim-type classifier. A data-derived hypothesis that merely *looks* like a
+  provided series therefore receives normal, conservative deflation.
+- **One authoritative claim type.** The resolved claim type is computed once and threaded through routing,
+  fidelity, and deflation, removing an inconsistency in which different stages could classify the same
+  claim differently and reach contradictory verdicts.
+
+### Fixed
+- **Missing data is `needs_data`, not `cannot_replicate`.** A run blocked purely by absent inputs now
+  routes to `needs_data` (an honest, recoverable stop) instead of the stronger `cannot_replicate`.
+- **Verbatim source-span gate tolerates real-world text.** The gate that requires a claim's quoted span to
+  appear verbatim in its source now canonicalizes markdown and unicode punctuation and recovers
+  non-contiguous verbatim spans via a guarded sentence-level fallback — ending a class of false
+  zero-extraction `engine_error`s on otherwise-valid papers.
+
 ## [0.4.1] — 2026-07-04
 
 Building on 0.4.0 (an internal-only milestone, documented below), this is the first public release

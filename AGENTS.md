@@ -14,11 +14,32 @@ strategy is profitable**. DSR deflation scales with the search Penrose has actua
 a conservative effective-trials prior for external claims (config.DEFLATION_PRIOR). See
 [docs/GATES.md](docs/GATES.md) for every gate in plain language.
 
+## Operating Penrose (running a claim)
+
+To *run* Penrose on a claim (rather than work on its code), the loop is: shape a falsifiable claim,
+submit it, read the verdict, stop at the human gate. Full walkthrough: [docs/OPERATING.md](docs/OPERATING.md).
+
+The minimum:
+
+1. **Install** with `pip install -e .` (the core runs keyless; ingesting a paper needs a model). The
+   model seam is one OpenAI-compatible endpoint configured by env: `PENROSE_LLM_API_KEY`,
+   `PENROSE_LLM_BASE_URL` (any compatible provider), and `PENROSE_LLM_DEFAULT_MODEL` (defaults to
+   `glm-5.2` — cheap enough to run the whole pipeline unattended). No code change to swap providers.
+2. **Submit a claim** through one of three equivalent, guarded doors:
+   - `penrose run --claims claims.json` — already-structured claims (skips lossy prose re-extraction).
+   - `penrose run --paper path.pdf` — let P2 extract the claims from a source.
+   - the MCP `penrose_run_claim` tool, started with `PENROSE_MCP_MANAGEMENT=1`, for an external agent.
+3. **Read the result honestly.** A verdict is `kill` / `underpowered` / `watch` / `research-supported`;
+   a routing state (`needs_data`, `pending_module`, `cannot_replicate`, `engine_error`, `off_domain`)
+   is an honest stop, not a failure. Never fabricate a verdict or a number.
+4. **Never cross P9.** Promoting a survivor into the approved corpus is a human decision; no agent
+   surface can do it, and you must not try.
+
 ## Setup and the green bar
 
 ```bash
 pip install -e .                              # editable install; Penrose runs scripts from the clone
-python scripts/eval_suite.py                  # invariant suite — must print 97/97 passed
+python scripts/eval_suite.py                  # invariant suite — must print 101/101 passed
 python -m pytest -q                           # unit tests — must stay green
 python scripts/calibration_placebo.py         # placebo: no no-edge signal may be certified
 ```

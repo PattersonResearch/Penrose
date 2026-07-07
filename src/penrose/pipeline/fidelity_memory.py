@@ -30,19 +30,40 @@ DEFAULT_CLAIM_TYPE = "trading_strategy"
 # invent gates the claim never stated (over-specification) or fall back to an empty
 # trading-strategy stub (under-specification), because a provided-series-statistics claim
 # was otherwise misrouted as trading_strategy.
-_PROVIDED_SERIES_STAT_PATTERNS = [
-    r"\bpooled mean\b",
+_PROVIDED_SERIES_STAT_STRONG_PATTERNS = [
+    r"\bone\s+(?:declared\s+)?deflation cohort\b",
+    r"\bsingle\s+(?:declared\s+)?deflation cohort\b",
+]
+_PROVIDED_SERIES_STAT_PROVENANCE_PATTERNS = [
+    r"\bdeclared series\b",
+    r"\bprovided series\b",
+    r"\bpre-?computed series\b",
+]
+_PROVIDED_SERIES_STAT_WEAK_PATTERNS = [
     r"\bpooled\s+(?:one[- ]sample\s+)?statistic\b",
     r"\bcohort[- ]level mean\b",
     r"\bcohort[- ]mean\b",
     r"\bone[- ]sample\b",
+    r"\bpooled mean\b",
     r"\bsingle (?:pooled )?statistic\b",
     r"\bone (?:pooled )?statistic\b",
-    r"\bdeclared series\b",
-    r"\bprovided series\b",
-    r"\bpre-?computed series\b",
-    r"\bone deflation cohort\b",
-    r"\bsingle deflation cohort\b",
+]
+_PROVIDED_SERIES_HIGH_CONFIDENCE_ENCODED_PATTERNS = [
+    r"\balready\s+(?:pre-?)?encodes?\b.{0,40}\b(?:p&l|pnl|net|return|returns|profit|edge)\b",
+    r"\bseries\b.{0,40}\balready\s+encodes?\b",
+]
+_PROVIDED_SERIES_DECLARATION_PATTERNS = [
+    *_PROVIDED_SERIES_HIGH_CONFIDENCE_ENCODED_PATTERNS,
+    r"\b(?:provided|pre-?computed|declared|pre-?encoded)\s+(?:net\s+)?(?:p&l|pnl|return|returns|series)\b",
+    r"\bpool these\s+\d*\s*(?:[\w&.-]+\s+)*series\b",
+]
+_TRADING_CONSTRUCTION_PATTERNS = [
+    r"\bgo\s+long\b|\bgo\s+short\b|\blong[- ]short\b|\blong[- ]only\b|\bshort[- ]only\b",
+    r"\bentry\b|\bexit\b",
+    r"\bposition\b|\bpositions\b",
+    r"\bsignal\b",
+    r"\bmomentum\b",
+    r"\brebalance\b|\brebalanced\b|\brebalancing\b",
 ]
 
 _DESCRIPTIVE_PATTERNS = [
@@ -75,8 +96,69 @@ _STRUCTURAL_PATTERNS = [
     r"\bshould\b",
 ]
 
+_PREREGISTERED_SINGLE_STAT_PATTERNS = [
+    r"\b(?:exactly\s+)?one\s+pre[- ]?registered\s+statistic\b",
+    r"\bsingle\s+pre[- ]?registered\s+statistic\b",
+    r"\b(?:one|single)\s+(?:declared\s+)?deflation cohort\b",
+    r"\bcounts?\s+as\s+one\s+pre[- ]?registered\s+search\b",
+    r"\bpre[- ]?registered\s+search\s+denominator\s*(?:of\s+|is\s+|=\s*)1\b",
+    r"\b(?:deflation\s+)?cohort\s+denominator\s*(?:of\s+|is\s+|=\s*)1\b",
+]
+_SINGLE_POOLED_TEST_ASSERTION = (
+    r"\b(?:one|single)\s+(?:pooled\s+)?test\b|"
+    r"\bpooled\s+test\b.{0,40}\b(?:one|single)\b"
+)
+_PREREGISTRATION_CONTEXT_PATTERN = (
+    r"\bpre[- ]?registered\b|"
+    r"\bdeflation cohort\b|"
+    r"\bpre[- ]?registered search\b|"
+    r"\b(?:exactly\s+)?one\s+pre[- ]?registered\s+statistic\b|"
+    r"\bsingle\s+pre[- ]?registered\s+statistic\b"
+)
 
-def classify_claim_type(claim) -> str:
+
+def _claim_source_text(claim, source=None) -> str:
+    parts = []
+    for attr in ("statement", "mechanism", "claimed_metric_quote", "source_span"):
+        try:
+            parts.append(getattr(claim, attr, "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        parts.append(getattr(source, "text", "") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    if isinstance(source, dict):
+        try:
+            parts.append(str(source.get("text") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def is_preregistered_single_cohort(claim, source=None) -> bool:
+    """True only for an explicit one-cohort pre-registration assertion.
+
+    This is verdict-integrity bookkeeping, not claim routing. Generic statistical
+    prose such as "one-sample t-test" or "pooled mean" must not earn the reduced
+    deflation denominator.
+    """
+    try:
+        text = _claim_source_text(claim, source)
+        if not text.strip():
+            return False
+        if any(re.search(pat, text) for pat in _PREREGISTERED_SINGLE_STAT_PATTERNS):
+            return True
+        return bool(
+            re.search(r"\bno multiplicity correction\b", text)
+            and re.search(_SINGLE_POOLED_TEST_ASSERTION, text)
+            and re.search(_PREREGISTRATION_CONTEXT_PATTERN, text)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def classify_claim_type(claim, source=None) -> str:
     """Return a deterministic claim type, failing open to trading_strategy.
 
     Classification is keyword/regex-based over the ENGLISH claim text. Non-English
@@ -85,7 +167,7 @@ def classify_claim_type(claim) -> str:
     a strategy rather than mis-specialized), never a crash.
     """
     try:
-        text = " ".join([
+        claim_text = " ".join([
             getattr(claim, "statement", "") or "",
             getattr(claim, "mechanism", "") or "",
             getattr(claim, "claimed_metric_quote", "") or "",
@@ -93,20 +175,47 @@ def classify_claim_type(claim) -> str:
         ]).lower()
     except Exception:  # noqa: BLE001
         return DEFAULT_CLAIM_TYPE
-    if not text.strip():
+    if not claim_text.strip():
         return DEFAULT_CLAIM_TYPE
 
-    # Checked FIRST and independently of the descriptive/trading tally: a claim that
-    # names itself as a pooled/cohort/one-sample statistic over provided series is this
-    # type regardless of incidental trading-flavored words it also contains (e.g. "net
-    # P&L", "long-only") -- exactly the EXP-1/EXP-1b phrasing that used to fall through
-    # to trading_strategy and get either over- or under-specified (6g).
-    if any(re.search(pat, text) for pat in _PROVIDED_SERIES_STAT_PATTERNS):
+    # Checked FIRST and independently of the descriptive/trading tally, but only for
+    # explicit provided-series declarations. Ambiguous pooled/cohort/one-sample prose is
+    # handled by the declaration-gated weak branch below.
+    if any(re.search(pat, claim_text) for pat in _PROVIDED_SERIES_STAT_STRONG_PATTERNS):
         return "provided_series_statistic"
+    if any(re.search(pat, claim_text) for pat in _PROVIDED_SERIES_STAT_PROVENANCE_PATTERNS):
+        trading_construction = sum(
+            1 for pat in _TRADING_CONSTRUCTION_PATTERNS if re.search(pat, claim_text)
+        )
+        high_confidence_encoded = any(
+            re.search(pat, claim_text)
+            for pat in _PROVIDED_SERIES_HIGH_CONFIDENCE_ENCODED_PATTERNS
+        )
+        if trading_construction >= 2 and not high_confidence_encoded:
+            return "trading_strategy"
+        return "provided_series_statistic"
+    source_text = (getattr(source, "text", "") or "").lower()
+    stat_text = " ".join([claim_text, source_text])
+    has_weak_stat = any(
+        re.search(pat, stat_text) for pat in _PROVIDED_SERIES_STAT_WEAK_PATTERNS
+    )
+    if has_weak_stat:
+        declaration_text = stat_text
+        if any(re.search(pat, declaration_text) for pat in _PROVIDED_SERIES_DECLARATION_PATTERNS):
+            trading_construction = sum(
+                1 for pat in _TRADING_CONSTRUCTION_PATTERNS if re.search(pat, claim_text)
+            )
+            high_confidence_encoded = any(
+                re.search(pat, declaration_text)
+                for pat in _PROVIDED_SERIES_HIGH_CONFIDENCE_ENCODED_PATTERNS
+            )
+            if trading_construction >= 2 and not high_confidence_encoded:
+                return "trading_strategy"
+            return "provided_series_statistic"
 
-    descriptive = sum(1 for pat in _DESCRIPTIVE_PATTERNS if re.search(pat, text))
-    trading = sum(1 for pat in _TRADING_PATTERNS if re.search(pat, text))
-    structural = sum(1 for pat in _STRUCTURAL_PATTERNS if re.search(pat, text))
+    descriptive = sum(1 for pat in _DESCRIPTIVE_PATTERNS if re.search(pat, claim_text))
+    trading = sum(1 for pat in _TRADING_PATTERNS if re.search(pat, claim_text))
+    structural = sum(1 for pat in _STRUCTURAL_PATTERNS if re.search(pat, claim_text))
 
     if descriptive and descriptive >= trading:
         return "descriptive_statistical"

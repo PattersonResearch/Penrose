@@ -190,10 +190,12 @@ def _run_precheck_case(tmp_path, monkeypatch, precheck_result):
 
     def fake_fidelity(*args, **kwargs):
         calls["fid"] += 1
-        if calls["fid"] == 1:
-            if isinstance(precheck_result, Exception):
-                raise precheck_result
-            return precheck_result
+        precheck_results = precheck_result if isinstance(precheck_result, list) else [precheck_result]
+        if calls["fid"] <= len(precheck_results):
+            result = precheck_results[calls["fid"] - 1]
+            if isinstance(result, Exception):
+                raise result
+            return result
         return {"faithful": True, "verified": True, "checked": True,
                 "confidence": 0.9, "divergences": [], "note": "post ok"}
 
@@ -221,12 +223,15 @@ def _run_precheck_case(tmp_path, monkeypatch, precheck_result):
 
 
 def test_r3_unfaithful_precheck_blocks_before_auto_impl_and_backtest(tmp_path, monkeypatch):
+    from penrose.pipeline import run as runmod
+
+    unfaithful = {"faithful": False, "verified": False, "checked": True, "confidence": 0.92,
+                  "divergences": ["spec translates unconditional mean into momentum trading"],
+                  "note": "unfaithful spec"}
     out, rows, calls = _run_precheck_case(
         tmp_path,
         monkeypatch,
-        {"faithful": False, "verified": False, "checked": True, "confidence": 0.92,
-         "divergences": ["spec translates unconditional mean into momentum trading"],
-         "note": "unfaithful spec"},
+        [unfaithful] * runmod.SPEC_SELF_CORRECTION_MAX_ATTEMPTS,
     )
 
     assert out["decisions"] == [{
@@ -239,6 +244,7 @@ def test_r3_unfaithful_precheck_blocks_before_auto_impl_and_backtest(tmp_path, m
     assert calls["impl"] == 0
     assert calls["sandbox"] == 0
     assert calls["p7"] == 0
+    assert calls["fid"] == runmod.SPEC_SELF_CORRECTION_MAX_ATTEMPTS
 
 
 def test_r3_faithful_or_error_precheck_falls_through_to_backtest(tmp_path, monkeypatch):

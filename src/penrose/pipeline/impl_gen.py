@@ -218,7 +218,7 @@ def _template_guidance(spec: dict) -> str:
 # `__future__` is compile-time only (no runtime code, no attack surface) and LLMs emit
 # `from __future__ import annotations` reflexively — allowing it stops a needless self-repair
 # attempt from being burned on a harmless line (C-009).
-_IMPORT_ALLOWLIST = {"numpy", "np", "pandas", "pd", "math", "__future__"}
+_IMPORT_ALLOWLIST = {"numpy", "np", "pandas", "pd", "math", "warnings", "__future__"}
 
 # Belt-and-suspenders TEXT scan for dangerous non-import operations. Import safety is
 # enforced by AST (above); these catch dynamic-exec / IO calls expressed as plain calls.
@@ -344,14 +344,23 @@ def _generate_code(spec: dict, available: dict,
     )
     if feedback:                                  # self-repair: prior code + the error it hit
         prev_code, err = feedback
-        user += (
-            "\n\n--- YOUR PREVIOUS ATTEMPT FAILED VALIDATION ---\n"
-            f"error: {err}\n\nthe code you wrote:\n{prev_code[:3500]}\n\n"
-            "Fix the specific failure above. Common fixes: only read bundle keys from the "
-            "allowed list (anything else -> return data_unavailable); guard None/empty "
-            "series; use NON-OVERLAPPING trades so len(net) >= 10; return the exact contract "
-            "dict. Output ONLY the corrected full Python module."
-        )
+        if str(err).startswith("FIDELITY:"):
+            user += (
+                "\n\n--- YOUR PREVIOUS ATTEMPT VALIDATED BUT WAS UNFAITHFUL ---\n"
+                f"{str(err)[len('FIDELITY:'):].strip()}\n\n"
+                f"the code you wrote:\n{prev_code[:3500]}\n\n"
+                "Regenerate the implementation to fix exactly these fidelity divergences, "
+                "without breaking validation. Output ONLY the corrected full Python module."
+            )
+        else:
+            user += (
+                "\n\n--- YOUR PREVIOUS ATTEMPT FAILED VALIDATION ---\n"
+                f"error: {err}\n\nthe code you wrote:\n{prev_code[:3500]}\n\n"
+                "Fix the specific failure above. Common fixes: only read bundle keys from the "
+                "allowed list (anything else -> return data_unavailable); guard None/empty "
+                "series; use NON-OVERLAPPING trades so len(net) >= 10; return the exact contract "
+                "dict. Output ONLY the corrected full Python module."
+            )
     last_err = None
     for attempt in range(3):                     # retry transient LLM errors (timeouts)
         try:
@@ -722,6 +731,8 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
     # bail to pending_module on the first rough draft.
     feedback = None
     last_err = None
+    last_validated = None
+    fidelity_attempts = []
     for attempt in range(1, max_attempts + 1):
         try:
             code = _generate_code(spec, BUNDLE_KEYS, feedback=feedback)
@@ -759,13 +770,64 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
             impl_path, mid, bundle, claim, cost_frac, prerun_result=sbx,
             validation_meta=validation_meta)
         if ok:
+            last_validated = (result, attempt, validation_meta)
+            if use_llm and getattr(config, "FIDELITY_CHECK", False):
+                try:
+                    from . import fidelity
+
+                    module_code = impl_path.read_text()
+                    fid = fidelity.assess(claim, module_code, spec=spec)
+                    if not isinstance(fid, dict):
+                        fid = {"faithful": False, "confidence": 0.0, "divergences": [],
+                               "note": "fidelity assessor returned non-dict"}
+                except Exception as e:  # noqa: BLE001
+                    fid = {"faithful": False, "confidence": 0.0, "divergences": [],
+                           "note": f"fidelity check errored: {e}"}
+
+                divergences = fid.get("divergences") or []
+                if not divergences and fid.get("note"):
+                    divergences = [str(fid.get("note"))]
+                fid_attempt = {
+                    "attempt": attempt,
+                    "faithful": bool(fid.get("faithful", False)),
+                    "confidence": float(fid.get("confidence", 0.0) or 0.0),
+                    "divergences": [str(d) for d in divergences],
+                }
+                fidelity_attempts.append(fid_attempt)
+                confidently_unfaithful = (
+                    not fid_attempt["faithful"]
+                    and fid_attempt["confidence"] >= config.FIDELITY_KILL_CONFIDENCE
+                )
+                if confidently_unfaithful and attempt < max_attempts:
+                    guidance = (
+                        "The previous module was VALIDATED but judged UNFAITHFUL to the claim "
+                        "for these reasons: "
+                        f"{'; '.join(fid_attempt['divergences']) or 'unspecified divergence'}. "
+                        "Regenerate the implementation to fix exactly these, without breaking "
+                        "validation."
+                    )
+                    last_err = guidance
+                    feedback = (module_code, f"FIDELITY: {guidance}")
+                    continue
+
             return {"ok": True, "module": result, "module_id": mid, "attempts": attempt,
                     "validation": validation_meta,
+                    **({"fidelity_attempts": fidelity_attempts} if fidelity_attempts else {}),
                     "note": f"auto-implemented + validated on the live bundle (attempt {attempt})"}
         last_err = result
         feedback = (code, result)              # repair on the next pass
 
-    # all attempts failed -> leave a REJECTED stub so nothing broken is ever registered.
+    # If fidelity self-correction spent the remaining attempts without finding a faithful
+    # replacement, return the last validated module and let the downstream gate render the
+    # authoritative unfaithful_module outcome with full metrics.
+    if last_validated is not None:
+        result, attempt, validation_meta = last_validated
+        return {"ok": True, "module": result, "module_id": mid, "attempts": attempt,
+                "validation": validation_meta,
+                **({"fidelity_attempts": fidelity_attempts} if fidelity_attempts else {}),
+                "note": f"auto-implemented + validated on the live bundle (attempt {attempt})"}
+
+    # all attempts failed validation -> leave a REJECTED stub so nothing broken is ever registered.
     # D-005: last_err carries LLM-controlled substrings (a crafted __module_id__ / run() reason
     # with an embedded newline) — interpolating it RAW could break out of the `#` comment into
     # executable code. Two defenses: (1) the stub is marked __auto_generated__=True, so

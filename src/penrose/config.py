@@ -105,7 +105,7 @@ LLM_ROLES = {
     # adversarial VERIFY gate — checks a module faithfully implements its claim. Configure an
     # independent judge with PENROSE_LLM_VERIFIER_BASE_URL/API_KEY/MODEL; unset preserves the
     # default provider/model path.
-    "fidelity_refuter":         {"model": VERIFIER_LLM_MODEL, "max_tokens": 4000,
+    "fidelity_refuter":         {"model": VERIFIER_LLM_MODEL, "max_tokens": 8000,
                                  "max_cost_per_call": 0.30},
     "concept_extractor":        {"model": DEFAULT_LLM_MODEL, "max_tokens": 5000,
                                  "max_cost_per_call": 0.30},
@@ -145,6 +145,7 @@ LLM_BUDGET = {
 
 LLM_TIMEOUTS = {
     "default": int(os.environ.get("PENROSE_LLM_TIMEOUT_DEFAULT", "90")),
+    "claim_extractor": int(os.environ.get("PENROSE_LLM_TIMEOUT_CLAIM_EXTRACTOR", "240")),
     "fidelity_refuter": int(os.environ.get("PENROSE_LLM_TIMEOUT_FIDELITY_REFUTER", "150")),
 }
 
@@ -248,9 +249,16 @@ REGIME_ADHERENCE_MIN = 0.60
 # Enabling this turns the advisory into a stricter verdict gate for isolated tests/experiments.
 COST_SENSITIVITY_GATE = {"enabled": False, "min_margin": 1.5}
 
-# Tail-risk / widow-maker gate: kills (or caps) a stable, well-deflated strategy whose payoff is
-# bounded-up / unbounded-down. DEFAULT-OFF so it never silently moves an existing verdict.
-TAIL_RISK_GATE = {"enabled": False, "max_skew": -0.5, "min_tail_ratio": 3.0, "cap_only": False}
+# Tail-risk / widow-maker gate: warns on bounded-up / unbounded-down payoff shapes and caps
+# otherwise-supported survivors at watch by default. Operators may set cap_only=False to hard-kill.
+TAIL_RISK_GATE = {
+    "enabled": True,
+    "max_skew": -0.5,
+    "severe_skew": -3.0,
+    "severe_min_n": 40,   # skew-alone flag needs an adequate sample (skew is noisy at small n)
+    "min_tail_ratio": 3.0,
+    "cap_only": True,
+}
 
 # E2: all penrose economics (fee curve, impact coef, vol-trade cost) are MODELED placeholders,
 # not measured fills. While this is "modeled", a survivor is structurally capped at `watch`

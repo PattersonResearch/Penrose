@@ -68,6 +68,23 @@ def run(bundle, claim, cost_frac):
     assert impl_gen._scan_code_text(benign) is None
 
 
+def test_static_scan_allows_stdlib_warnings_import():
+    from penrose.pipeline import impl_gen
+
+    code = """
+import warnings
+import pandas as pd
+__module_id__ = 'warnings-ok'
+__strategy_class__ = 'unit-test'
+def run(bundle, claim, cost_frac):
+    warnings.warn('unit test', RuntimeWarning)
+    return {'ok': False, 'reason': 'data_unavailable: unit test'}
+"""
+
+    assert impl_gen._ast_import_violation(code) is None
+    assert impl_gen._scan_code_text(code) is None
+
+
 def test_static_scan_still_rejects_unambiguous_future_leaks():
     from penrose.pipeline import impl_gen
 

@@ -36,7 +36,10 @@ from ..report import write_report
 from . import stages, p7_backtest
 # NB: claims.py is per-paper P2 output and gitignored (cold-start = none), so it is NOT imported
 # here — a fresh clone has no claims.py. extract.fallback_claims loads it lazily when present.
-from . import p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox, fidelity_memory
+from . import (
+    p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox,
+    fidelity_memory, provided_series,
+)
 
 
 def _now() -> str:
@@ -234,6 +237,9 @@ def _find_paper(cli_path: str | None) -> Path | None:
 REGISTRY: dict[str, object] = {}   # strategy_class -> module object with .run()
 _REGISTRY_ALIAS_OWNERS: dict[str, str] = {}
 _REGISTRY_CANONICAL_OWNERS: dict[str, str] = {}
+_REGISTRY_CANONICAL_MODULES: dict[str, object] = {}
+
+SPEC_SELF_CORRECTION_MAX_ATTEMPTS = 3
 
 
 def _canonical_strategy_class(alias: str) -> str:
@@ -286,6 +292,11 @@ def _register_known_modules() -> None:
                         _REGISTRY_CANONICAL_OWNERS.get(canonical)
                         or _REGISTRY_ALIAS_OWNERS.get(alias)
                     )
+                    if (existing_owner is not None and existing_owner != owner
+                            and _canonical_strategy_class(existing_owner) == _canonical_strategy_class(owner)):
+                        _REGISTRY_ALIAS_OWNERS[alias] = existing_owner
+                        REGISTRY[alias] = _REGISTRY_CANONICAL_MODULES.get(canonical, module)
+                        continue
                     # Trusted-first-wins: never let a later trusted module silently clobber an
                     # alias another already claimed (a real operator foot-gun — dir-iteration
                     # order would otherwise decide routing nondeterministically). First registrant
@@ -296,6 +307,7 @@ def _register_known_modules() -> None:
                               f"{mod_dir.name} not registered for it", file=sys.stderr)
                         continue
                     _REGISTRY_CANONICAL_OWNERS[canonical] = owner
+                    _REGISTRY_CANONICAL_MODULES[canonical] = module
                     _REGISTRY_ALIAS_OWNERS[alias] = owner
                     REGISTRY[alias] = module
         except Exception as e:  # noqa: BLE001
@@ -319,9 +331,57 @@ def _data_domain(claim) -> str:
     return "general"
 
 
-def _family(claim, module) -> str:
+def _is_preregistered_single_cohort(claim, source=None) -> bool:
+    try:
+        if source is None and hasattr(claim, "preregistered_single_cohort"):
+            return bool(getattr(claim, "preregistered_single_cohort"))
+        return fidelity_memory.is_preregistered_single_cohort(claim, source)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _stamp_resolved_claim_type(claim, claim_type: str) -> str:
+    claim_type = str(claim_type or "").strip() or fidelity_memory.DEFAULT_CLAIM_TYPE
+    try:
+        setattr(claim, "resolved_claim_type", claim_type)
+    except Exception:  # noqa: BLE001
+        pass
+    return claim_type
+
+
+def _authoritative_claim_type(claim, spec: dict | None = None, source=None) -> str:
+    """Resolve the run's single claim_type decision.
+
+    The source-aware classifier can see declarations omitted from extracted claim fields.
+    Once resolved, keep that value on the Claim so later no-source paths cannot drift.
+    """
+    stamped = str(getattr(claim, "resolved_claim_type", "") or "").strip()
+    if stamped:
+        return stamped
+    spec_type = str((spec or {}).get("claim_type") or "").strip()
+    if spec_type:
+        return _stamp_resolved_claim_type(claim, spec_type)
+    if source is not None:
+        try:
+            return _stamp_resolved_claim_type(
+                claim, fidelity_memory.classify_claim_type(claim, source)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return fidelity_memory.classify_claim_type(claim)
+    except Exception:  # noqa: BLE001
+        return fidelity_memory.DEFAULT_CLAIM_TYPE
+
+
+def _family(claim, module, source=None, spec: dict | None = None) -> str:
     """C1: the multiple-testing family = strategy class + data domain. DSR deflation counts only
     sibling strategies in the same family, so unrelated domains don't raise each other's bar."""
+    if (
+        _authoritative_claim_type(claim, spec, source) == "provided_series_statistic"
+        and _is_preregistered_single_cohort(claim, source)
+    ):
+        return f"provided_series_statistic::{getattr(claim, 'claim_id', 'unknown')}"
     if source_is_unanchored(getattr(claim, "source_type", "external_source")):
         return f"generated::{_data_domain(claim)}"
     cls = (getattr(claim, "applicable_strategy_class", "") or
@@ -333,7 +393,9 @@ def _family(claim, module) -> str:
     return f"{cls}::{_data_domain(claim)}"
 
 
-def _generation_source_for(claim: Claim) -> str:
+def _generation_source_for(claim: Claim, spec: dict | None = None, source=None) -> str:
+    if _authoritative_claim_type(claim, spec, source) == "provided_series_statistic":
+        return "provided_series_statistic"
     if claim.source_type == "confirmation":
         return "confirmation"
     if source_is_unanchored(claim.source_type):
@@ -346,7 +408,7 @@ def _cohort_id(source_id: str, family: str) -> str:
     return f"{source_id}:p7:{digest}"
 
 
-def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str) -> None:
+def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str, source=None) -> None:
     """Register the run's P7-ready claims as per-family cohorts before backtesting.
 
     This fixes the paper/external path's order-dependent running denominator. The cohort is
@@ -356,14 +418,36 @@ def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str) -> Non
     if not ready_for_backtest:
         return
     grouped: dict[str, list[dict]] = {}
-    for item in ready_for_backtest:
-        claim = item["claim"]
-        family = _family(claim, item["module"])
-        item["family"] = family
-        grouped.setdefault(family, []).append(item)
-
     prepared: list[tuple[Claim, str, str, int]] = []
     rows: list[dict] = []
+    for item in ready_for_backtest:
+        claim = item["claim"]
+        spec = item.get("spec")
+        claim_type = _authoritative_claim_type(claim, spec, source)
+        preregistered_single_cohort = (
+            claim_type == "provided_series_statistic"
+            and fidelity_memory.is_preregistered_single_cohort(claim, source)
+        )
+        try:
+            setattr(claim, "preregistered_single_cohort", preregistered_single_cohort)
+        except Exception:  # noqa: BLE001
+            pass
+        family = _family(claim, item["module"], source, spec)
+        item["family"] = family
+        if claim_type == "provided_series_statistic" and preregistered_single_cohort:
+            cohort_id = f"{source_id}:provided_series:{claim.claim_id}"
+            denominator = 1
+            prepared.append((claim, family, cohort_id, denominator))
+            rows.append({
+                "strategy": claim.claim_id,
+                "family": family,
+                "generation_source": _generation_source_for(claim, spec, source),
+                "search_cohort_id": cohort_id,
+                "search_denominator": denominator,
+            })
+            continue
+        grouped.setdefault(family, []).append(item)
+
     for family, items in sorted(grouped.items()):
         # The per-run cohort size is this run's P7-ready claim count only. Ignore any
         # stale cohort fields if a Claim object is accidentally reused across runs.
@@ -375,7 +459,7 @@ def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str) -> Non
             rows.append({
                 "strategy": claim.claim_id,
                 "family": family,
-                "generation_source": _generation_source_for(claim),
+                "generation_source": _generation_source_for(claim, item.get("spec"), source),
                 "search_cohort_id": cohort_id,
                 "search_denominator": denominator,
             })
@@ -394,7 +478,9 @@ def _cleanup_run_cohorts(ready_for_backtest: list[dict]) -> None:
     cohort_ids = {
         str(getattr(item["claim"], "search_cohort_id", "") or "")
         for item in ready_for_backtest
-        if _generation_source_for(item["claim"]) == "paper"
+        if _generation_source_for(item["claim"], item.get("spec")) in {
+            "paper", "provided_series_statistic"
+        }
     }
     try:
         p7_backtest.cleanup_unscored_paper_cohorts(cohort_ids)
@@ -602,6 +688,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         if p3["killed"]:
             decisions.append(_kill(claim, p3["reason"], p3["note"], synthetic, rec, run_log))
             continue
+        _authoritative_claim_type(claim, source=source)
 
         # ---- P4: fee curve ------------------------------------------------ #
         p4 = stages.p4_fee_curve(claim, expected_edge=claim.expected_edge)
@@ -620,6 +707,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         # ---- P6: module routing (+ spec + auto-implement) ----------------- #
         cls = claim.applicable_strategy_class or ""
         module = REGISTRY.get(cls)
+        spec = None
         # B1: fidelity GATES routing. If a claim matched an EXISTING module, verify that module
         # actually implements THIS claim before trusting a backtest on it. If the refuter calls
         # it unfaithful, don't reuse — fall through to a fresh spec + auto-impl for this claim.
@@ -644,16 +732,69 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             continue
         if module is None:
             # cold-start / novel class -> generate spec, then TRY to auto-implement it
-            spec = spec_gen.generate_spec(claim, source, use_llm=use_llm)
-            specs_generated.append(spec)
-            pre_fid = _assess_spec_fidelity_safe(claim, spec) if use_llm and getattr(config, "FIDELITY_CHECK", False) else {}
-            if _fidelity_confidently_unfaithful(pre_fid):
+            pre_fid = {}
+            prior_divergences: list[str] | None = None
+            missing_inputs: list[str] = []
+            max_spec_attempts = (
+                SPEC_SELF_CORRECTION_MAX_ATTEMPTS
+                if use_llm and getattr(config, "FIDELITY_CHECK", False)
+                else 1
+            )
+            for spec_attempt in range(1, max_spec_attempts + 1):
+                spec = spec_gen.generate_spec(
+                    claim, source, use_llm=use_llm,
+                    prior_divergences=prior_divergences)
+                _authoritative_claim_type(claim, spec, source)
+                specs_generated.append(spec)
+                try:
+                    missing_inputs = _missing_spec_inputs_from_bundle(spec, bundle)
+                except Exception:  # noqa: BLE001 — pre-fidelity availability check must fail open
+                    missing_inputs = None
+                if missing_inputs:
+                    rec["stages"]["P6_data_availability"] = {
+                        "blocked": True,
+                        "missing_series": missing_inputs,
+                        "spec_path": str(spec.get("_path", "")),
+                    }
+                    decisions.append(_needs_data(
+                        claim, "data_unavailable: " + ", ".join(missing_inputs), rec, run_log))
+                    break
+                pre_fid = (
+                    _assess_spec_fidelity_safe(claim, spec)
+                    if use_llm and getattr(config, "FIDELITY_CHECK", False)
+                    else {}
+                )
+                if use_llm and getattr(config, "FIDELITY_CHECK", False):
+                    rec["stages"].setdefault("P6_pre_fidelity_attempts", []).append({
+                        "attempt": spec_attempt,
+                        "blocked": _fidelity_confidently_unfaithful(pre_fid),
+                        "faithful": pre_fid.get("faithful"),
+                        "confidence": pre_fid.get("confidence", 0),
+                        "divergences": pre_fid.get("divergences", []),
+                        "spec_path": str(spec.get("_path", "")),
+                    })
+                if not _fidelity_confidently_unfaithful(pre_fid):
+                    break
                 _persist_fidelity_rejection(claim, spec, pre_fid)
-                decisions.append(_cannot_replicate_unfaithful_spec(claim, spec, pre_fid, rec, run_log))
+                if spec_attempt >= max_spec_attempts:
+                    decisions.append(_cannot_replicate_unfaithful_spec(claim, spec, pre_fid, rec, run_log))
+                    break
+                prior_divergences = list(pre_fid.get("divergences") or [])
+                if not prior_divergences and pre_fid.get("note"):
+                    prior_divergences = [str(pre_fid.get("note"))]
+            if missing_inputs:
                 continue
+            if _fidelity_confidently_unfaithful(pre_fid):
+                continue
+            claim_type = _authoritative_claim_type(claim, spec, source)
+            if claim_type == "provided_series_statistic":
+                module = provided_series.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "provided_series_statistic"},
+                        "deterministic_provided_series": True}
             # Auto-implementation REQUIRES the Docker sandbox — model-written code never execs unsandboxed.
             # No Docker -> no auto-implement (the claim stays pending_module for the operator).
-            if not config.AUTO_IMPLEMENT_MODULES:
+            elif not config.AUTO_IMPLEMENT_MODULES:
                 impl = {"ok": False, "reason": "auto-impl disabled"}
             elif not (sandbox.docker_available() and sandbox.ensure_image()):
                 impl = {"ok": False, "reason": "auto-impl requires Docker sandbox (not available); "
@@ -661,12 +802,20 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             else:
                 impl = impl_gen.try_implement(spec, claim, bundle, cost_frac, use_llm=use_llm)
             if impl.get("ok"):
-                _register_known_modules()          # discover the just-written, validated module
+                if not impl.get("deterministic_provided_series"):
+                    _register_known_modules()      # discover the just-written, validated module
                 module = impl["module"]
                 rec["stages"]["P6"] = {"module_id": impl["module_id"], "spec_generated": True,
-                                       "auto_implemented": True, "spec_path": str(spec.get("_path", "")),
+                                       "auto_implemented": not impl.get("deterministic_provided_series"),
+                                       "deterministic_provided_series": bool(
+                                           impl.get("deterministic_provided_series")),
+                                       "spec_path": str(spec.get("_path", "")),
                                        "validation": impl.get("validation", {}),
-                                       "note": "spec auto-implemented + validated on the live bundle; backtesting"}
+                                       "note": (
+                                           "deterministic provided-series executor; backtesting"
+                                           if impl.get("deterministic_provided_series")
+                                           else "spec auto-implemented + validated on the live bundle; backtesting"
+                                       )}
                 # fall through to P7 with the freshly-built module
             else:
                 rec["stages"]["P6"] = {"module_id": None, "spec_generated": True,
@@ -698,9 +847,10 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             "module": module,
             "rec": rec,
             "claim_i": _ci,
+            "spec": spec,
         })
 
-    _register_run_cohorts(ready_for_backtest, source_id)
+    _register_run_cohorts(ready_for_backtest, source_id, source)
 
     try:
         for _ready in ready_for_backtest:
@@ -708,6 +858,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             module = _ready["module"]
             rec = _ready["rec"]
             _ci = _ready["claim_i"]
+            spec = _ready.get("spec")
             claim_started = time.monotonic()
             # ---- P7: backtest (pre-existing OR just auto-implemented module) -- #
             _progress("evaluate", detail=f"P7 backtest: {_short_name(claim)}",
@@ -758,6 +909,16 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             if not isinstance(mres, dict) or not mres.get("ok"):
                 decisions.append(_needs_data(claim, mres.get("reason"), rec, run_log))
                 continue
+            try:
+                mcode_for_coverage = Path(getattr(module, "__file__", "") or "").read_text()
+            except Exception:  # noqa: BLE001
+                mcode_for_coverage = ""
+            coverage = fidelity.variable_coverage_check(mcode_for_coverage, spec)
+            if coverage.get("needs_review"):
+                rec["stages"]["P6_variable_coverage"] = coverage
+                decisions.append(_needs_review(claim, coverage.get("reason"), rec, run_log,
+                                               metrics={"variable_coverage": coverage}))
+                continue
             # B-005: an ok-module may still omit required keys -> guard before subscript (no KeyError
             # aborting the paper). Treat a malformed result as a data blocker, not a crash.
             _missing = [k for k in ("net", "positions", "bars_per_year") if k not in mres]
@@ -765,7 +926,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 decisions.append(_needs_data(
                     claim, f"data_unavailable: module result missing keys {_missing}", rec, run_log))
                 continue
-            family = _family(claim, module)        # C1: strategy_class + data_domain
+            family = _family(claim, module, source, spec)        # C1: strategy_class + data_domain
             # Pre-registered point-in-time MARKET-regime labels for the kill-lens. PRIMARY source is
             # the bundle's regime catalog series (btc_vol_regime / btc_trend_regime) — the SAME labels
             # a module conditions on via bundle.get(), so the lens partitions by exactly what the
@@ -794,14 +955,16 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     claim.claim_id, mres["net"], mres["positions"], mres["bars_per_year"],
                     payoff=mres.get("payoff"), position_signed=mres.get("position_signed"),
                     cost_frac=cost_frac, wf_frame=mres.get("wf_frame"), family=family,
-                    generation_source=_generation_source_for(claim),
+                    generation_source=_generation_source_for(claim, spec, source),
                     search_cohort_id=claim.search_cohort_id,
                     search_denominator=claim.search_denominator,
+                    preregistered_single_cohort=_is_preregistered_single_cohort(claim, source),
                     regime_schemes=reg_schemes,
                     declared_regime=claim.declared_regime)
             except Exception as e:  # noqa: BLE001 — C-005: one bad backtest must not abort the paper
                 decisions.append(_engine_error(claim, "P7 backtest", e, rec, run_log))
                 continue
+            bt.setdefault("claim_type", _authoritative_claim_type(claim, spec, source))
             if claim.source_type == "external_source":
                 sample_end = (claim.sample_period or {}).get("end") if claim.sample_period else None
                 data_end = None
@@ -858,7 +1021,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     mcode = Path(getattr(module, "__file__", "") or "").read_text()  # real path (B-011)
                 except Exception:  # noqa: BLE001
                     mcode = ""
-                fid = _assess_fidelity_safe(claim, mcode)
+                fid = _assess_fidelity_safe(claim, mcode, spec)
                 bt["fidelity"] = fid
                 dec.metrics["fidelity"] = fid
                 dec.metrics["independent_verifier"] = bool(fid.get("independent_verifier", False))
@@ -880,7 +1043,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     # B3: an unfaithful module's result is NOT a trusted kill OR survivor — it's a
                     # distinct `cannot_replicate` verdict (a translation failure), excluded from the
                     # corpus, never a principle.
-                    _persist_fidelity_rejection(claim, None, fid)
+                    _persist_fidelity_rejection(claim, spec, fid)
                     dec.metrics["fidelity_suspect"] = True
                     dec.metrics["original_verdict"] = dec.verdict
                     dec.verdict = "cannot_replicate"
@@ -1152,6 +1315,48 @@ def _parse_missing_series(reason: str) -> list[str]:
     return out or ["unspecified"]
 
 
+def _missing_spec_inputs_from_bundle(spec: dict, bundle) -> list[str] | None:
+    """Return declared spec inputs that the actual run bundle cannot provide.
+
+    This deliberately asks DataBundle.get(), not the catalog, because module execution
+    sees the bundle: catalog series plus bundle-native live/synthetic/vendor series and
+    the contract's alias rules. Any uncertainty fails open to None so the existing module
+    data_unavailable path remains the backstop.
+    """
+    had_accessed = False
+    prior_accessed = set()
+    try:
+        inputs = spec.get("inputs", []) if isinstance(spec, dict) else []
+        if inputs is None:
+            return []
+        if not isinstance(inputs, list):
+            return None
+        resolver = getattr(bundle, "get", None)
+        if not callable(resolver):
+            return None
+        had_accessed = hasattr(bundle, "_accessed")
+        if had_accessed:
+            prior_accessed = set(getattr(bundle, "_accessed") or set())
+        missing: list[str] = []
+        seen: set[str] = set()
+        for raw in inputs:
+            name = str(raw or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            series = resolver(name)
+            if series is None or getattr(series, "available", True) is False:
+                missing.append(name)
+        return missing
+    except Exception:  # noqa: BLE001 — verdict logic fails open on availability uncertainty
+        return None
+    finally:
+        if had_accessed:
+            object.__setattr__(bundle, "_accessed", prior_accessed)
+        elif hasattr(bundle, "_accessed"):
+            object.__setattr__(bundle, "_accessed", set())
+
+
 def _run_module_once(module, bundle, claim, cost_frac, is_auto: bool):
     if is_auto:
         # untrusted model-written code -> run in the Docker sandbox, NEVER in-process
@@ -1291,9 +1496,12 @@ def _zero_extraction_engine_error(source, source_id: str, p2_prov: dict, run_log
     claim_id = f"{source_id}-c0"
     mode = str((p2_prov or {}).get("mode") or "unknown")
     detail = str((p2_prov or {}).get("extraction_error") or (p2_prov or {}).get("error") or "").strip()
+    retry_note = ""
+    if (p2_prov or {}).get("retry_on_zero"):
+        retry_note = " after retry-on-zero extraction hardening ran once"
     rationale = (
         f"engine error: P2 claim extraction returned ZERO claims for a non-trivial source "
-        f"({getattr(source, 'n_chars', 0)} chars, p2_mode={mode})"
+        f"({getattr(source, 'n_chars', 0)} chars, p2_mode={mode}){retry_note}"
         + (f": {detail}" if detail else "")
         + ". Very likely an extraction failure (LLM/network hiccup, or a vocabulary-"
           "confusion misjudgment reading the source as an admin/report document rather "
@@ -1364,6 +1572,30 @@ def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
+    return dec
+
+
+def _needs_review(claim, reason, rec, run_log, metrics=None):
+    """Soft-stop for implementation-fidelity defects that need a human/agent fix.
+
+    This is not a falsification verdict. It means the implementation cannot be trusted to
+    answer the claim, so P7/P8 are not allowed to manufacture a kill from it.
+    """
+    from ..brain import Decision
+    note = str(reason or "implementation needs review")[:300]
+    dec = Decision(decision_id=f"{claim.claim_id}-review", claim_id=claim.claim_id,
+                   verdict="needs_review", kill_reason=None,
+                   rationale=f"needs_review: {note}; claim untested until implementation is fixed.",
+                   metrics=metrics or {}, revisit_at="2026-07-01")
+    rec["stages"]["P8"] = {"verdict": "needs_review", "reason": note}
+    run_log["claims"].append(rec)
+    _append_jsonl(config.DECISIONS_LOG,
+                  asdict(dec) | _decision_log_metadata(claim, run_log))
+    _append_jsonl(config.REVIEW_QUEUE,
+                  {"type": "needs_review", "queued_at": _now(), "status": "pending",
+                   "proposal_id": dec.decision_id, "name": _short_name(claim),
+                   "claim_id": claim.claim_id, "claim_statement": claim.statement,
+                   "rationale": dec.rationale, **asdict(dec)})
     return dec
 
 
@@ -1464,9 +1696,9 @@ def _fidelity_unknown(error: Exception) -> dict:
     }
 
 
-def _assess_fidelity_safe(claim, module_code: str) -> dict:
+def _assess_fidelity_safe(claim, module_code: str, spec: dict | None = None) -> dict:
     try:
-        fid = fidelity.assess(claim, module_code)
+        fid = fidelity.assess(claim, module_code, spec=spec)
     except Exception as e:  # noqa: BLE001 — fidelity must not abort a source run
         return _fidelity_unknown(e)
     if not isinstance(fid, dict):
@@ -1533,10 +1765,7 @@ def _fidelity_confidently_unfaithful(fid: dict) -> bool:
 
 def _persist_fidelity_rejection(claim, spec: dict | None, fid: dict) -> None:
     try:
-        claim_type = (
-            (spec or {}).get("claim_type")
-            or fidelity_memory.classify_claim_type(claim)
-        )
+        claim_type = _authoritative_claim_type(claim, spec)
         strategy_class = (
             (spec or {}).get("strategy_class")
             or getattr(claim, "applicable_strategy_class", "")

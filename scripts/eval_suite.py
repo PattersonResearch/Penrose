@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 
 from penrose.pipeline import p7_backtest as P7   # noqa: E402 (self-adds harness path)
 from penrose.pipeline import run as RUN          # noqa: E402
+from penrose.pipeline import fidelity_memory     # noqa: E402
 from penrose.pipeline import stages              # noqa: E402
 from penrose.brain import Claim                  # noqa: E402
 from penrose import config                       # noqa: E402
@@ -257,11 +258,15 @@ def invariants() -> list[tuple[str, bool]]:
     P7._trial_stats = _REAL_TRIAL_STATS
     _order_ok = False
     _single_ok = False
+    _provided_decoupled_ok = False
+    _provided_prereg_ok = False
     _order_a = Path(tempfile.gettempdir()) / "_eval_5c_order_a.tsv"
     _order_b = Path(tempfile.gettempdir()) / "_eval_5c_order_b.tsv"
     _single_l = Path(tempfile.gettempdir()) / "_eval_5c_single.tsv"
     _base_l = Path(tempfile.gettempdir()) / "_eval_5c_single_base.tsv"
-    for _p in (_order_a, _order_b, _single_l, _base_l):
+    _provided_l = Path(tempfile.gettempdir()) / "_eval_provided_decoupled.tsv"
+    _provided_prereg_l = Path(tempfile.gettempdir()) / "_eval_provided_prereg.tsv"
+    for _p in (_order_a, _order_b, _single_l, _base_l, _provided_l, _provided_prereg_l):
         _p.unlink(missing_ok=True)
         Path(str(_p) + ".lock").unlink(missing_ok=True)
     _old_ledger = P7.LEDGER
@@ -305,15 +310,79 @@ def invariants() -> list[tuple[str, bool]]:
             _bt_single == _bt_base
             and _single_family_n == config.DEFLATION_PRIOR["external_min_trials"]
         )
+
+        def _provided_eval_claim(cid: str, statement: str) -> Claim:
+            return Claim(claim_id=cid, statement=statement, mechanism="", scope="",
+                         horizon="", source_id="eval", source_span=statement,
+                         claimed_metric_quote="", applicable_strategy_class="eval-provided")
+
+        _provided_statement = "The pooled mean of declared provided series is greater than zero."
+        _prereg_statement = (
+            "There is exactly one pre-registered statistic; because it is a single pooled "
+            "test, no multiplicity correction applies for the declared provided series."
+        )
+        P7.LEDGER = _provided_l
+        _pa = _provided_eval_claim("provided-a", _provided_statement)
+        _pb = _provided_eval_claim("provided-b", _provided_statement)
+        _provided_ready = [{"claim": c, "module": _EvalModule()} for c in (_pa, _pb)]
+        RUN._register_run_cohorts(_provided_ready, "eval-source")
+        _n_provided, _ = P7._trial_stats(
+            _provided_ready[0]["family"], "provided-a",
+            registered_trials=_pa.search_denominator,
+            generation_source="provided_series_statistic",
+            search_cohort_id=_pa.search_cohort_id,
+            preregistered_single_cohort=False)
+        _bt_provided = P7.run_backtest(
+            "provided-a", _cohort_net, pd.Series(1.0, index=_cohort_net.index), 252.0,
+            family=_provided_ready[0]["family"], generation_source="provided_series_statistic",
+            search_cohort_id=_pa.search_cohort_id, search_denominator=_pa.search_denominator,
+            preregistered_single_cohort=False, log=False)
+        _provided_decoupled_ok = (
+            fidelity_memory.classify_claim_type(_pa) == "provided_series_statistic"
+            and not fidelity_memory.is_preregistered_single_cohort(_pa)
+            and _pa.search_denominator == _pb.search_denominator == 2
+            and _provided_ready[0]["family"] == _provided_ready[1]["family"]
+            and _n_provided == config.DEFLATION_PRIOR["external_min_trials"]
+            and int(_bt_provided["regime"].get("n_partitions", 0)) > 0
+        )
+
+        P7.LEDGER = _provided_prereg_l
+        _pra = _provided_eval_claim("prereg-a", _prereg_statement)
+        _prb = _provided_eval_claim("prereg-b", _prereg_statement)
+        _prereg_ready = [{"claim": c, "module": _EvalModule()} for c in (_pra, _prb)]
+        RUN._register_run_cohorts(_prereg_ready, "eval-source")
+        _n_prereg, _ = P7._trial_stats(
+            _prereg_ready[0]["family"], "prereg-a",
+            registered_trials=_pra.search_denominator,
+            generation_source="provided_series_statistic",
+            search_cohort_id=_pra.search_cohort_id,
+            preregistered_single_cohort=True)
+        _bt_prereg = P7.run_backtest(
+            "prereg-a", _cohort_net, pd.Series(1.0, index=_cohort_net.index), 252.0,
+            family=_prereg_ready[0]["family"], generation_source="provided_series_statistic",
+            search_cohort_id=_pra.search_cohort_id, search_denominator=_pra.search_denominator,
+            preregistered_single_cohort=True, log=False)
+        _provided_prereg_ok = (
+            fidelity_memory.is_preregistered_single_cohort(_pra)
+            and _pra.search_denominator == _prb.search_denominator == 1
+            and _prereg_ready[0]["family"] != _prereg_ready[1]["family"]
+            and _n_prereg == 1
+            and _bt_prereg["regime"].get("n_partitions") == 0
+            and _bt_prereg["n_trials"] == 1
+        )
     finally:
         P7.LEDGER = _old_ledger
         P7._trial_stats = _old_stats
-        for _p in (_order_a, _order_b, _single_l, _base_l):
+        for _p in (_order_a, _order_b, _single_l, _base_l, _provided_l, _provided_prereg_l):
             _p.unlink(missing_ok=True)
             Path(str(_p) + ".lock").unlink(missing_ok=True)
     out.append(("5c: same strategy first-vs-last in a paper cohort has identical n_trials + DSR + verdict",
                 _order_ok))
     out.append(("5c: PEN-06 single-claim paper cohort is byte-identical at external floor", _single_ok))
+    out.append(("6g: provided-series classification without pre-registration uses normal deflation",
+                _provided_decoupled_ok))
+    out.append(("6g: explicit pre-registered provided-series claim keeps singleton deflation break",
+                _provided_prereg_ok))
 
     # ===================== Wave 2/3 audit-fix regression guards ===================== #
     import tempfile
@@ -353,6 +422,60 @@ def invariants() -> list[tuple[str, bool]]:
              " return {'ok':True,'net':pd.Series(np.linspace(-0.02,0.03,20),index=idx),'positions':pd.Series(1.0,index=idx),'bars_per_year':52,'n_trades':20}\n")
     ok_g, why_g = ig._validate_module(_mod(_good), "m", None, None, 0.0)
     out.append(("A-014: a well-formed module still passes validation", ok_g is True))
+
+    # W7/#18: smoothed vs filtered regime probabilities. The dynamic truncated-bundle
+    # rerun must reject full-sample smoothed probabilities (future-dependent early
+    # signals) while allowing the identical trailing/filtered construction.
+    class _EvalSeries:
+        def __init__(self, data):
+            self.data = data
+            self.available = True
+
+    class _EvalBundle:
+        def __init__(self, price):
+            self.series = {"regime_price": _EvalSeries(price)}
+
+        def get(self, key):
+            return self.series.get(key)
+
+    _rpx = pd.Series(
+        np.r_[np.linspace(100, 200, 112), np.linspace(198, 50, 48)],
+        index=pd.date_range("2023-01-01", periods=160, freq="D"),
+    )
+    _rbundle = _EvalBundle(_rpx)
+    _smoothed = _td / "smoothed_impl.py"
+    _smoothed.write_text(_H + """
+__module_id__='m'
+def run(bundle, claim, cost_frac):
+    px = bundle.get('regime_price').data.astype(float)
+    ret = px.pct_change().dropna()
+    idx = ret.index[:-1]
+    signal = pd.Series(np.where(px.iloc[-1] > px.reindex(idx), 1.0, -1.0), index=idx)
+    future_ret = pd.Series(ret.to_numpy()[1:], index=idx)
+    net = pd.Series(signal.values * future_ret.values, index=idx)
+    return {'ok': True, 'net': net, 'positions': pd.Series(1.0, index=idx),
+            'bars_per_year': 1.0, 'n_trades': len(net)}
+""")
+    _filtered = _td / "filtered_impl.py"
+    _filtered.write_text(_H + """
+__module_id__='m'
+def run(bundle, claim, cost_frac):
+    px = bundle.get('regime_price').data.astype(float)
+    ret = px.pct_change().dropna()
+    idx = ret.index[20:-1]
+    trailing = px.rolling(20, min_periods=20).mean().reindex(idx)
+    signal = pd.Series(np.where(px.reindex(idx) > trailing, 1.0, -1.0), index=idx)
+    future_ret = pd.Series(ret.to_numpy()[21:], index=idx)
+    net = pd.Series(signal.values * future_ret.values, index=idx)
+    return {'ok': True, 'net': net, 'positions': pd.Series(1.0, index=idx),
+            'bars_per_year': 1.0, 'n_trades': len(net)}
+""")
+    _sm_ok, _sm_why = ig._validate_module(_smoothed, "m", _rbundle, None, 0.0)
+    _fl_ok, _fl_why = ig._validate_module(_filtered, "m", _rbundle, None, 0.0)
+    out.append(("W7/#18: smoothed regime probability strategy is rejected for dynamic look-ahead",
+                _sm_ok is False and "look-ahead" in str(_sm_why)))
+    out.append(("W7/#18: filtered real-time regime probability strategy passes dynamic look-ahead",
+                _fl_ok is True))
 
     # A-023: _sharpe distinguishes deterministic edge from no-edge
     out.append(("A-023: constant +series -> Sharpe > 0", R._sharpe(np.array([0.01] * 5), 25) > 0))

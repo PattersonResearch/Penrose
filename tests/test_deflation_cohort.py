@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -11,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from penrose.brain import Claim
 from penrose import config
 from penrose.data.contract import DataBundle
+from penrose.pipeline import fidelity_memory
 from penrose.pipeline import p7_backtest as p7
 from penrose.pipeline import run as runmod
 from penrose.pipeline import stages
@@ -52,6 +54,54 @@ def _claim(claim_id: str, cls: str = "unit-deflation") -> Claim:
         source_span="",
         claimed_metric_quote="",
         applicable_strategy_class=cls,
+    )
+
+
+def _provided_claim(claim_id: str) -> Claim:
+    return Claim(
+        claim_id=claim_id,
+        statement="The pooled mean of declared provided series is greater than zero.",
+        mechanism="",
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="one pooled statistic across declared series",
+        applicable_strategy_class="unit-provided-series",
+    )
+
+
+def _provided_preregistered_claim(claim_id: str) -> Claim:
+    return Claim(
+        claim_id=claim_id,
+        statement=(
+            "The declared provided series has exactly one pre-registered statistic; "
+            "because it is a single pooled test, no multiplicity correction applies."
+        ),
+        mechanism="",
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="single pooled test",
+        applicable_strategy_class="unit-provided-series",
+    )
+
+
+def _exp1b_claim(claim_id: str) -> Claim:
+    return Claim(
+        claim_id=claim_id,
+        statement=(
+            "A strategy that buys the mispriced side of settled tail markets "
+            "earns a positive mean net P&L"
+        ),
+        mechanism="",
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="",
+        applicable_strategy_class="unit-provided-series",
     )
 
 
@@ -112,6 +162,214 @@ def test_run_cohort_makes_same_strategy_order_independent(tmp_path, monkeypatch)
     assert first_family_n == last_family_n == config.DEFLATION_PRIOR["external_min_trials"]
     assert first_bt["dsr"] == last_bt["dsr"]
     assert first_verdict == last_verdict
+
+
+def test_is_preregistered_single_cohort_requires_explicit_single_cohort_assertion():
+    assert fidelity_memory.is_preregistered_single_cohort(_provided_preregistered_claim("exp-1b"))
+
+    momentum = Claim(
+        claim_id="momentum",
+        statement="Momentum was validated with a one-sample t-test on daily P&L.",
+        mechanism="",
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="",
+        applicable_strategy_class="unit-provided-series",
+    )
+    pooled_mean = Claim(
+        claim_id="pooled",
+        statement="We compute a pooled mean over the declared series.",
+        mechanism="",
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="",
+        applicable_strategy_class="unit-provided-series",
+    )
+    assert not fidelity_memory.is_preregistered_single_cohort(momentum)
+    assert not fidelity_memory.is_preregistered_single_cohort(pooled_mean)
+
+
+def test_exp1b_keeps_provided_series_and_singleton_preregistration():
+    source = SimpleNamespace(text=(
+        "Pool these 8 net-tail-P&L series (each already encodes the per-market net P&L "
+        "above, held to settlement) into a pooled sample and run a single one-sided "
+        "one-sample t-test on that pooled sample. There is exactly one pre-registered "
+        "statistic; because it is a single pooled test, no multiplicity correction applies."
+    ))
+    claim = _exp1b_claim("exp-1b")
+
+    assert fidelity_memory.classify_claim_type(claim, source) == "provided_series_statistic"
+    assert fidelity_memory.is_preregistered_single_cohort(claim, source) is True
+
+
+def test_preregistered_single_cohort_rejects_generic_statistical_prose():
+    generic_sources = [
+        "the F-statistic has denominator of 1 degree of freedom",
+        "the denominator is 1 for this unit-root test",
+        "we report one test, with no multiplicity correction",
+    ]
+    for text in generic_sources:
+        assert fidelity_memory.is_preregistered_single_cohort(
+            _provided_claim("generic"), SimpleNamespace(text=text)
+        ) is False
+
+    assert fidelity_memory.is_preregistered_single_cohort(
+        _provided_claim("explicit-stat"),
+        SimpleNamespace(text="exactly one pre-registered statistic; single pooled test"),
+    ) is True
+    assert fidelity_memory.is_preregistered_single_cohort(
+        _provided_claim("explicit-search"),
+        SimpleNamespace(text="This counts as one pre-registered search."),
+    ) is True
+
+
+def test_provided_series_provenance_phrase_obeys_trading_veto():
+    claim = Claim(
+        claim_id="momentum-provenance",
+        statement="The long-short momentum strategy earns positive excess returns",
+        mechanism=(
+            "We go long the top decile and go short the bottom decile, rebalanced "
+            "monthly, using the provided series of excess returns from CRSP"
+        ),
+        scope="",
+        horizon="",
+        source_id="unit-source",
+        source_span="",
+        claimed_metric_quote="",
+        applicable_strategy_class="momentum",
+    )
+    source = SimpleNamespace(text="F-tests whose denominator of 1 degree of freedom are reported.")
+
+    assert fidelity_memory.classify_claim_type(claim, source) == "trading_strategy"
+    assert fidelity_memory.is_preregistered_single_cohort(claim, source) is False
+
+
+def test_provided_series_without_preregistration_uses_normal_cohort_deflation(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        claims = [_provided_claim("provided-a"), _provided_claim("provided-b")]
+        ready = _ready(claims)
+        runmod._register_run_cohorts(ready, "unit-paper")
+        rows = p7._canonicalize_ledger()
+        n_a, _ = p7._trial_stats(
+            ready[0]["family"], "provided-a",
+            registered_trials=claims[0].search_denominator,
+            generation_source="provided_series_statistic",
+            search_cohort_id=claims[0].search_cohort_id,
+            preregistered_single_cohort=False,
+        )
+        net = _net()
+        bt = p7.run_backtest(
+            "provided-a",
+            net,
+            pd.Series(1.0, index=net.index),
+            252.0,
+            family=ready[0]["family"],
+            generation_source="provided_series_statistic",
+            search_cohort_id=claims[0].search_cohort_id,
+            search_denominator=claims[0].search_denominator,
+            preregistered_single_cohort=False,
+            log=False,
+        )
+    finally:
+        p7.LEDGER = old
+
+    assert fidelity_memory.classify_claim_type(claims[0]) == "provided_series_statistic"
+    assert not fidelity_memory.is_preregistered_single_cohort(claims[0])
+    assert claims[0].search_denominator == 2
+    assert claims[1].search_denominator == 2
+    assert set(rows["search_denominator"].astype(int)) == {2}
+    assert set(rows["generation_source"].astype(str)) == {"provided_series_statistic"}
+    assert ready[0]["family"] == ready[1]["family"]
+    assert n_a == config.DEFLATION_PRIOR["external_min_trials"]
+    assert bt["n_trials"] > 1
+    assert int(bt["regime"].get("n_partitions", 0)) > 0
+
+
+def test_generic_denominator_prose_does_not_create_singleton_provided_deflation(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    source = SimpleNamespace(text="F-tests whose denominator of 1 degree of freedom are reported.")
+    try:
+        claims = [_provided_claim("provided-a"), _provided_claim("provided-b")]
+        ready = _ready(claims)
+        runmod._register_run_cohorts(ready, "unit-paper", source=source)
+        net = _net()
+        bt = p7.run_backtest(
+            "provided-a",
+            net,
+            pd.Series(1.0, index=net.index),
+            252.0,
+            family=ready[0]["family"],
+            generation_source="provided_series_statistic",
+            search_cohort_id=claims[0].search_cohort_id,
+            search_denominator=claims[0].search_denominator,
+            preregistered_single_cohort=fidelity_memory.is_preregistered_single_cohort(
+                claims[0], source
+            ),
+            log=False,
+        )
+    finally:
+        p7.LEDGER = old
+
+    assert fidelity_memory.classify_claim_type(claims[0], source) == "provided_series_statistic"
+    assert fidelity_memory.is_preregistered_single_cohort(claims[0], source) is False
+    assert claims[0].search_denominator == 2
+    assert ready[0]["family"] == ready[1]["family"]
+    assert bt["n_trials"] != 1
+    assert int(bt["regime"].get("n_partitions", 0)) > 0
+
+
+def test_preregistered_provided_series_keeps_singleton_deflation_break(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        claims = [
+            _provided_preregistered_claim("provided-a"),
+            _provided_preregistered_claim("provided-b"),
+        ]
+        ready = _ready(claims)
+        runmod._register_run_cohorts(ready, "unit-paper")
+        rows = p7._canonicalize_ledger()
+        n_a, _ = p7._trial_stats(
+            ready[0]["family"], "provided-a",
+            registered_trials=claims[0].search_denominator,
+            generation_source="provided_series_statistic",
+            search_cohort_id=claims[0].search_cohort_id,
+            preregistered_single_cohort=True,
+        )
+        net = _net()
+        bt = p7.run_backtest(
+            "provided-a",
+            net,
+            pd.Series(1.0, index=net.index),
+            252.0,
+            family=ready[0]["family"],
+            generation_source="provided_series_statistic",
+            search_cohort_id=claims[0].search_cohort_id,
+            search_denominator=claims[0].search_denominator,
+            preregistered_single_cohort=True,
+            log=False,
+        )
+    finally:
+        p7.LEDGER = old
+
+    assert claims[0].search_denominator == 1
+    assert claims[1].search_denominator == 1
+    assert set(rows["search_denominator"].astype(int)) == {1}
+    assert ready[0]["family"] != ready[1]["family"]
+    assert n_a == 1
+    assert bt["regime"] == {
+        "n_partitions": 0,
+        "fragile": False,
+        "provided_series_statistic": True,
+    }
+    assert bt["n_trials"] == 1
 
 
 def test_trial_stats_never_discounts_distinct_strategies_or_unrelated_family(tmp_path):

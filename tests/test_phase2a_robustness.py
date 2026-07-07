@@ -396,7 +396,7 @@ def test_fidelity_timeout_records_unknown_and_run_continues(tmp_path, monkeypatc
 
     calls = {"n": 0}
 
-    def fake_fidelity(claim, module_code):
+    def fake_fidelity(claim, module_code, spec=None):
         calls["n"] += 1
         if calls["n"] == 1:
             return {"faithful": True, "verified": True, "checked": True,

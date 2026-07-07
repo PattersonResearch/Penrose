@@ -2,11 +2,15 @@
 
 <img src="docs/assets/penrose-wordmark.png" alt="Penrose" width="100%"/>
 
-**An independent, power-aware falsification referee for quantitative trading claims.**
+**Penrose is independent peer review for trading strategies.**
 
-_Most edges don't survive. Penrose finds the few that do, and records why the rest didn't._
+_Anyone can produce a backtest that looks spectacular. Most are statistical mirages. Penrose rebuilds
+the strategy itself, stress-tests its evidence the way a skeptical reviewer would, and tells you
+whether the edge is real or just an artifact of how it was found. The same returns can be a genuine
+edge or a lucky fluke, depending on how many things you tried to get there. It never tells you what to
+trade; it tells you what not to believe._
 
-[![Version](https://img.shields.io/badge/version-0.4.1-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.4.2-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -16,52 +20,72 @@ _Most edges don't survive. Penrose finds the few that do, and records why the re
 
 ---
 
-Penrose is a **referee for quantitative research**. It is not a strategy generator and not a
-backtester. A backtester measures one strategy's returns and moves on. Penrose asks whether a claim's
-evidence can be believed at all, given how it was discovered, and it keeps what it learns. Every
-result becomes a durable, reusable **invalidation** that records what was tested, why it did not
-survive, and under what conditions. These accumulate into a slowly growing **corpus of
-invalidations**, a compounding map of what does not work that no single backtest can build. The rare
-claim that survives falsification is flagged for human review; the far more common case of invalidation is kept and investigated for principles (truths or patterns that are valuable despite the broader invalidation). Users can also invoke an experimental synthesis process in which the corpus is mined for connections between principles to form unconfirmed hypotheses to test, a speculative frontier sometimes
-referred to as [candidate alpha](#generating-candidate-alpha)<sup>[[8]](#references)[[9]](#references)</sup>.
+## The one thing most backtests ignore: how many strategies you tried
+
+If you test 500 ideas and show me only the best one, its spectacular numbers are mostly luck, not
+edge. Penrose counts the whole search behind a claim, not just the winner you present, and deflates
+the result accordingly. That single correction, the multiple-testing problem, is why most "amazing"
+backtests do not survive it. The same idea lets Penrose group related attempts into **strategy
+families** and charge every generated candidate to the shared search, so a machine that tries
+thousands of factors cannot launder luck into a "discovery."
+
+## For quants: what it actually does
+
+Penrose is an independent, power-aware falsification **referee for quantitative trading claims**. It
+is not a strategy generator and not a backtester. A backtester measures one strategy's returns and
+moves on; Penrose asks whether a claim's evidence can be believed at all, given how it was discovered,
+and it keeps what it learns. Every result becomes a durable, reusable **invalidation** that records
+what was tested, why it did not survive, and under what conditions. These accumulate into a growing
+**corpus of invalidations**, a compounding map of what does not work that no single backtest can
+build. The rare claim that survives falsification is flagged for human review; the far more common
+invalidation is kept and mined for **principles** (patterns that are valuable despite the broader
+failure). An experimental, opt-in synthesis process can mine the corpus for connections between those
+principles to form unconfirmed hypotheses to test, a speculative frontier sometimes called
+[candidate alpha](#generating-candidate-alpha)<sup>[[8]](#references)[[9]](#references)</sup>.
 
 In use, you give Penrose a claim, whether from a paper, a strategy generator, or yourself. It
 reconstructs the claim in a sandbox, tests it under a rigorous robustness stack, **validates its own
-detector**, and returns a calibrated [verdict](#verdicts). Penrose finds **no new alpha**, makes no promises to do so; verdicts should not be seen as financial advice or strategy endorsement. Its value is an honest, accumulating account of what does not survive proper testing,
-and the discipline to occasionally certify what does.
+detector**, and returns a calibrated [verdict](#verdicts). Penrose finds **no new alpha** and makes no
+promise to; verdicts are not financial advice or a strategy endorsement. Its value is an honest,
+accumulating account of what does not survive proper testing, and the discipline to occasionally
+certify what does.
 
 ---
 
 ## Features
 
-- **A full falsification stack, not a single statistic.** Each claim runs a gauntlet of independent
-  gates: PSR/DSR evidence scoped to the search Penrose has actually seen, three-fold sign stability,
-  a regime kill-lens, combinatorial purged cross-validation, a bootstrap edge interval, a permutation
-  test, walk-forward consistency, an opt-in tail-risk (widow-maker) check for bounded-up /
-  unbounded-down payoffs, cost and capacity modeling, and a single-use locked holdout. A single isolated family run is scored by
-  Probabilistic Sharpe plus the robustness stack; DSR deflation strengthens as the family or
-  generator ledger accumulates trials. See [docs/GATES.md](docs/GATES.md) for every gate in plain
-  language.
-- **A power-aware verdict taxonomy.** Every verdict ships a *minimum detectable effect*. A non-result
-  on under-powered data is labeled `underpowered`, not `kill`, so a rigorous skeptic is never mistaken
-  for a broken always-no machine. "We couldn't resolve it" never becomes "it's dead."
-- **A self-calibrated detector.** Before trusting any verdict, Penrose measures its own sensitivity
-  and specificity on real data: placebo, injected-edge, native-breadth, dead-state, persistence-matched,
-  and tail-risk (widow-maker) controls, plus a multi-null battery. See [docs/STRESS_TESTING.md](docs/STRESS_TESTING.md)
-  for the runnable stress controls. Almost no system validates its own detector.
-- **A discovery/confirmation firewall.** A single-use locked holdout confirms a survivor exactly once
-  and then burns, so nothing can be tuned against the confirmation set.
-- **A growing corpus of invalidations.** Every verdict becomes a durable, reusable record of what was
-  tested and why it failed, a compounding asset no single backtest can build. The corpus is mined for
-  recurring-failure principles and **contrastive** ones (where one strategy class survives a failure
-  mode that kills another), all advisory and never gating a new test.
-- **Referees any source.** Papers, your own theses, code-complete strategies, or machine-generated
-  hypotheses, all routed through the same pipeline, with generated candidates charged to the
-  multiple-testing denominator.
+- **A full falsification stack, not a single statistic.** Each gate targets a different way a backtest
+  can fool you, and a survivor has to clear all of them: evidence deflated for the whole search behind
+  the claim (PSR/DSR), sign stability across a three-way time split, robustness when its single best
+  market regime is dropped, purged cross-validation, a bootstrap confidence band on the edge, a shuffle
+  (permutation) test, walk-forward consistency, a default-on widow-maker check for bounded-up /
+  unbounded-down payoffs (small steady gains, rare large losses) that caps such a survivor at `watch`
+  and warns, realistic cost and capacity, and a one-time locked holdout. The deflated
+  Sharpe is the spine that accounts for the search, but it is one gate among many, never the verdict on
+  its own. See [docs/GATES.md](docs/GATES.md) for every gate in plain language.
+- **It separates "doesn't work" from "not enough data."** Every verdict reports the smallest edge the
+  data could have detected. When the claimed edge sits below that floor, the result is `underpowered`,
+  not `kill`, so a careful skeptic is never mistaken for a machine that just says no to everything.
+  "We couldn't resolve it" never becomes "it's dead."
+- **It proves it works before you trust it.** Before certifying anything, Penrose runs known-fake and
+  known-real strategies through the very same gates and checks it gets them right: noise must not pass
+  (placebo), a planted edge must be caught (injection), plus dead-state, native-breadth,
+  persistence-matched, and tail-risk controls and a multi-null battery. Almost nothing else validates
+  its own instrument. See [docs/STRESS_TESTING.md](docs/STRESS_TESTING.md) for the runnable controls.
+- **A one-time confirmation you cannot game.** The final check is a sealed slice of data used exactly
+  once. It confirms a survivor and then burns, so nothing, human or machine, can be quietly tuned until
+  it slips through.
+- **A compounding memory of what fails.** Every verdict is kept as a durable, reusable record of what
+  was tried and why it did not survive, so the map of dead ends grows in a way no single backtest can
+  build. Penrose mines it for recurring lessons and contrasting ones (where a failure mode that kills
+  one kind of strategy spares another), all advisory, never gating a new test.
+- **Referees any source, and charges the whole search.** Papers, your own theses, code-complete
+  strategies, or machine-generated hypotheses all run through the same pipeline, and a generator that
+  produces thousands of candidates is charged for the entire search, not just its best-looking one.
 - **Sandboxed and reproducible.** Untrusted generated code only ever runs inside a Docker sandbox, and
   evaluation paths are deterministic and seeded.
-- **Pennie, a corpus-grounded research assistant** that helps you shape a rough idea into a single
-  testable hypothesis ([see below](#pennie-your-research-assistant)).
+- **Pennie, a research assistant grounded in the corpus** that helps you shape a rough idea into a
+  single testable hypothesis ([see below](#pennie-your-research-assistant)).
 
 ## Why Penrose
 
@@ -103,7 +127,8 @@ multiple-testing denominator instead of letting the generator report only its fa
 The robustness stack: PSR/DSR scoped to the observed search, a single-use locked holdout,
 walk-forward, a regime kill-lens (it catches edges concentrated in one calendar/vol/trend regime)
 with an adherence-gated declared-regime scope, combinatorial purged cross-validation, bootstrap edge
-CI, a permutation test, an opt-in tail-risk gate, capacity/impact, a fee curve, and a fidelity check
+CI, a permutation test, a default-on tail-risk (widow-maker) gate that caps a bounded-up/unbounded-down
+survivor at `watch` and warns (hard-kill is opt-in), capacity/impact, a fee curve, and a fidelity check
 that the code faithfully tests the claim. Input series are also frequency-checked at the data boundary
 (so intraday data can never be silently treated as daily); data adapters include keyless crypto and
 equity venues plus bring-your-own futures and Tiingo IEX intraday adapters. Tiingo IEX is price-only
@@ -185,7 +210,7 @@ pip install -e .             # editable: Penrose runs the scripts that ship in t
 jupyter notebook notebooks/penrose_demo.ipynb
 
 # or from the command line (no key needed):
-penrose eval                 # ground-truth: planted strategies with known verdicts (97/97)
+penrose eval                 # ground-truth: planted strategies with known verdicts (101/101)
 python scripts/worked_example_process_conditional.py  # start here: identical returns, opposite verdicts by search scope
 make calib-nulls            # the 5-null specificity battery (0/300)
 make calib-sensitivity      # the detection-threshold sweep
@@ -202,6 +227,23 @@ The core (`eval`, `calib-*`, `connections`) runs on `pip install -e .` alone, wi
 external data. The full pipeline (ingesting a paper) and the literature/generator experiments need a
 model key and/or a data download; the notebook walks through both. Commands that need a key fail with a
 clear message, never a crash, if one is not set.
+
+### Model configuration
+
+Every model-backed stage (extraction, spec generation, implementation, fidelity) talks to one
+**OpenAI-compatible** endpoint through a single seam, so any compatible provider works with no code
+change. It defaults to **GLM (`glm-5.2`)** — an inexpensive, capable model that runs the whole pipeline
+well, so an agent or a batch job can referee at low cost. Three environment variables configure it:
+
+```bash
+export PENROSE_LLM_API_KEY=...                     # your provider key
+export PENROSE_LLM_BASE_URL=https://api.z.ai/...   # any OpenAI-compatible endpoint (z.ai, OpenAI, Ollama, LiteLLM, ...)
+export PENROSE_LLM_DEFAULT_MODEL=glm-5.2           # optional; defaults to glm-5.2
+```
+
+For a genuinely independent fidelity check (a different model judging the reconstruction), also set
+`PENROSE_LLM_VERIFIER_MODEL` / `PENROSE_LLM_VERIFIER_BASE_URL` / `PENROSE_LLM_VERIFIER_API_KEY`; unset,
+the check falls back to the default provider and each result records whether it was independent.
 
 ## MCP server (optional)
 
@@ -302,9 +344,12 @@ scoring. No external embedding service is required.
 - **Reconstruction fidelity** is the central risk for prose inputs ("you tested a broken approximation
   of my strategy"), and a depreciating moat as foundation models improve. The strongest use is
   refereeing *code-complete* candidates, where this risk disappears.
-- **Claim-type routing is English keyword-based.** Claims are routed (descriptive-statistical vs
-  trading-strategy vs structural) by English-text cues; non-English or unusually phrased claims fall
-  through to the `trading_strategy` default. That fail-open is conservative (tested as a strategy, not
+- **Claim-type routing is English keyword-based.** Claims are routed (descriptive-statistical,
+  trading-strategy, provided-series-statistic, or structural) by English-text cues; non-English or
+  unusually phrased claims fall through to the `trading_strategy` default. A provided-series claim (one
+  that supplies its own pre-computed statistic series) is executed deterministically and, because its
+  construction is supplied rather than reproduced, is capped at `watch` until reconstructed from
+  primitives. That fail-open is conservative (tested as a strategy, not
   mis-specialized), never a crash.
 - **Deflation is not magic on the first look.** On the first single-claim run in a family, DSR is
   effectively PSR; deflation engages as Penrose sees multiple trials, registered generator
@@ -329,6 +374,38 @@ scoring. No external embedding service is required.
 
 See [ROADMAP.md](ROADMAP.md) for where this is going, and [AGENTS.md](AGENTS.md) if you are pointing a
 coding agent at the repo.
+
+## FAQ
+
+**Does Penrose need an LLM to run?** Only to referee a real claim. The keyless core — `penrose eval`,
+the calibration batteries, `connections`, and the worked example — runs with no API key and no network,
+because it uses planted strategies with known code and has nothing to reconstruct. Refereeing an actual
+claim uses a model for the reconstruction stages: extraction from prose, spec generation, module
+implementation, and the fidelity check. The deterministic **provided-series** path is the exception — it
+tests a supplied statistic series with no generated code.
+
+**Is the pipeline's model the same as an agent that drives Penrose?** No — they are separate roles. The
+pipeline's *internal* model (`PENROSE_LLM_DEFAULT_MODEL`, default `glm-5.2`) is called programmatically
+inside the stages to reconstruct a claim. An *external* agent — via the CLI, a runner script, or the MCP
+`penrose_run_claim` tool — operates Penrose from the outside: it submits claims and reads verdicts, and
+never touches the reconstruction. They can be, and usually are, different models (an orchestrating agent
+can be one model while the pipeline uses cheap `glm-5.2` internally), and you can drive Penrose entirely
+by hand with the CLI and use no external agent at all.
+
+**Does it need more than one model provider?** No. One OpenAI-compatible provider runs the whole
+pipeline. A *second, independent* provider is optional and affects only one gate: point the fidelity
+check at a different model (`PENROSE_LLM_VERIFIER_MODEL` / `_BASE_URL` / `_API_KEY`) so a reconstruction
+is not graded by the model that wrote it. Unset, the check falls back to the default provider and each
+verdict records whether it was independent.
+
+**Which model should I use?** The default is `glm-5.2` — cheap enough to run the full pipeline
+unattended and capable enough for the reconstruction and fidelity stages. Any OpenAI-compatible endpoint
+works (see [Model configuration](#model-configuration)); use a stronger model when reconstruction
+fidelity on difficult prose claims matters more than cost.
+
+**Do I need a GPU or any special hardware?** No. Penrose orchestrates and evaluates; the model runs
+wherever your endpoint is (a hosted API or a local server). Untrusted generated code runs in a Docker
+sandbox, so Docker is required for the reconstruction path but no GPU is.
 
 
 ## Why is it called Penrose?

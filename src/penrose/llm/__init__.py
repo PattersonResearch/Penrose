@@ -14,9 +14,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -142,12 +143,22 @@ class OpenAICompatProvider:
                      "User-Agent": "penrose/0.2"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode())
-        except urllib.error.HTTPError as e:
-            err = e.read().decode()[:500] if hasattr(e, "read") else str(e)
-            raise RuntimeError(f"LLM HTTP {e.code}: {err}") from e
+        last_err = None
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    data = json.loads(r.read().decode())
+                break
+            except urllib.error.HTTPError as e:
+                err = e.read().decode()[:500] if hasattr(e, "read") else str(e)
+                raise RuntimeError(f"LLM HTTP {e.code}: {err}") from e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_err = e
+                if attempt == 0:
+                    continue
+                raise
+        else:
+            raise last_err or RuntimeError("LLM request failed")
 
         usage = data.get("usage", {})
         choice = (data.get("choices") or [{}])[0]
@@ -254,6 +265,10 @@ def call(role: str, messages: list[dict], *,
 
     t0 = time.time()
     verifier_fallback = False
+    request_extra_body = dict(extra_body or {})
+    # glm-5.2 and similar thinking models may otherwise spend the content budget on
+    # hidden reasoning. Providers that ignore this extension should harmlessly no-op.
+    request_extra_body.setdefault("thinking", {"type": "disabled"})
     try:
         payload = provider.complete(
             model, messages,
@@ -261,7 +276,7 @@ def call(role: str, messages: list[dict], *,
             temperature=temperature,
             response_format={"type": "json_object"} if json_mode else None,
             timeout=timeout,
-            extra_body=extra_body,
+            extra_body=request_extra_body,
         )
     except Exception:  # noqa: BLE001 - verifier provider must degrade to the default path
         if role != "fidelity_refuter" or not verifier_provider_configured:
@@ -274,7 +289,7 @@ def call(role: str, messages: list[dict], *,
             temperature=temperature,
             response_format={"type": "json_object"} if json_mode else None,
             timeout=timeout,
-            extra_body=extra_body,
+            extra_body=request_extra_body,
         )
     elapsed = time.time() - t0
     cost = _estimate_cost(payload["model"], payload["in_tokens"], payload["out_tokens"])
@@ -303,21 +318,78 @@ def call(role: str, messages: list[dict], *,
     return resp
 
 
-def _parse_or_repair(text: str):
-    """Return a parsed dict from JSON text, attempting a truncation repair, else None."""
+def _strip_json_fences(text: str) -> str:
     txt = (text or "").strip()
+    if txt.startswith("```"):
+        txt = re.sub(r"^```[a-zA-Z0-9_+\-]*\s*", "", txt, count=1).strip()
+        txt = re.sub(r"\s*```$", "", txt, count=1).strip()
+    return txt
+
+
+def _outermost_json_object(text: str) -> str | None:
+    """Extract the first complete outermost JSON object/array from noisy model text."""
+    s = _strip_json_fences(text)
+    start = -1
+    opener = ""
+    for i, ch in enumerate(s):
+        if ch in "{[":
+            start, opener = i, ch
+            break
+    if start < 0:
+        return None
+    closer = "}" if opener == "{" else "]"
+    stack = []
+    in_str = False
+    escaped = False
+    for i, ch in enumerate(s[start:], start):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None
+            expected = "}" if stack[-1] == "{" else "]"
+            if ch != expected:
+                return None
+            stack.pop()
+            if not stack:
+                return s[start:i + 1]
+    if closer and stack:
+        return s[start:]
+    return None
+
+
+def _lenient_json(text: str):
+    txt = _strip_json_fences(text)
     if not txt:
         return None
-    try:
-        return json.loads(txt)
-    except json.JSONDecodeError:
-        repaired = _repair_truncated_json(text)
-        if repaired:
-            try:
-                return json.loads(repaired)
-            except json.JSONDecodeError:
-                return None
+    for candidate in (txt, _outermost_json_object(txt)):
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            repaired = _repair_truncated_json(candidate)
+            if repaired:
+                try:
+                    return json.loads(repaired)
+                except json.JSONDecodeError:
+                    pass
     return None
+
+
+def _parse_or_repair(text: str):
+    """Return a parsed dict from JSON text, attempting a truncation repair, else None."""
+    return _lenient_json(text)
 
 
 def call_json(role: str, messages: list[dict], *, _max_attempts: int = 3,

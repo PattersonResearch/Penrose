@@ -9,11 +9,15 @@ import math
 import sys
 
 import numpy as np
-from scipy.stats import norm
+try:
+    from scipy.stats import norm
+except ModuleNotFoundError:
+    norm = None
 
 from .. import config
 from ..brain import Claim, Decision, Principle, BrainReader, source_is_unanchored
 from .. import stats as H        # vendored DSR/Sharpe/capacity — penrose is self-contained
+from . import fidelity_memory
 
 
 def _genuine_cscv_pbo(candidate_oos_series, cpcv: dict) -> float | None:
@@ -60,6 +64,12 @@ def _genuine_cscv_pbo(candidate_oos_series, cpcv: dict) -> float | None:
     if not logits:
         return None
     return round(sum(1 for x in logits if x < 0.0) / len(logits), 4)
+
+
+def _require_scipy(feature: str):
+    if norm is None:
+        raise RuntimeError(f"pip install scipy required for {feature}")
+    return norm
 
 
 def _power_resolution(n_oos, bars_per_year, mde_ic, pw: dict) -> dict | None:
@@ -269,6 +279,12 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     folds = bt.get("three_fold", {})
     cap = bt.get("capacity_usd")
     band = config.DSR_DECISION
+    claim_type = str(bt.get("claim_type") or "")
+    if not claim_type:
+        try:
+            claim_type = fidelity_memory.classify_claim_type(claim)
+        except Exception:  # noqa: BLE001 - verdict caps must fail closed to legacy behavior
+            claim_type = "trading_strategy"
 
     # --- POWER: how small an edge could THIS backtest even resolve? ----------------------------
     # MDE (min detectable IC) ~ z/sqrt(n_oos): the smallest per-bar Sharpe (~= IC for a single-asset
@@ -306,7 +322,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     # retained only for the decision record, not for gating.
     ic_ref = pw["realistic_ic_floor"]
     three_fold_power = (
-        math.prod(norm.cdf(ic_ref * math.sqrt(n)) for n in fold_ns)
+        math.prod(_require_scipy("P8 three-fold power").cdf(ic_ref * math.sqrt(n)) for n in fold_ns)
         if len(fold_ns) == 3 and all(n >= 5 for n in fold_ns)
         else None
     )
@@ -393,40 +409,63 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                     f"CPCV overfit: prob_oos_loss={cpcv.get('prob_oos_loss')}, "
                     f"median_oos_sharpe={cpcv.get('median_oos_sharpe')}, "
                     f"combos={cpcv.get('combos_used')}")
+
+    # Trust/tail caps are independent and all must remain VISIBLE. Capture whether the statistical
+    # path reached the strongest verdict BEFORE any cap (tail or trust); otherwise the first cap
+    # hides the others' messages in reports and review.
+    reached_research_supported = verdict == "research-supported"
+
+    trg = getattr(config, "TAIL_RISK_GATE", {"enabled": False})
+    tail = bt.get("tail") or {}
+    tail_asymmetric = bool(trg.get("enabled") and tail.get("asymmetric"))
+    if tail_asymmetric:
+        warning = (
+            f"tail-asymmetric widow-maker warning: bounded-up/unbounded-down payoff "
+            f"(skew={tail.get('skew')}, tail_ratio={tail.get('tail_ratio')}, "
+            f"max_loss={tail.get('max_loss')})"
+        )
+        if claim_type == "provided_series_statistic":
+            warning += (
+                "; provided-series caveat: tested series is pre-aggregated, so per-trade "
+                "and cross-unit portfolio tail risk is understated; true tail risk requires "
+                "per-trade reconstruction"
+            )
+        reasons.append(warning)
+        # J-1: the warning stands for ANY verdict, but only CHANGE the verdict for a current
+        # survivor. Never overwrite a prior structural kill, insufficient_data routing, or the
+        # power-aware underpowered relabel (those are decided upstream and must stand).
+        if verdict in ("watch", "research-supported"):
+            if trg.get("cap_only"):
+                if verdict == "research-supported":
+                    verdict = "watch"
+                    reasons.append("tail-asymmetric: capped to watch")
             else:
-                trg = getattr(config, "TAIL_RISK_GATE", {"enabled": False})
-                tail = bt.get("tail") or {}
-                if trg.get("enabled") and tail.get("asymmetric"):
-                    if trg.get("cap_only"):
-                        if verdict == "research-supported":
-                            verdict = "watch"
-                            reasons.append(
-                                f"tail-asymmetric: capped to watch (skew={tail.get('skew')}, "
-                                f"tail_ratio={tail.get('tail_ratio')})")
-                    else:
-                        verdict, kill = "kill", "tail_asymmetric"
-                        reasons.append(
-                            f"tail_asymmetric: bounded-up/unbounded-down payoff "
-                            f"(skew={tail.get('skew')}, tail_ratio={tail.get('tail_ratio')}, "
-                            f"max_loss={tail.get('max_loss')})")
+                verdict, kill = "kill", "tail_asymmetric"
 
     if cap is None and verdict in ("watch", "research-supported"):
         reasons.append("capacity not estimable")
 
-    # Trust caps are independent and all must remain visible. Capture whether the statistical path
-    # reached the strongest verdict before applying either cap; otherwise the first cap hides the
-    # second one in reports and review.
-    reached_research_supported = verdict == "research-supported"
     source_type = getattr(claim, "source_type", "external_source")
     unanchored = source_is_unanchored(source_type)
     fidelity_provenance = "self-authored-unanchored" if unanchored else "external-source"
-    if reached_research_supported and getattr(config, "COST_PROVENANCE", "modeled") != "measured":
+    # `verdict != "kill"` guards against a cap un-killing a claim the tail gate (cap_only=False)
+    # just killed; the message-visibility is preserved via reached_research_supported.
+    if reached_research_supported and verdict != "kill" and getattr(config, "COST_PROVENANCE", "modeled") != "measured":
         verdict = "watch"
         reasons.append("costs/capacity are MODELED placeholders — capped at watch until measured (E2)")
-    if reached_research_supported and unanchored:
+    if reached_research_supported and verdict != "kill" and unanchored:
         verdict = "watch"
         reasons.append(f"{source_type} lacks an external anchor — capped at watch until "
                        "independent forward/external confirmation")
+    provided_series_provenance = (
+        "unverified_construction" if claim_type == "provided_series_statistic" else None
+    )
+    if claim_type == "provided_series_statistic" and verdict in ("watch", "research-supported"):
+        if verdict == "research-supported":
+            verdict = "watch"
+        reasons.append(
+            "provided-series claim: Penrose tests a pre-computed series it did not construct; "
+            "capped at watch/provisional pending primitive reconstruction (EXP-2)")
     post_sample_missing = False
     ps = bt.get("post_sample") or {}
     post_cfg = getattr(config, "POST_SAMPLE", {})
@@ -518,6 +557,10 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "three_fold": folds.get("folds"), "n_trades": bt.get("n"),
                  "bootstrap": boot, "permutation": perm, "regime": regime,
                  "tail": bt.get("tail"),
+                 "tail_asymmetric": tail_asymmetric,
+                 "tail_skew": tail.get("skew"),
+                 "tail_tail_ratio": tail.get("tail_ratio"),
+                 "tail_max_loss": tail.get("max_loss"),
                  "cpcv": cpcv,
                  "capacity_ci": bt.get("capacity_ci"),
                  "cost_sensitivity": bt.get("cost_sensitivity"),
@@ -525,6 +568,8 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "declared_regime": declared_regime,
                  "regime_adherence": regime.get("adherence"),
                  "fidelity_provenance": fidelity_provenance,
+                 "provided_series_provenance": provided_series_provenance,
+                 "claim_type": claim_type,
                  "holdout": holdout, "synthetic_signal": synthetic},
         revisit_at="2026-07-01",
     )
