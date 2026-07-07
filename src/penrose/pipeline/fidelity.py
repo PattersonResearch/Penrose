@@ -54,6 +54,15 @@ _PROVIDED_SERIES_STATISTIC_GUIDANCE = (
     "declared series, (2) exact stated statistic/decision rule, (3) no added gates."
 )
 
+_EVENT_MARKET_STRATEGY_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=event_market_strategy. This pass uses a "
+    "deterministic declared-model module, not LLM-generated pricing code. A spec/module "
+    "is structurally faithful when it loads the declared settled bracket table, uses an "
+    "allowed declared pricing family such as normal_bracket, and applies the declared "
+    "entry/sizing parameters through the event-market backtest. Defer new "
+    "LLM-reconstruction fidelity for arbitrary pricing formulas to the later milestone."
+)
+
 _USER_TMPL = """CLAIM (verbatim): {statement}
 MECHANISM: {mechanism}
 SPEC signal_logic: {signal_logic}
@@ -110,8 +119,11 @@ def assess(claim, module_code: str, spec: dict | None = None,
             claim_type = fidelity_memory.classify_claim_type(claim)
         except Exception:  # noqa: BLE001 - prompt specialization must fail closed to the default
             claim_type = ""
-    system = _SYSTEM + (_PROVIDED_SERIES_STATISTIC_GUIDANCE
-                        if claim_type == "provided_series_statistic" else "")
+    system = _SYSTEM
+    if claim_type == "provided_series_statistic":
+        system += _PROVIDED_SERIES_STATISTIC_GUIDANCE
+    elif claim_type == "event_market_strategy":
+        system += _EVENT_MARKET_STRATEGY_GUIDANCE
     try:
         parsed, response = llm.call_json(
             role,
@@ -132,7 +144,8 @@ def assess(claim, module_code: str, spec: dict | None = None,
             "note": str(parsed.get("note", ""))[:240],
             "independent_verifier": bool(getattr(response, "independent_verifier", False)),
         }
-        return _provided_series_statistic_backstop(result, claim_type, spec)
+        result = _provided_series_statistic_backstop(result, claim_type, spec)
+        return _event_market_strategy_backstop(result, claim_type, spec)
     except Exception as e:  # noqa: BLE001 — inconclusive is contained, never promoted to faithful
         return {"faithful": False, "verified": False, "confidence": 0.0, "divergences": [],
                 "note": f"fidelity check errored: {e}", "independent_verifier": False}
@@ -239,6 +252,51 @@ def _provided_series_statistic_backstop(result: dict, claim_type: str,
         "provided_series_statistic fidelity block overridden structurally: deterministic "
         "template with declared inputs and no added gate fields; construction provenance "
         "remains verdict-capped"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _is_deterministic_event_market_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "event_market_strategy":
+        return False
+    cfg = spec.get("event_market") if isinstance(spec.get("event_market"), dict) else spec
+    has_table = any(cfg.get(k) for k in ("path", "table", "table_path",
+                                         "event_market_path", "event_market_table"))
+    pricing = spec.get("pricing_model") or spec.get("pricing") or spec.get("model") or {}
+    if isinstance(pricing, dict):
+        family = str(pricing.get("family") or pricing.get("model") or "")
+    else:
+        family = str(pricing or "")
+    # M-1: mirror the provided_series discipline — DENY the structural override if the spec carries an
+    # added gate (significance/alpha/bonferroni/threshold/min_observations/...) that the deterministic
+    # normal_bracket executor silently drops. A stated-but-dropped gate is a REAL fidelity divergence,
+    # not a construction cap, so the refuter's unfaithful verdict must stand. (These markers do not
+    # collide with the legit event-market fields min_ev/max_price/kelly_fraction/size_cap/pricing params.)
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return has_table and family.strip() == "normal_bracket"
+
+
+def _event_market_strategy_backstop(result: dict, claim_type: str,
+                                    spec: dict | None = None) -> dict:
+    if claim_type != "event_market_strategy" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_event_market_spec(spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["event_market_fidelity_override"] = "deterministic_declared_model_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "event_market_strategy fidelity block overridden structurally: deterministic "
+        "normal_bracket pricing over a declared bracket table; arbitrary pricing-formula "
+        "fidelity is deferred"
     )
     out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
     return out

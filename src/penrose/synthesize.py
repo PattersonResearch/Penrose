@@ -5,8 +5,10 @@ population and runs discovery with the production holdout physically read-only.
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,7 +24,17 @@ from .dream import (_atomic_json, _read_jsonl, _snapshot_hash, _validate_run_id,
 
 _SYSTEM = """You synthesize candidate quantitative-research families from a leveled corpus.
 You propose; you never certify. Ground every component in supplied node ids and boundaries.
-Return the complete requested population as strict JSON. Never use or request confirmation data."""
+Return the complete requested population as strict JSON. Never use or request confirmation data.
+Each candidate must keep the prose fields and also include a structured, buildable spec object:
+- signal: an explicit expression using only named catalog series from the supplied capabilities and
+  named params, e.g. "zscore(funding_btc, window) - ma(funding_btc, window2)".
+- series: exact catalog series names used by signal; every name must come from capabilities.
+- params: named parameter values.
+- param_grid: a prior parameter grid with reasonable ranges for every tunable param, not a single
+  tuned point, e.g. {"window":[10,20,60]}.
+- conditioning: an explicit regime/condition rule, or null.
+- entry_exit: explicit entry and exit rules.
+- horizon: holding horizon."""
 
 _USER = """Create exactly {n} distinct candidate strategy families from these family principles
 and cross-family mechanisms:
@@ -31,10 +43,38 @@ and cross-family mechanisms:
 Capabilities:
 {capabilities}
 
+Allowed capability series names:
+{capability_series}
+
+Use ONLY the allowed capability series names in spec.series and spec.signal.
+
 Return {{"candidates":[{{"statement":"falsifiable claim","mechanism":"tentative mechanism",
 "scope":"market/universe","horizon":"measurable horizon","strategy_class":"class",
 "candidate_class":"testable_now|testable_with_new_module|requires_data_acquisition|conceptual_only",
-"required_series":[],"inspired_by":["node ids"],"boundaries":[],"falsifier":"specific rejection"}}]}}."""
+"required_series":[],"inspired_by":["node ids"],"boundaries":[],"falsifier":"specific rejection",
+"spec":{{"signal":"expression using allowed series and params","series":["allowed_series_name"],
+"params":{{"param_name":20}},"param_grid":{{"param_name":[10,20,60]}},
+"conditioning":null,"entry_exit":"explicit entry and exit rules","horizon":"holding horizon"}}}}]}}."""
+
+_REQUIRED_SPEC_FIELDS = ("signal", "series", "params", "param_grid", "entry_exit", "horizon")
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SIGNAL_FUNCTIONS = frozenset({
+    "abs", "clip", "corr", "cov", "diff", "ema", "ewm", "lag", "log", "ma", "max", "mean",
+    "min", "pct_change", "rank", "ratio", "sign", "sma", "std", "sum", "vol", "zscore",
+    # N-2: the reconstructor (LLM code-gen) can implement any pandas/numpy function, so the gate must
+    # not be narrower than it. Add common, unambiguously-implementable ones so legitimate candidate
+    # families are not silently dropped.
+    "median", "var", "quantile", "exp", "sqrt", "cumsum", "cumprod", "skew", "kurt",
+    "shift", "winsorize", "demean", "tanh", "roll", "cbrt",
+})
+# N-1: functions that require a series AND a second arg (window/period). A call with too few args is
+# a malformed signal that would break reconstruction; reject it at admission. Functions not listed
+# (abs/sign/log/exp/sqrt/clip/cumsum/...) accept any arity.
+_FUNCTION_MIN_ARGS = {
+    "zscore": 2, "ma": 2, "sma": 2, "ema": 2, "ewm": 2, "std": 2, "var": 2, "vol": 2, "lag": 2,
+    "shift": 2, "diff": 2, "pct_change": 2, "rank": 2, "sum": 2, "corr": 2, "cov": 2, "ratio": 2,
+    "median": 2, "quantile": 2, "roll": 2,
+}
 
 
 def _now() -> str:
@@ -45,6 +85,94 @@ def _inputs(graph: dict) -> dict:
     nodes = [n for n in graph.get("nodes", [])
              if n.get("level") in {"family_principle", "cross_family_mechanism"}]
     return {"nodes": nodes, "snapshot_hash": _snapshot_hash(nodes)}
+
+
+def _capability_series_names(capabilities: object) -> set[str]:
+    if not isinstance(capabilities, dict):
+        return set()
+    raw = capabilities.get("series")
+    if isinstance(raw, dict):
+        return {str(k) for k in raw if str(k).strip()}
+    if isinstance(raw, (list, tuple, set)):
+        return {str(x) for x in raw if str(x).strip()}
+    return set()
+
+
+def _present(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
+def _reconstructability(item: dict, capabilities: object | None) -> tuple[bool, str]:
+    spec = item.get("spec")
+    if not isinstance(spec, dict):
+        return False, "missing spec"
+
+    for field in _REQUIRED_SPEC_FIELDS:
+        if not _present(spec.get(field)):
+            return False, f"missing spec.{field}"
+
+    signal = spec.get("signal")
+    if not isinstance(signal, str) or not signal.strip():
+        return False, "spec.signal must be a non-empty string"
+
+    series = spec.get("series")
+    if not isinstance(series, list) or not all(isinstance(x, str) and x.strip() for x in series):
+        return False, "spec.series must be a non-empty list of names"
+    series_names = {x.strip() for x in series}
+
+    params = spec.get("params")
+    # N-1(c): param VALUES must be numeric, not just the keys — a non-numeric/None value breaks code-gen.
+    if not isinstance(params, dict) or not params or not all(
+        isinstance(k, str) and k.strip()
+        and isinstance(v, (int, float)) and not isinstance(v, bool)
+        for k, v in params.items()
+    ):
+        return False, "spec.params must map named params to numeric values"
+
+    param_grid = spec.get("param_grid")
+    if not isinstance(param_grid, dict) or not all(
+        isinstance(k, str) and k.strip()
+        and isinstance(v, (list, tuple, set)) and _present(v)
+        for k, v in param_grid.items()
+    ):
+        return False, "spec.param_grid must be an object with non-empty ranges"
+    # N-1(d): the grid may only vary DECLARED params — gridding an undeclared param while pinning the
+    # real one to a single tuned point defeats the from-priors-grid promise (and feeds #58 a bad grid).
+    if not set(param_grid) <= set(params):
+        return False, "spec.param_grid grids a param not declared in spec.params"
+
+    allowed_series = _capability_series_names(capabilities)
+    if allowed_series:
+        unknown = sorted(series_names - allowed_series)
+        if unknown:
+            return False, f"unknown series: {', '.join(unknown[:5])}"
+
+    # N-1(a/b/e): the signal must be a well-formed EXPRESSION (not a bare identifier or malformed
+    # string), every identifier declared, and known window-functions must meet their required arity —
+    # so a syntactically-valid-but-vacuous signal can't be admitted and then pending_module downstream.
+    try:
+        tree = ast.parse(signal.strip(), mode="eval")
+    except SyntaxError:
+        return False, "spec.signal is not a valid expression"
+    if isinstance(tree.body, (ast.Name, ast.Constant)):
+        return False, "spec.signal is a bare identifier/constant, not an operation on the series"
+    allowed_signal_names = series_names | {k.strip() for k in params}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Name) and node.id not in allowed_signal_names
+                and node.id not in _SIGNAL_FUNCTIONS):
+            return False, f"undeclared signal identifier: {node.id}"
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            need = _FUNCTION_MIN_ARGS.get(node.func.id)
+            if need is not None and len(node.args) < need:
+                return False, f"signal function {node.func.id}() needs >= {need} args"
+
+    return True, ""
 
 
 def _upsert_synthesis_summary(payload: dict) -> None:
@@ -64,8 +192,10 @@ def _upsert_synthesis_summary(payload: dict) -> None:
 
 
 def generate(n: int, corpus: dict, capabilities: dict) -> tuple[list[dict], dict]:
+    capability_series = sorted(_capability_series_names(capabilities))
     user = _USER.format(n=n, corpus=json.dumps(corpus, indent=2)[:14000],
-                        capabilities=json.dumps(capabilities, indent=2)[:6000])
+                        capabilities=json.dumps(capabilities, indent=2)[:6000],
+                        capability_series=json.dumps(capability_series, indent=2)[:6000])
     parsed, resp = llm.call_json(
         "synthesizer", [{"role": "system", "content": _SYSTEM},
                         {"role": "user", "content": user}],
@@ -77,7 +207,8 @@ def generate(n: int, corpus: dict, capabilities: dict) -> tuple[list[dict], dict
                   "cost_usd": round(resp.cost_usd, 5)}
 
 
-def normalize(run_id: str, raw: list[dict], graph: dict) -> tuple[list[Claim], list[dict]]:
+def normalize(run_id: str, raw: list[dict], graph: dict,
+              capabilities: object | None = None) -> tuple[list[Claim], list[dict]]:
     node_map = {n.get("node_id"): n for n in graph.get("nodes", [])}
     valid_nodes = set(node_map)
     claims, normalized, seen = [], [], set()
@@ -96,6 +227,7 @@ def normalize(run_id: str, raw: list[dict], graph: dict) -> tuple[list[Claim], l
         grounded = bool(inspirations)
         duplicate = statement.lower() in seen
         seen.add(statement.lower())
+        reconstructable, reconstructable_reason = _reconstructability(item, capabilities)
         claim_id = f"{run_id}-c{i:03d}"
         claim = Claim(
             claim_id=claim_id, statement=statement,
@@ -106,11 +238,14 @@ def normalize(run_id: str, raw: list[dict], graph: dict) -> tuple[list[Claim], l
             source_type="synthesized_hypothesis", search_cohort_id=run_id,
             raw_hypothesis_id=f"{run_id}-raw-{i:03d}",
             data_provenance=lineage)
-        admitted = grounded and not duplicate and klass in {"testable_now", "testable_with_new_module"}
+        admitted = (grounded and not duplicate and reconstructable
+                    and klass in {"testable_now", "testable_with_new_module"})
         claims.append(claim)
         normalized.append({"raw_hypothesis_id": claim.raw_hypothesis_id, "claim_id": claim_id,
                            "raw": item, "candidate_class": klass, "grounded": grounded,
-                           "duplicate_in_run": duplicate, "admitted": admitted,
+                           "duplicate_in_run": duplicate, "reconstructable": reconstructable,
+                           "reconstructable_reason": reconstructable_reason,
+                           "admitted": admitted,
                            "data_provenance": lineage})
     return claims, normalized
 
@@ -167,7 +302,7 @@ def run_synthesis(*, n: int = 10, generate_only: bool = False,
             manifest["generation_provenance"] = prov
             manifest = record_candidates(manifest, raw)
         graph = {"nodes": corpus.get("nodes", [])}
-        claims, normalized = normalize(run_id, raw, graph)
+        claims, normalized = normalize(run_id, raw, graph, caps)
         manifest = register_search(manifest, claims, normalized)
         manifest["source_type"] = "synthesized_hypothesis"
         source = _source(root, run_id, normalized)

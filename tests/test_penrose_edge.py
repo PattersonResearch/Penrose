@@ -49,7 +49,12 @@ def test_synthesized_source_is_capped_and_population_registered(tmp_path):
     from penrose.synthesize import normalize
     graph = {"nodes": [{"node_id": "m1", "level": "cross_family_mechanism"}]}
     raw = [{"statement": "candidate", "strategy_class": "x",
-            "candidate_class": "testable_now", "inspired_by": ["m1"]},
+            "candidate_class": "testable_now", "inspired_by": ["m1"],
+            "spec": {"signal": "zscore(edge_series, window)", "series": ["edge_series"],
+                     "params": {"window": 20}, "param_grid": {"window": [10, 20, 60]},
+                     "conditioning": None,
+                     "entry_exit": "enter when signal > 1; exit after horizon",
+                     "horizon": "1d"}},
            {"statement": "blocked", "strategy_class": "x",
             "candidate_class": "conceptual_only", "inspired_by": ["m1"]}]
     claims, norm = normalize("s", raw, graph)

@@ -1,7 +1,7 @@
 # How Penrose is stress-tested
 
 A research referee is only as trustworthy as its own discipline. Penrose is built so its checks can be
-*verified*, not just asserted. This page summarizes how the system is calibrated and adversarially reviewed.
+*verified*, not just asserted. This page summarizes how the system is calibrated and verified.
 The relevant scripts are in `scripts/` and run on a clean, keyless install.
 
 ## It proves it has power before it claims anything
@@ -19,13 +19,12 @@ The relevant scripts are in `scripts/` and run on a clean, keyless install.
   runnable (`scripts/worked_example_process_conditional.py`). This is the cleanest demonstration of why
   Penrose is not a backtester, and it runs with no network, key, or data.
 
-## It is reviewed adversarially, not just written
+## It is verified before every release
 
-Changes are pushed through a build → independent-review → correct loop, where reviewers (including a separate
-model and direct re-execution of the real pipeline) try to *refute* each result before it is accepted.
-Findings are reproduced from the code, not taken on faith; controls that turn out to be no-ops are fixed.
-Several real defects — a search that silently hid committed results, a "demonstration" whose claimed verdict
-did not survive the real pipeline — were caught and closed this way before release.
+Every change is checked against the calibration suite and the real pipeline before it ships; controls
+that turn out to be no-ops are fixed, not left in place. Several real defects — a search that silently
+hid committed results, a "demonstration" whose claimed verdict did not survive the real pipeline — were
+caught and closed this way before release.
 
 ## What this does and does not establish
 

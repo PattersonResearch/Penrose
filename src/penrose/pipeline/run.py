@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import copy
 import fcntl
 import functools
 import hashlib
@@ -20,8 +21,11 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +34,7 @@ import pandas as pd
 
 from .. import config
 from .. import regime as regime_lib
+from .. import worker_control
 from ..brain import BrainReader, Claim, source_is_unanchored, validate_source_type
 from ..data import client as dataclient
 from ..report import write_report
@@ -38,24 +43,154 @@ from . import stages, p7_backtest
 # here — a fresh clone has no claims.py. extract.fallback_claims loads it lazily when present.
 from . import (
     p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox,
-    fidelity_memory, provided_series,
+    fidelity_memory, provided_series, event_market, robustness,
 )
+
+MAX_CLAIM_WORKERS = worker_control.MAX_REQUESTED_WORKERS
+_JSONL_DEFER = threading.local()
+_JSONL_WRITE_LOCK = threading.Lock()
+_PROGRESS_LOCK = threading.Lock()
+_HOLDOUT_LOCK = threading.Lock()
+_REGISTRY_LOCK = threading.Lock()
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+@contextmanager
+def _defer_jsonl_events():
+    prior = getattr(_JSONL_DEFER, "events", None)
+    events: list[tuple[Path, dict]] = []
+    _JSONL_DEFER.events = events
+    try:
+        yield events
+    finally:
+        _JSONL_DEFER.events = prior
+
+
 def _append_jsonl(path, obj) -> None:
+    deferred = getattr(_JSONL_DEFER, "events", None)
+    if deferred is not None:
+        deferred.append((Path(path), obj))
+        return
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(json.dumps(obj, default=str) + "\n")
+    with _JSONL_WRITE_LOCK:
+        with open(path, "a") as f:
+            f.write(json.dumps(obj, default=str) + "\n")
+
+
+def _emit_jsonl_events(events: list[tuple[Path, dict]]) -> None:
+    for path, obj in events:
+        _append_jsonl(path, obj)
 
 
 def _llm_available() -> bool:
     """True iff an LLM API key is configured."""
     return bool(os.environ.get("PENROSE_LLM_API_KEY"))
+
+
+def resolve_worker_count(requested: int | str | None) -> int:
+    return worker_control.resolve_worker_count(requested)
+
+
+def _claim_worker_resolution(value: int | str | None = None) -> worker_control.WorkerCountResolution:
+    raw = os.environ.get("PENROSE_MAX_CLAIM_WORKERS") if value is None else value
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        # Operator specified nothing -> conservative parallel default = min(4, auto): 4 on capable
+        # hardware, auto-reduced on constrained machines so a small box is never swamped. `auto`
+        # (the full hardware max, up to the cap) and an explicit `--workers N`/1 remain available.
+        raw = worker_control.default_worker_count()
+    return worker_control.resolve_worker_count_details(raw)
+
+
+def _log_claim_worker_resolution(resolution: worker_control.WorkerCountResolution) -> None:
+    print(
+        "[penrose] claim workers: "
+        f"resolved={resolution.count} requested={resolution.requested!r} "
+        f"bound={resolution.bound} "
+        f"ceilings(cpu={resolution.cpu_ceiling}, ram={resolution.ram_ceiling}, cap={resolution.hard_cap})",
+        file=sys.stderr,
+    )
+
+
+def _isolated_bundle_access(bundle):
+    """Shallow clone a bundle for one claim run, with independent access tracking.
+
+    Series values are shared read-only; the series mapping and `_accessed` set are per-claim.
+    Auto-fetch additions therefore cannot leak into another claim's provenance cap.
+    """
+    try:
+        clone = copy.copy(bundle)
+    except Exception:  # noqa: BLE001
+        clone = bundle
+    if hasattr(bundle, "series"):
+        try:
+            object.__setattr__(clone, "series", dict(getattr(bundle, "series", {}) or {}))
+        except Exception:  # noqa: BLE001
+            pass
+    if hasattr(bundle, "fallback_substitutions"):
+        try:
+            object.__setattr__(
+                clone, "fallback_substitutions",
+                list(getattr(bundle, "fallback_substitutions", []) or []),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    for attr, value in (("_accessed", set()), ("_norm_index", None), ("_norm_index_keys", None)):
+        try:
+            object.__setattr__(clone, attr, value)
+        except Exception:  # noqa: BLE001
+            pass
+    return clone
+
+
+def _accessed_keys(bundle, *, conservative_for_auto: bool = False) -> list[str]:
+    if conservative_for_auto:
+        keys = getattr(bundle, "series", {}).keys() if hasattr(bundle, "series") else []
+    else:
+        keys = getattr(bundle, "_accessed", None) or []
+    return sorted(str(k) for k in keys)
+
+
+def _run_claim_tasks(items, worker_count: int, fn, on_error=None, governor=None):
+    # P-1: a worker must NEVER propagate. In the parallel path a raised worker aborts `as_completed`
+    # and discards EVERY sibling worker's deferred writes (their successful decisions vanish from the
+    # ledger — worse than serial, where prior claims are already committed). `on_error` converts an
+    # unguarded worker crash into a per-claim engine_error result so isolation matches the serial intent.
+    def _safe(item):
+        try:
+            if worker_count <= 1 or governor is None:
+                return fn(item)
+            acquired = False
+            try:
+                governor.acquire()
+                acquired = True
+            except Exception as exc:  # noqa: BLE001
+                print(f"[penrose] worker governor failed open: {exc}", file=sys.stderr)
+                return fn(item)
+            try:
+                return fn(item)
+            finally:
+                if acquired:
+                    try:
+                        governor.release()
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[penrose] worker governor release failed open: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            if on_error is None:
+                raise
+            return on_error(item, exc)
+
+    if worker_count <= 1 or len(items) <= 1:
+        return [_safe(item) for item in items]
+    out = []
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = {pool.submit(_safe, item): item for item in items}
+        for fut in as_completed(futures):
+            out.append(fut.result())
+    return sorted(out, key=lambda r: r.get("claim_i", 0))
 
 
 def _processed_set() -> set[str]:
@@ -521,7 +656,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                source_type: str = "external_source",
                bundle_override=None,
                force: bool = False,
-               max_claims: int | None = None) -> dict:
+               max_claims: int | None = None,
+               max_claim_workers: int | str | None = None) -> dict:
     """Run one paper end-to-end. Returns the run log (also written to runs.jsonl)."""
     config.ensure_output_dirs()
     source_type = validate_source_type(source_type)
@@ -531,6 +667,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     reader = BrainReader()
     run_log: dict = {"run_at": _now(), "paper_path": str(paper_path), "claims": [],
                      "source_type": source_type}
+    claim_worker_resolution = _claim_worker_resolution(max_claim_workers)
+    claim_workers = claim_worker_resolution.count
+    _log_claim_worker_resolution(claim_worker_resolution)
+    claim_governor = worker_control.configure_claim_governor(claim_workers)
+    run_log["claim_workers"] = claim_workers
     _set_pipeline_status("running")        # dashboard status dot -> green while we run
     _progress("ingest", paper=paper_path.name)
 
@@ -668,7 +809,234 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     ready_for_backtest = []
     auto_fetch_attempted_series: set[str] = set()
 
-    for _ci, claim in enumerate(claims, 1):
+    claims_for_phase1 = claims
+    if claim_workers > 1 and len(claims) > 1:
+        def _phase1_one(item: tuple[int, Claim]) -> dict:
+            _ci, claim = item
+            claim_started = time.monotonic()
+            rec: dict = {"claim_id": claim.claim_id, "statement": claim.statement, "stages": {}}
+            rec["stages"]["P1"] = {"sanitized": True}
+            local_bundle = _isolated_bundle_access(bundle)
+            local_run_log = {**run_log, "claims": []}
+            local_decisions = []
+            local_ready = []
+            local_specs = []
+            with _defer_jsonl_events() as events:
+                for _once in (None,):
+                    _progress("evaluate", detail=f"P3–P6 routing: {_short_name(claim)}",
+                              paper=title, claim_i=_ci, claim_n=len(claims))
+                    if use_llm:
+                        try:
+                            p3 = extract.classify_claim(claim)
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[penrose] P3 LLM failed ({e}); using stub", file=sys.stderr)
+                            p3 = extract.classify_claim_stub(claim)
+                    else:
+                        p3 = extract.classify_claim_stub(claim)
+                    rec["stages"]["P3"] = p3
+                    if p3["killed"]:
+                        local_decisions.append(
+                            _kill(claim, p3["reason"], p3["note"], synthetic, rec, local_run_log))
+                        continue
+                    _authoritative_claim_type(claim, source=source)
+
+                    p4 = stages.p4_fee_curve(claim, expected_edge=claim.expected_edge)
+                    rec["stages"]["P4"] = p4
+                    if p4["killed"]:
+                        local_decisions.append(
+                            _kill(claim, p4["reason"], p4["note"], synthetic, rec, local_run_log))
+                        continue
+
+                    p5 = stages.p5_dedup(claim, reader)
+                    rec["stages"]["P5"] = p5
+                    if p5["killed"]:
+                        local_decisions.append(
+                            _kill(claim, p5["reason"], p5["note"], synthetic, rec, local_run_log))
+                        continue
+
+                    cls = claim.applicable_strategy_class or ""
+                    module = REGISTRY.get(cls)
+                    spec = None
+                    if module is not None and use_llm and getattr(config, "FIDELITY_CHECK", False):
+                        try:
+                            _mc = Path(getattr(module, "__file__", "") or "").read_text()
+                        except Exception:  # noqa: BLE001
+                            _mc = ""
+                        _rf = _assess_fidelity_safe(claim, _mc)
+                        if not _rf.get("verified", False):
+                            rec["stages"]["P6_route_fidelity"] = {
+                                "reused": False, "reason": _rf.get("note", "")[:140],
+                                "confidence": _rf.get("confidence", 0),
+                            }
+                            module = None
+                    if _claim_budget_exceeded(claim_started):
+                        local_decisions.append(_skip(
+                            claim, "timeout",
+                            "skipped: per-claim time budget exceeded before module routing",
+                            rec, local_run_log))
+                        continue
+                    if module is None:
+                        pre_fid = {}
+                        prior_divergences: list[str] | None = None
+                        missing_inputs: list[str] = []
+                        max_spec_attempts = (
+                            SPEC_SELF_CORRECTION_MAX_ATTEMPTS
+                            if use_llm and getattr(config, "FIDELITY_CHECK", False)
+                            else 1
+                        )
+                        for spec_attempt in range(1, max_spec_attempts + 1):
+                            spec = spec_gen.generate_spec(
+                                claim, source, use_llm=use_llm,
+                                prior_divergences=prior_divergences)
+                            _authoritative_claim_type(claim, spec, source)
+                            local_specs.append(spec)
+                            try:
+                                missing_inputs = _missing_spec_inputs_from_bundle(spec, local_bundle)
+                            except Exception:  # noqa: BLE001
+                                missing_inputs = None
+                            if missing_inputs:
+                                rec["stages"]["P6_data_availability"] = {
+                                    "blocked": True,
+                                    "missing_series": missing_inputs,
+                                    "spec_path": str(spec.get("_path", "")),
+                                }
+                                local_decisions.append(_needs_data(
+                                    claim, "data_unavailable: " + ", ".join(missing_inputs),
+                                    rec, local_run_log))
+                                break
+                            pre_fid = (
+                                _assess_spec_fidelity_safe(claim, spec)
+                                if use_llm and getattr(config, "FIDELITY_CHECK", False)
+                                else {}
+                            )
+                            if use_llm and getattr(config, "FIDELITY_CHECK", False):
+                                rec["stages"].setdefault("P6_pre_fidelity_attempts", []).append({
+                                    "attempt": spec_attempt,
+                                    "blocked": _fidelity_confidently_unfaithful(pre_fid),
+                                    "faithful": pre_fid.get("faithful"),
+                                    "confidence": pre_fid.get("confidence", 0),
+                                    "divergences": pre_fid.get("divergences", []),
+                                    "spec_path": str(spec.get("_path", "")),
+                                })
+                            if not _fidelity_confidently_unfaithful(pre_fid):
+                                break
+                            _persist_fidelity_rejection(claim, spec, pre_fid)
+                            if spec_attempt >= max_spec_attempts:
+                                local_decisions.append(
+                                    _cannot_replicate_unfaithful_spec(
+                                        claim, spec, pre_fid, rec, local_run_log))
+                                break
+                            prior_divergences = list(pre_fid.get("divergences") or [])
+                            if not prior_divergences and pre_fid.get("note"):
+                                prior_divergences = [str(pre_fid.get("note"))]
+                        if missing_inputs:
+                            continue
+                        if _fidelity_confidently_unfaithful(pre_fid):
+                            continue
+                        claim_type = _authoritative_claim_type(claim, spec, source)
+                        if claim_type == "provided_series_statistic":
+                            module = provided_series.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "provided_series_statistic"},
+                                    "deterministic_provided_series": True}
+                        elif claim_type == "event_market_strategy":
+                            module = event_market.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "event_market_strategy"},
+                                    "deterministic_event_market": True}
+                        elif not config.AUTO_IMPLEMENT_MODULES:
+                            impl = {"ok": False, "reason": "auto-impl disabled"}
+                        elif not (sandbox.docker_available() and sandbox.ensure_image()):
+                            impl = {"ok": False, "reason": "auto-impl requires Docker sandbox (not available); "
+                                    "operator must implement, or start Docker"}
+                        else:
+                            impl = impl_gen.try_implement(
+                                spec, claim, local_bundle, cost_frac, use_llm=use_llm)
+                        if impl.get("ok"):
+                            deterministic_module = (
+                                impl.get("deterministic_provided_series")
+                                or impl.get("deterministic_event_market")
+                            )
+                            if not deterministic_module:
+                                with _REGISTRY_LOCK:
+                                    _register_known_modules()
+                            module = impl["module"]
+                            rec["stages"]["P6"] = {
+                                "module_id": impl["module_id"], "spec_generated": True,
+                                "auto_implemented": not deterministic_module,
+                                "deterministic_provided_series": bool(
+                                    impl.get("deterministic_provided_series")),
+                                "deterministic_event_market": bool(
+                                    impl.get("deterministic_event_market")),
+                                "spec_path": str(spec.get("_path", "")),
+                                "validation": impl.get("validation", {}),
+                                "note": (
+                                    "deterministic event-market executor; backtesting"
+                                    if impl.get("deterministic_event_market") else
+                                    "deterministic provided-series executor; backtesting"
+                                    if impl.get("deterministic_provided_series")
+                                    else "spec auto-implemented + validated on the live bundle; backtesting"
+                                )}
+                        else:
+                            rec["stages"]["P6"] = {
+                                "module_id": None, "spec_generated": True,
+                                "auto_implemented": False,
+                                "auto_impl_reason": str(impl.get("reason", ""))[:140],
+                                "spec_path": str(spec.get("_path", "")),
+                                "note": "ModuleSpec generated; auto-impl declined -> pending operator"}
+                            _append_jsonl(config.REVIEW_QUEUE,
+                                          {"type": "module_spec", "queued_at": _now(),
+                                           "status": "pending",
+                                           "proposal_id": f"{claim.claim_id}-spec",
+                                           "name": _short_name(claim),
+                                           "claim_id": claim.claim_id, "strategy_class": cls,
+                                           "spec_path": str(spec.get("_path", "")),
+                                           "statement": claim.statement, "meaning": claim.mechanism})
+                            local_decisions.append(_skip(
+                                claim, "module_unavailable",
+                                "spec generated; auto-impl declined ("
+                                + str(impl.get("reason", ""))[:60] + "); awaiting operator",
+                                rec, local_run_log))
+                            continue
+                    else:
+                        rec["stages"]["P6"] = {"module_id": getattr(module, "__module_id__", "unknown"),
+                                               "spec_generated": False}
+                    if _claim_budget_exceeded(claim_started):
+                        local_decisions.append(_skip(
+                            claim, "timeout",
+                            "skipped: per-claim time budget exceeded before backtest",
+                            rec, local_run_log))
+                        continue
+                    local_ready.append({
+                        "claim": claim,
+                        "module": module,
+                        "rec": rec,
+                        "claim_i": _ci,
+                        "spec": spec,
+                    })
+            return {"claim_i": _ci, "decisions": local_decisions, "ready": local_ready,
+                    "specs": local_specs, "claims": list(local_run_log.get("claims", [])),
+                    "events": list(events)}
+
+        phase1_items = list(enumerate(claims, 1))
+
+        def _phase1_on_error(item, exc):  # P-1: isolate a worker crash to its own claim
+            _eci, _eclaim = item
+            _erec = {"claim_id": _eclaim.claim_id, "statement": _eclaim.statement, "stages": {}}
+            return {"claim_i": _eci, "ready": [], "specs": [], "claims": [], "events": [],
+                    "decisions": [_engine_error(_eclaim, "parallel worker (phase1)", exc, _erec, run_log)]}
+
+        for result in _run_claim_tasks(
+                phase1_items, claim_workers, _phase1_one, _phase1_on_error, claim_governor):
+            _emit_jsonl_events(result.get("events", []))
+            decisions.extend(result.get("decisions", []))
+            specs_generated.extend(result.get("specs", []))
+            ready_for_backtest.extend(result.get("ready", []))
+            run_log["claims"].extend(result.get("claims", []))
+        ready_for_backtest.sort(key=lambda item: item.get("claim_i", 0))
+        claims_for_phase1 = []
+
+    for _ci, claim in enumerate(claims_for_phase1, 1):
         claim_started = time.monotonic()
         _progress("evaluate", detail=f"P3–P6 routing: {_short_name(claim)}",
                   paper=title, claim_i=_ci, claim_n=len(claims))
@@ -792,6 +1160,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 impl = {"ok": True, "module": module, "module_id": module.__module_id__,
                         "validation": {"deterministic": "provided_series_statistic"},
                         "deterministic_provided_series": True}
+            elif claim_type == "event_market_strategy":
+                module = event_market.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "event_market_strategy"},
+                        "deterministic_event_market": True}
             # Auto-implementation REQUIRES the Docker sandbox — model-written code never execs unsandboxed.
             # No Docker -> no auto-implement (the claim stays pending_module for the operator).
             elif not config.AUTO_IMPLEMENT_MODULES:
@@ -802,16 +1175,24 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             else:
                 impl = impl_gen.try_implement(spec, claim, bundle, cost_frac, use_llm=use_llm)
             if impl.get("ok"):
-                if not impl.get("deterministic_provided_series"):
+                deterministic_module = (
+                    impl.get("deterministic_provided_series")
+                    or impl.get("deterministic_event_market")
+                )
+                if not deterministic_module:
                     _register_known_modules()      # discover the just-written, validated module
                 module = impl["module"]
                 rec["stages"]["P6"] = {"module_id": impl["module_id"], "spec_generated": True,
-                                       "auto_implemented": not impl.get("deterministic_provided_series"),
+                                       "auto_implemented": not deterministic_module,
                                        "deterministic_provided_series": bool(
                                            impl.get("deterministic_provided_series")),
+                                       "deterministic_event_market": bool(
+                                           impl.get("deterministic_event_market")),
                                        "spec_path": str(spec.get("_path", "")),
                                        "validation": impl.get("validation", {}),
                                        "note": (
+                                           "deterministic event-market executor; backtesting"
+                                           if impl.get("deterministic_event_market") else
                                            "deterministic provided-series executor; backtesting"
                                            if impl.get("deterministic_provided_series")
                                            else "spec auto-implemented + validated on the live bundle; backtesting"
@@ -851,6 +1232,277 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         })
 
     _register_run_cohorts(ready_for_backtest, source_id, source)
+
+    if claim_workers > 1 and ready_for_backtest:
+        def _phase2_one(_ready: dict) -> dict:
+            claim = _ready["claim"]
+            module = _ready["module"]
+            rec = _ready["rec"]
+            _ci = _ready["claim_i"]
+            spec = _ready.get("spec")
+            local_bundle = _isolated_bundle_access(bundle)
+            local_run_log = {**run_log, "claims": []}
+            local_auto_fetch_attempted: set[str] = set()
+            local_decisions = []
+            claim_started = time.monotonic()
+            local_provenance = provenance
+            local_synthetic = synthetic
+            with _defer_jsonl_events() as events:
+                for _once in (None,):
+                    # ---- P7: backtest (pre-existing OR just auto-implemented module) -- #
+                    _progress("evaluate", detail=f"P7 backtest: {_short_name(claim)}",
+                              paper=title, claim_i=_ci, claim_n=len(claims))
+                    local_bundle.reset_access()
+                    is_auto = bool(getattr(module, "__auto_generated__", False))
+                    mres = _run_module_once(module, local_bundle, claim, cost_frac, is_auto)
+                    if not isinstance(mres, dict) or not mres.get("ok"):
+                        mres = mres if isinstance(mres, dict) else {
+                            "ok": False, "reason": "module returned non-dict"}
+                        if not _is_data_unavailable_reason(mres.get("reason")):
+                            local_decisions.append(_engine_error(
+                                claim, "module run",
+                                RuntimeError(str(mres.get("reason") or "module returned not-ok")),
+                                rec, local_run_log))
+                            continue
+                        retry = _auto_fetch_and_retry_missing_series(
+                            module, local_bundle, claim, cost_frac, is_auto, mres,
+                            local_auto_fetch_attempted)
+                        if retry.get("attempted"):
+                            rec["stages"]["P7_auto_fetch"] = {
+                                "attempted": retry.get("attempted", []),
+                                "added": retry.get("added", []),
+                                "status": retry.get("status", "miss"),
+                            }
+                        if retry.get("retried"):
+                            local_provenance = local_bundle.provenance_summary()
+                            local_synthetic = local_bundle.any_synthetic()
+                            mres = retry.get("mres")
+                            if isinstance(mres, dict) and mres.get("ok"):
+                                pass
+                            elif not isinstance(mres, dict) or not _is_data_unavailable_reason(mres.get("reason")):
+                                local_decisions.append(_engine_error(
+                                    claim, "module run",
+                                    RuntimeError(str(retry.get("reason")
+                                                     or "module retry returned not-ok")),
+                                    rec, local_run_log))
+                                continue
+                            else:
+                                local_decisions.append(_needs_data(
+                                    claim, retry.get("reason", mres.get("reason")), rec, local_run_log,
+                                    auto_fetch_attempted=retry.get("attempted")))
+                                continue
+                        else:
+                            local_decisions.append(_needs_data(
+                                claim, mres.get("reason"), rec, local_run_log,
+                                auto_fetch_attempted=retry.get("attempted")))
+                            continue
+                    if not isinstance(mres, dict) or not mres.get("ok"):
+                        local_decisions.append(_needs_data(claim, mres.get("reason"), rec, local_run_log))
+                        continue
+                    try:
+                        mcode_for_coverage = Path(getattr(module, "__file__", "") or "").read_text()
+                    except Exception:  # noqa: BLE001
+                        mcode_for_coverage = ""
+                    coverage = fidelity.variable_coverage_check(mcode_for_coverage, spec)
+                    if coverage.get("needs_review"):
+                        rec["stages"]["P6_variable_coverage"] = coverage
+                        local_decisions.append(_needs_review(
+                            claim, coverage.get("reason"), rec, local_run_log,
+                            metrics={"variable_coverage": coverage}))
+                        continue
+                    _missing = [k for k in ("net", "positions", "bars_per_year") if k not in mres]
+                    if _missing:
+                        local_decisions.append(_needs_data(
+                            claim, f"data_unavailable: module result missing keys {_missing}",
+                            rec, local_run_log))
+                        continue
+                    family = _family(claim, module, source, spec)
+                    reg_schemes = {}
+                    for _rk in ("btc_vol_regime", "btc_trend_regime"):
+                        _rs = local_bundle.series.get(_rk)
+                        if (_rs is not None and getattr(_rs, "available", False)
+                                and getattr(_rs, "data", None) is not None):
+                            reg_schemes[_rk] = _rs.data
+                    if mres.get("regime_schemes"):
+                        if not isinstance(mres["regime_schemes"], dict):
+                            local_decisions.append(_needs_data(
+                                claim, "data_unavailable: module regime_schemes must be a mapping",
+                                rec, local_run_log))
+                            continue
+                        reg_schemes.update(mres["regime_schemes"])
+                    elif mres.get("prices") is not None:
+                        try:
+                            reg_schemes.update(regime_lib.regime_schemes(mres["prices"]))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    reg_schemes = reg_schemes or None
+                    try:
+                        bt = p7_backtest.run_backtest(
+                            claim.claim_id, mres["net"], mres["positions"], mres["bars_per_year"],
+                            payoff=mres.get("payoff"), position_signed=mres.get("position_signed"),
+                            cost_frac=cost_frac, wf_frame=mres.get("wf_frame"), family=family,
+                            generation_source=_generation_source_for(claim, spec, source),
+                            search_cohort_id=claim.search_cohort_id,
+                            search_denominator=claim.search_denominator,
+                            preregistered_single_cohort=_is_preregistered_single_cohort(claim, source),
+                            declared_grid_size=p7_backtest.declared_grid_size(spec),
+                            regime_schemes=reg_schemes,
+                            declared_regime=claim.declared_regime)
+                    except Exception as e:  # noqa: BLE001
+                        local_decisions.append(_engine_error(claim, "P7 backtest", e, rec, local_run_log))
+                        continue
+                    bt.setdefault("claim_type", _authoritative_claim_type(claim, spec, source))
+                    if claim.source_type == "external_source":
+                        sample_end = (claim.sample_period or {}).get("end") if claim.sample_period else None
+                        data_end = None
+                        post_years = None
+                        try:
+                            data_end_ts = mres["net"].dropna().index.max()
+                            data_end = str(data_end_ts.date())
+                            if sample_end:
+                                post_years = (
+                                    data_end_ts.tz_localize(None) - pd.Timestamp(sample_end)
+                                ).days / 365.25
+                        except Exception:  # noqa: BLE001
+                            post_years = None
+                        bt["post_sample"] = {
+                            "sample_end": sample_end,
+                            "data_end": data_end,
+                            "post_years": post_years,
+                            "declared": claim.sample_period is not None,
+                        }
+                    rec["stages"]["P7"] = bt
+                    if _claim_budget_exceeded(claim_started):
+                        local_decisions.append(_skip(
+                            claim, "timeout", "skipped: per-claim time budget exceeded before verdict",
+                            rec, local_run_log))
+                        continue
+                    syn_here = local_synthetic if is_auto else local_bundle.accessed_synthetic()
+                    holdout = {}
+                    try:
+                        dec = stages.p8_verdict(claim, bt, holdout, syn_here)
+                        if _maybe_attach_parameter_fragility(
+                                bt, module, local_bundle, claim, cost_frac, spec, dec):
+                            dec = stages.p8_verdict(claim, bt, holdout, syn_here)
+                        with _HOLDOUT_LOCK:
+                            dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
+                        dec.metrics["corpus_isolation"] = stages.corpus_isolation(claim, reader)
+                    except Exception as e:  # noqa: BLE001
+                        local_decisions.append(_engine_error(claim, "P8 verdict", e, rec, local_run_log))
+                        continue
+                    rec["stages"]["holdout"] = holdout
+                    if use_llm and getattr(config, "FIDELITY_CHECK", False):
+                        _progress("evaluate", detail=f"fidelity check: {_short_name(claim)}",
+                                  paper=title, claim_i=_ci, claim_n=len(claims))
+                        try:
+                            mcode = Path(getattr(module, "__file__", "") or "").read_text()
+                        except Exception:  # noqa: BLE001
+                            mcode = ""
+                        fid = _assess_fidelity_safe(claim, mcode, spec)
+                        bt["fidelity"] = fid
+                        dec.metrics["fidelity"] = fid
+                        dec.metrics["independent_verifier"] = bool(fid.get("independent_verifier", False))
+                        if fid.get("checked") is False:
+                            dec.metrics["fidelity_provenance"] = "unknown"
+                        else:
+                            base_provenance = dec.metrics.get("fidelity_provenance", "unknown")
+                            dec.metrics["fidelity_provenance"] = (
+                                f"{base_provenance}; independent_verifier="
+                                f"{str(bool(fid.get('independent_verifier', False))).lower()}"
+                            )
+                        if not fid.get("verified", False):
+                            dec.metrics["fidelity_unverified"] = True
+                            dec.rationale += f". FIDELITY UNVERIFIED: {fid.get('note', 'inconclusive')}."
+                            if dec.verdict == "research-supported":
+                                dec.verdict = "watch"
+                                dec.rationale += " Strongest verdict withheld."
+                        if (not fid.get("faithful", False)
+                                and fid.get("confidence", 0) >= config.FIDELITY_KILL_CONFIDENCE):
+                            _persist_fidelity_rejection(claim, spec, fid)
+                            dec.metrics["fidelity_suspect"] = True
+                            dec.metrics["original_verdict"] = dec.verdict
+                            dec.verdict = "cannot_replicate"
+                            dec.kill_reason = "unfaithful_module"
+                            dec.rationale += (
+                                f". CANNOT_REPLICATE — module unfaithful to the claim "
+                                f"(conf {fid['confidence']:.2f}): {fid.get('note', '')}")
+                    rec["stages"]["P8"] = {"verdict": dec.verdict, "kill_reason": dec.kill_reason,
+                                           "rationale": dec.rationale}
+                    try:
+                        from .. import explanations
+                        _inputs = explanations.visible_inputs(
+                            mres["net"], market=mres.get("market_returns"),
+                            momentum=mres.get("momentum_proxy"), simpler_net=mres.get("simpler_net"),
+                            visible_frac=p7_backtest.IS_FRAC + p7_backtest.OOS_FRAC)
+                        competing = explanations.analyze(
+                            _inputs["net"], mres["bars_per_year"],
+                            market=_inputs["market"], momentum=_inputs["momentum"],
+                            crisis_windows=mres.get("crisis_windows"),
+                            simpler_net=_inputs["simpler_net"])
+                    except Exception:  # noqa: BLE001
+                        competing = []
+                    rec["competing_explanations"] = competing
+                    local_decisions.append(dec)
+                    _queue_and_log(claim, dec, local_run_log)
+                    chart = charts.render_backtest_chart(claim.claim_id, _short_name(claim),
+                                                         mres["net"], bt, dec.verdict)
+                    analysis_record = {
+                        "claim_id": claim.claim_id, "source_id": source_id, "source_title": title,
+                        "statement": claim.statement[:240], "mechanism": claim.mechanism,
+                        "verdict": dec.verdict,
+                        "kill_reason": dec.kill_reason,
+                        "metrics": {k: bt.get(k) for k in ("dsr", "psr", "oos_sharpe", "n_trades",
+                                                           "n_oos", "three_fold", "regime",
+                                                           "capacity_usd", "edge_t")},
+                        "fidelity": dec.metrics.get("fidelity"),
+                        "fidelity_provenance": dec.metrics.get("fidelity_provenance"),
+                        "competing_explanations": competing,
+                        "data_provenance": {
+                            **(getattr(claim, "data_provenance", {}) or {}),
+                            "data_domain": _data_domain(claim), "strategy_family": family,
+                            "datasets": _accessed_keys(local_bundle, conservative_for_auto=is_auto),
+                            "periods": ([{"start": str(local_bundle.requested_window[0]),
+                                          "end": str(local_bundle.requested_window[1])}]
+                                        if getattr(local_bundle, "requested_window", None) else []),
+                            "fallback_substitutions": list(
+                                getattr(local_bundle, "fallback_substitutions", [])),
+                            "bundle": local_provenance,
+                        },
+                        "source_type": claim.source_type,
+                        "declared_regime": claim.declared_regime,
+                        "synthetic": syn_here, "chart": chart, "run_at": _now()}
+                    _append_jsonl(config.ANALYSIS_INDEX, analysis_record)
+                    try:
+                        from ..concepts import extract_and_append
+                        concept = extract_and_append(analysis_record, use_llm=bool(use_llm))
+                        if concept:
+                            rec["concept_id"] = concept["concept_id"]
+                    except Exception as e:  # noqa: BLE001
+                        rec["concept_error"] = f"{type(e).__name__}: {e}"[:160]
+            return {"claim_i": _ci, "decisions": local_decisions,
+                    "claims": list(local_run_log.get("claims", [])), "events": list(events),
+                    "provenance": local_provenance}
+
+        try:
+            def _phase2_on_error(item, exc):  # P-1: isolate a worker crash to its own claim
+                return {"claim_i": item["claim_i"], "claims": [], "events": [],
+                        "decisions": [_engine_error(item["claim"], "parallel worker (phase2)", exc,
+                                                    item["rec"], run_log)]}
+
+            phase2_results = _run_claim_tasks(
+                ready_for_backtest, claim_workers, _phase2_one, _phase2_on_error, claim_governor)
+            for result in phase2_results:
+                _emit_jsonl_events(result.get("events", []))
+                decisions.extend(result.get("decisions", []))
+                run_log["claims"].extend(result.get("claims", []))
+                # Merge each worker's provenance (auto-fetched series land in the worker's bundle CLONE,
+                # so the run-level summary must aggregate them or a parallel run under-reports what data
+                # it used vs serial). Union of per-series keys; base keys are shared so update is safe.
+                if isinstance(result.get("provenance"), dict):
+                    provenance.update(result["provenance"])
+        finally:
+            _cleanup_run_cohorts(ready_for_backtest)
+        ready_for_backtest = []
 
     try:
         for _ready in ready_for_backtest:
@@ -959,6 +1611,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     search_cohort_id=claim.search_cohort_id,
                     search_denominator=claim.search_denominator,
                     preregistered_single_cohort=_is_preregistered_single_cohort(claim, source),
+                    declared_grid_size=p7_backtest.declared_grid_size(spec),
                     regime_schemes=reg_schemes,
                     declared_regime=claim.declared_regime)
             except Exception as e:  # noqa: BLE001 — C-005: one bad backtest must not abort the paper
@@ -1003,7 +1656,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             holdout = {}
             try:
                 dec = stages.p8_verdict(claim, bt, holdout, syn_here)
-                dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
+                if _maybe_attach_parameter_fragility(
+                        bt, module, bundle, claim, cost_frac, spec, dec):
+                    dec = stages.p8_verdict(claim, bt, holdout, syn_here)
+                with _HOLDOUT_LOCK:
+                    dec, holdout = _maybe_consult_holdout(claim, bt, mres, dec, syn_here)
                 dec.metrics["corpus_isolation"] = stages.corpus_isolation(claim, reader)
             except Exception as e:  # noqa: BLE001 — C-005: a verdict-stage error isolates to this claim
                 decisions.append(_engine_error(claim, "P8 verdict", e, rec, run_log))
@@ -1114,6 +1771,9 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
 
     finally:
         _cleanup_run_cohorts(ready_for_backtest)
+
+    claim_order = {getattr(c, "claim_id", ""): i for i, c in enumerate(claims)}
+    decisions.sort(key=lambda d: claim_order.get(getattr(d, "claim_id", ""), len(claim_order)))
 
     # ---- P8 aggregate: principle proposal (sub-threshold if <3 same-class kills) #
     _progress("finalize", paper=title)
@@ -1326,6 +1986,8 @@ def _missing_spec_inputs_from_bundle(spec: dict, bundle) -> list[str] | None:
     had_accessed = False
     prior_accessed = set()
     try:
+        if isinstance(spec, dict) and spec.get("claim_type") == "event_market_strategy":
+            return []
         inputs = spec.get("inputs", []) if isinstance(spec, dict) else []
         if inputs is None:
             return []
@@ -1371,6 +2033,27 @@ def _run_module_once(module, bundle, claim, cost_frac, is_auto: bool):
             return {"ok": False, "reason": f"engine_error: legacy module raised {type(e).__name__}: {e}"}
     except Exception as e:  # noqa: BLE001 — a buggy module must not abort the whole paper (A-027)
         return {"ok": False, "reason": f"engine_error: module raised {type(e).__name__}: {e}"}
+
+
+def _maybe_attach_parameter_fragility(bt: dict, module, bundle, claim, cost_frac, spec, dec) -> bool:
+    """Attach parameter-fragility metrics only for provisional survivor candidates."""
+    try:
+        if getattr(dec, "verdict", None) not in ("watch", "research-supported"):
+            return False
+        gate = getattr(config, "FRAGILITY_GATE", {})
+        if not gate.get("enabled", True):
+            return False
+        min_configs = int(gate.get("min_configs", 4))
+        if p7_backtest.declared_grid_size(spec) < min_configs:
+            return False
+        if not getattr(module, "__supports_param_override__", False):
+            return False
+        bt["parameter_fragility"] = robustness.parameter_fragility(
+            module, bundle, claim, cost_frac, spec, p7_backtest.OOS_FRAC)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        bt["parameter_fragility"] = {"ran": False, "reason": f"{type(exc).__name__}: {exc}"}
+        return True
 
 
 def _is_data_unavailable_reason(reason) -> bool:
@@ -1818,23 +2501,24 @@ def _progress(stage: str | None, detail: str = "", *, paper: str = "",
     """Write live per-stage progress for the dashboard activity panel. stage=None -> idle/done.
     Best-effort: never let progress I/O break a run."""
     try:
-        if stage is None:
-            payload = {"running": False, "updated_at": _now()}
-        else:
-            payload = {
-                "running": True,
-                "paper": paper,
-                "stage": stage,
-                "stage_no": (_STAGE_ORDER.index(stage) + 1) if stage in _STAGE_ORDER else 0,
-                "stage_total": len(_STAGE_ORDER),
-                "stage_label": _STAGE_LABEL.get(stage, stage),
-                "detail": detail,
-                "claim_i": claim_i,
-                "claim_n": claim_n,
-                "updated_at": _now(),
-            }
-        config.PROGRESS_JSON.parent.mkdir(parents=True, exist_ok=True)
-        config.PROGRESS_JSON.write_text(json.dumps(payload, indent=2, default=str))
+        with _PROGRESS_LOCK:
+            if stage is None:
+                payload = {"running": False, "updated_at": _now()}
+            else:
+                payload = {
+                    "running": True,
+                    "paper": paper,
+                    "stage": stage,
+                    "stage_no": (_STAGE_ORDER.index(stage) + 1) if stage in _STAGE_ORDER else 0,
+                    "stage_total": len(_STAGE_ORDER),
+                    "stage_label": _STAGE_LABEL.get(stage, stage),
+                    "detail": detail,
+                    "claim_i": claim_i,
+                    "claim_n": claim_n,
+                    "updated_at": _now(),
+                }
+            config.PROGRESS_JSON.parent.mkdir(parents=True, exist_ok=True)
+            config.PROGRESS_JSON.write_text(json.dumps(payload, indent=2, default=str))
     except Exception:  # noqa: BLE001
         pass
 
@@ -1925,9 +2609,12 @@ def _write_live(source_title, source_id, decisions, provenance, principle,
 
 
 def _run_and_report(paper: Path, use_llm: bool, *, force: bool = False,
-                    max_claims: int | None = None) -> None:
+                    max_claims: int | None = None,
+                    max_claim_workers: int | str | None = None) -> None:
     try:
-        out = run_source(paper, use_llm=use_llm, force=force, max_claims=max_claims)
+        out = run_source(
+            paper, use_llm=use_llm, force=force, max_claims=max_claims,
+            max_claim_workers=max_claim_workers)
     except BaseException:  # noqa: BLE001 — incl. KeyboardInterrupt/SystemExit (B-015): never leave 'running'
         _set_pipeline_status("error")
         _progress(None)
@@ -1953,13 +2640,16 @@ def main() -> None:
     ap.add_argument("--max-claims", type=int,
                     help=("process at most N extracted claims from this source; setting "
                           "PENROSE_CLAIM_TIME_BUDGET_SECONDS makes budget skips wall-clock-dependent"))
+    ap.add_argument("--workers",
+                    help=("per-claim worker threads; default PENROSE_MAX_CLAIM_WORKERS or 1, "
+                          f"accepts an int or auto; ints clamped to {MAX_CLAIM_WORKERS}"))
     args = ap.parse_args()
     use_llm = (not args.no_llm)
 
     if args.paper:
         _run_and_report(Path(args.paper) if Path(args.paper).exists()
                         else _find_paper(args.paper), use_llm, force=args.force,
-                        max_claims=args.max_claims)
+                        max_claims=args.max_claims, max_claim_workers=args.workers)
         return
 
     if args.all:
@@ -1971,7 +2661,9 @@ def main() -> None:
         for i, paper in enumerate(pending, 1):
             print(f"[penrose] ({i}/{len(pending)}) {paper.name}", file=sys.stderr)
             try:
-                _run_and_report(paper, use_llm, force=args.force, max_claims=args.max_claims)
+                _run_and_report(
+                    paper, use_llm, force=args.force, max_claims=args.max_claims,
+                    max_claim_workers=args.workers)
             except Exception as e:  # noqa: BLE001 — one bad paper must not stop the batch
                 # Record the failure VISIBLY (not silent data loss, A-025), then keep
                 # this invocation moving to the next paper.
@@ -1986,7 +2678,9 @@ def main() -> None:
                           "inbox": len(_inbox_pdfs()),
                           "note": "every inbox paper already run; `make reset` to reprocess"}))
         return
-    _run_and_report(paper, use_llm, force=args.force, max_claims=args.max_claims)
+    _run_and_report(
+        paper, use_llm, force=args.force, max_claims=args.max_claims,
+        max_claim_workers=args.workers)
 
 
 if __name__ == "__main__":

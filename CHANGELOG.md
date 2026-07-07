@@ -3,13 +3,47 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.5.0] — 2026-07-07
+
+A capability release on one theme: the referee learns to adjudicate a new *kind* of claim, to judge a
+strategy on a **neighborhood** of its parameters rather than one lucky configuration, and to evaluate a
+batch of claims in parallel without loosening any statistical guarantee. Green bar: eval 106/106,
+pytest 386 passed.
+
+### Added
+- **Event-market (bracket) adapter — a new data contract and strategy class.** Penrose can now referee
+  strategies on resolution-outcome markets (Kalshi/Polymarket-style brackets), where each event is a
+  strike range that settles win/lose. `EventMarketPanel` carries per-event decision-time prices, strikes,
+  and settled outcomes; a deterministic `normal_bracket` executor prices each bracket and runs the standard
+  backtest, so a bracket claim reaches a metric-bearing verdict through the same gates as any other
+  strategy — no generated code between the claim and its verdict. See `docs/ADAPTERS.md`.
+- **Parameter-robustness treatment (two parts).** (1) A claim's declared parameter grid is now *charged*
+  to the multiple-testing denominator: declare a K-configuration search, and the deflation reflects a
+  K-wide search — tuning is no longer free. (2) A new **parameter-fragility gate** re-runs a strategy
+  across its declared grid and *kills* an edge that survives only at isolated parameter points; a genuine
+  edge is robust to reasonable perturbation, a spurious one needs a magic point. The gate only ever
+  downgrades a survivor, never rescues a kill.
+- **Reconstructable synthesis candidates.** The candidate-generation layer now emits structured, buildable
+  specifications (signal as a function of named series and parameters, with a declared prior grid) and
+  admits a candidate only if it can actually be reconstructed — closing the gap where a self-generated
+  hypothesis could be proposed but not tested.
+- **Parallel claim execution.** Claims in a run can be evaluated concurrently (`--workers auto|N`, default
+  `min(4, auto)` — hardware-aware and auto-reduced on small machines so a laptop is never swamped).
+  Verdicts are **byte-identical** to a serial run (the multiple-testing denominator is pre-registered, not
+  raced), so parallelism changes only speed, never the answer; near-linear speedup on the I/O-bound path.
+  Live concurrency self-throttles when the model provider rate-limits.
+
+### Changed
+- The widow-maker / tail-risk gate (introduced in 0.4.2) is confirmed default-on in cap-and-warn mode.
+- New module re-evaluation contract (`param_override`) lets deterministic modules be re-run at alternate
+  parameter settings — the infrastructure powering the fragility gate.
+
 ## [0.4.2] — 2026-07-07
 
 A capability-and-calibration release built around one theme: the referee should adjudicate a claim on
 exactly what the claim asserts, and it should refuse to be fooled by a payoff that looks good on average
 but is catastrophic in the tail. It completes the provided-series claim type introduced in 0.4.1, adds a
-widow-maker gate, and closes several routing and self-correction gaps. Every change was verified through
-an adversarial swarm-audit pass. Green bar: eval 101/101, pytest 340 passed.
+widow-maker gate, and closes several routing and self-correction gaps. Green bar: eval 101/101, pytest 340 passed.
 
 ### Added
 - **Provided-series statistic path — complete build-out.** A claim that supplies its own pre-computed
@@ -75,11 +109,11 @@ that supply their own statistics. Green bar: eval 97/97, pytest 267 passed.
 
 A verdict-calibration release: the referee is now honest in both directions, and it enforces that
 honesty as a permanent control. Monte-Carlo evidence (surfaced by refereeing an external code-complete
-framework and an adversarial review, then two rounds of swarm audit) showed the prior taxonomy inverted
+framework) showed the prior taxonomy inverted
 at realistic effect sizes: it hard-killed true marginal edges as structurally dead while letting
 best-of-K mined noise reach a survivor verdict. This release fixes both, adds honest error routing and
-an edge-free offline fallback, and freezes the generative layer pending a corpus re-score. Every item
-was adversarially swarm-audited, and the two calibration failure modes are now CI controls.
+an edge-free offline fallback, and freezes the generative layer pending a corpus re-score. The two
+calibration failure modes are now CI controls.
 
 ### Added
 - **Enforcing power/mining calibration.** A Monte-Carlo control (`scripts/calibration_power_mining.py`)
@@ -140,7 +174,7 @@ was adversarially swarm-audited, and the two calibration failure modes are now C
 ## [0.3.0] — 2026-06-27
 
 A robustness, agent-surface, and data release. Post-0.2.0 work, much of it surfaced by a fresh-clone
-audit and by refereeing an external code-complete framework, then adversarially swarm-audited.
+audit and by refereeing an external code-complete framework.
 
 ### Added
 - **Tail-risk / widow-maker gate (default-off).** Every backtest now reports tail diagnostics (skew,
@@ -189,9 +223,9 @@ audit and by refereeing an external code-complete framework, then adversarially 
 
 ## [0.2.0] — 2026-06-25
 
-A correctness-and-coverage release. Every change was implemented and adversarially swarm-audited;
-the evaluation-invariant suite, the calibration battery (null + placebo + injection), and the unit
-tests are green. The headline is two verdict-lane correctness fixes plus a real data unblock.
+A correctness-and-coverage release. The evaluation-invariant suite, the calibration battery
+(null + placebo + injection), and the unit tests are green. The headline is two verdict-lane
+correctness fixes plus a real data unblock.
 
 ### Verdict integrity
 - **Order-independent deflation denominator (5c).** The Deflated Sharpe multiple-testing count is now

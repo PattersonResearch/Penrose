@@ -231,6 +231,7 @@ PERMUTATION = {"n_perm": 2000, "seed": 0}
 # PEN-02: regime fragility must be statistically distinguishable from noise-selection.
 # The drop-the-best statistic is compared against a permutation null (bucket labels shuffled).
 REGIME_FRAGILITY = {"n_perm": 500, "p_kill": 0.05, "seed": 0}
+FRAGILITY_GATE = {"enabled": True, "min_positive_frac": 0.5, "min_configs": 4, "max_configs": 24}
 WALK_FORWARD = {"n_windows": 4, "scheme": "anchored", "is_min": 0.30}
 CPCV = {"n_groups": 8, "k_test": 2, "embargo_frac": 0.01,
         "max_combos": 200, "seed": 0,

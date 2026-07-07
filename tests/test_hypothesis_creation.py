@@ -24,6 +24,18 @@ PLANTED_PRINCIPLE = (
 )
 
 
+def buildable_spec(series: str = "stress_signal") -> dict:
+    return {
+        "signal": f"zscore({series}, window) - ma({series}, slow_window)",
+        "series": [series],
+        "params": {"window": 20, "slow_window": 60},
+        "param_grid": {"window": [10, 20, 40], "slow_window": [40, 60, 120]},
+        "conditioning": "lag(liquidity_stress, 1) > threshold",
+        "entry_exit": "enter when signal > 1; exit after horizon or signal <= 0",
+        "horizon": "1d",
+    }
+
+
 def planted_concepts() -> list[dict]:
     rows = []
     specs = [
@@ -151,6 +163,7 @@ def test_normalize_admits_grounded_candidate():
         "candidate_class": "testable_now",
         "inspired_by": [mechanism["node_id"]],
         "falsifier": "no OOS lift after conditioning",
+        "spec": buildable_spec(),
     }], {"nodes": graph["nodes"]})
 
     assert normalized[0]["grounded"] is True
@@ -191,6 +204,7 @@ def test_normalize_rejects_duplicate():
         "candidate_class": "testable_now",
         "inspired_by": [mechanism["node_id"]],
         "falsifier": "no OOS lift",
+        "spec": buildable_spec(),
     }, {
         "statement": "Duplicate candidate statement",
         "mechanism": "same planted mechanism",
@@ -200,6 +214,7 @@ def test_normalize_rejects_duplicate():
         "candidate_class": "testable_now",
         "inspired_by": [mechanism["node_id"]],
         "falsifier": "no OOS lift",
+        "spec": buildable_spec(),
     }]
     _claims, normalized = normalize("hypothesis-recovery", raw, {"nodes": graph["nodes"]})
 

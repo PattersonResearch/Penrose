@@ -51,6 +51,15 @@ def _placebo_loop() -> tuple[int, bool]:
         "strategy_class": "noise-placebo", "candidate_class": "testable_now",
         "inspired_by": [mechanisms[0]["node_id"]],
         "falsifier": "no positive OOS evidence",
+        "spec": {
+            "signal": "zscore(noise_signal, window)",
+            "series": ["noise_signal"],
+            "params": {"window": 20},
+            "param_grid": {"window": [10, 20, 60]},
+            "conditioning": None,
+            "entry_exit": "enter when signal > 1; exit after horizon",
+            "horizon": "1d",
+        },
     }]
     claims, normalized = normalize("calib-noise", raw, {"nodes": graph["nodes"]})
     if not normalized[0]["admitted"]:

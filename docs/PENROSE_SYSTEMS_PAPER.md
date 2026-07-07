@@ -740,7 +740,7 @@ A publishable artifact should include data snapshots, exact environment metadata
 
 ### 14.3 Audit history
 
-The repository documents adversarial review findings that changed verdict validity, including:
+The repository documents review findings that changed verdict validity, including:
 
 - a `max(PSR, DSR)` combination that made deflation ineffective;
 - holdout leakage into kill gates;

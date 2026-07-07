@@ -36,6 +36,27 @@ from .. import stats as H        # vendored DSR/Sharpe/capacity — penrose is s
 LEDGER = config.ROOT / "backtest_ledger.tsv"
 HOLDOUT_LOCK = config.ROOT / ".holdout_burned"
 IS_FRAC, OOS_FRAC = 0.50, 0.30                 # holdout = final 0.20
+DECLARED_GRID_SIZE_CAP = 10000
+
+
+def declared_param_grid(spec) -> dict | None:
+    """Return a normalized declared param grid, fail-open at None."""
+    try:
+        grid = spec.get("param_grid") if isinstance(spec, dict) else None
+        if not isinstance(grid, dict) or not grid:
+            return None
+        out = {}
+        for key in sorted(grid.keys(), key=lambda k: str(k)):
+            values = grid[key]
+            if not isinstance(values, (list, tuple, set)) or len(values) == 0:
+                return None
+            vals = list(values)
+            if isinstance(values, set):
+                vals = sorted(vals, key=lambda v: repr(v))
+            out[str(key)] = vals
+        return out or None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _claim_holdout_lock(name: str) -> Path:
@@ -48,11 +69,28 @@ def _claim_holdout_lock(name: str) -> Path:
     return HOLDOUT_LOCK.parent / f"{HOLDOUT_LOCK.name}.{slug}.{digest}.lock"
 
 
+def declared_grid_size(spec) -> int:
+    """Return the number of configs spanned by spec.param_grid, fail-open at one."""
+    try:
+        grid = declared_param_grid(spec)
+        if not grid:
+            return 1
+        total = 1
+        for values in grid.values():
+            total *= len(values)
+            if total >= DECLARED_GRID_SIZE_CAP:
+                return DECLARED_GRID_SIZE_CAP
+        return max(1, int(total))
+    except Exception:  # noqa: BLE001
+        return 1
+
+
 def _trial_stats(family: str | None = None, strategy: str | None = None,
                  registered_trials: int | None = None, *,
                  generation_source: str = "paper",
                  search_cohort_id: str | None = None,
-                 preregistered_single_cohort: bool = False) -> tuple[int, float]:
+                 preregistered_single_cohort: bool = False,
+                 declared_grid_size: int = 1) -> tuple[int, float]:
     """n_trials + cross-trial Sharpe variance for DSR deflation.
 
     C1: trials are scoped to the FAMILY (strategy_class + data_domain), so testing 500 crypto
@@ -62,16 +100,23 @@ def _trial_stats(family: str | None = None, strategy: str | None = None,
     prior = getattr(config, "DEFLATION_PRIOR", {})
     if generation_source == "provided_series_statistic" and preregistered_single_cohort:
         floor = 1
+        declared_floor = 1
     else:
         floor = int(prior.get(
             "generated_min_trials" if generation_source == "generated" else "external_min_trials",
             1,
         ))
+        try:
+            declared_floor = min(DECLARED_GRID_SIZE_CAP, max(1, int(declared_grid_size or 1)))
+        except Exception:  # noqa: BLE001
+            declared_floor = 1
     sr_var_prior = float(prior.get("sr_var_prior", 0.0))
     min_scored = int(prior.get("min_scored_for_empirical_var", 0))
 
     def _with_prior(n_raw: int, var_raw: float, n_scored: int) -> tuple[int, float]:
         n = max(1, n_raw, floor)
+        # Cheap half only: charge declared parameter-search width; do not re-run grid configs here.
+        n = max(n, declared_floor)
         var = float(var_raw)
         if min_scored > 0 and n_scored < min_scored:
             var = max(var, sr_var_prior)
@@ -359,6 +404,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
                  search_cohort_id: str | None = None,
                  search_denominator: int | None = None,
                  preregistered_single_cohort: bool = False,
+                 declared_grid_size: int = 1,
                  regime_schemes: dict | None = None,
                  declared_regime: dict | None = None) -> dict:
     """Score a strategy's per-trade net returns under full S4 discipline, plus the
@@ -381,8 +427,13 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     """
     net = net_per_trade.dropna()
     n = len(net)
+    try:
+        declared_grid_n = min(DECLARED_GRID_SIZE_CAP, max(1, int(declared_grid_size or 1)))
+    except Exception:  # noqa: BLE001
+        declared_grid_n = 1
     if n < config.DSR_DECISION["min_oos_bars"]:        # need enough total trades to carve an OOS (A-005)
-        return {"n": n, "note": "insufficient_trades", "dsr": 0.0, "tail": R.tail_metrics(net)}
+        return {"n": n, "note": "insufficient_trades", "dsr": 0.0,
+                "declared_grid_size": declared_grid_n, "tail": R.tail_metrics(net)}
 
     # time split FIRST — the final 0.20 is the LOCKED, single-use HOLDOUT. It must NEVER
     # reach a kill gate (3-fold, regime); only final_holdout_eval may read net[o:]. (A-002)
@@ -396,7 +447,8 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
         family, name, registered_trials=search_denominator,
         generation_source=generation_source,
         search_cohort_id=search_cohort_id,
-        preregistered_single_cohort=preregistered_single_cohort)  # current + registered search
+        preregistered_single_cohort=preregistered_single_cohort,
+        declared_grid_size=declared_grid_n)  # current + registered search
     # Regime kill-lens (Punisher) on the NON-HOLDOUT window. Calendar buckets always; the
     # pre-registered point-in-time vol/trend labels (extra_schemes) join when supplied so the
     # lens also catches edges concentrated in one MARKET regime. Each populated partition is an
@@ -418,6 +470,7 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
         "n_oos": len(oos),
         "bars_per_year": bars_per_year,        # needed for power/MDE in the verdict (power-aware labels)
         "n_trials": n_trials,
+        "declared_grid_size": declared_grid_n,
         "regime": regime,
         "tail": tail,
         "dsr": round(H.deflated_sharpe(oos, n_trials, sr_var), 4) if len(oos) >= 20 else 0.0,

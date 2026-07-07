@@ -22,12 +22,154 @@ Pure numpy / pandas; no harness coupling. Deterministic given a seed.
 from __future__ import annotations
 
 import itertools
+import hashlib
+import json
 import math
 
 import numpy as np
 import pandas as pd
 
 from .. import config
+
+
+# --------------------------------------------------------------------------- #
+def parameter_fragility(module, bundle, claim, cost_frac, spec, oos_frac: float) -> dict:
+    """Re-run a declared param grid and flag edges isolated to a small share of configs.
+
+    This gate is intentionally fail-open. Missing override support, malformed grids,
+    per-config module failures, and empty outputs never raise into verdict logic.
+    """
+    try:
+        gate = getattr(config, "FRAGILITY_GATE", {})
+        if not gate.get("enabled", True):
+            return {"ran": False, "reason": "disabled"}
+        if not getattr(module, "__supports_param_override__", False):
+            return {"ran": False, "reason": "module_no_param_override"}
+        from . import p7_backtest as P7
+        grid = P7.declared_param_grid(spec)
+        if not grid:
+            return {"ran": False, "reason": "no_param_grid"}
+        n_total = _grid_size_exact(grid)
+        min_configs = int(gate.get("min_configs", 4))
+        if n_total < min_configs:
+            return {"ran": False, "reason": "grid_too_small", "n_configs": int(n_total)}
+        max_configs = max(1, int(gate.get("max_configs", 24)))
+        configs = _sample_param_configs(grid, min(max_configs, n_total), seed=int(gate.get("seed", 0)))
+        per_config = []
+        n_positive = 0
+        for cfg in configs:
+            row = {"config": dict(cfg), "edge": None, "positive": False}
+            try:
+                res = module.run(bundle, claim, cost_frac, param_override=dict(cfg))
+                if not isinstance(res, dict) or not res.get("ok"):
+                    row["reason"] = str((res or {}).get("reason") if isinstance(res, dict) else "non_dict")
+                else:
+                    edge = _oos_mean_edge(res.get("net"), oos_frac=oos_frac)
+                    row["edge"] = edge
+                    row["positive"] = bool(edge is not None and edge > 0.0)
+                    if row["positive"]:
+                        n_positive += 1
+            except Exception as exc:  # noqa: BLE001
+                row["reason"] = f"{type(exc).__name__}: {exc}"
+            per_config.append(row)
+        n_configs = len(per_config)
+        # Q-1: an INERT grid must NOT earn a robustness certification. If every config produced an
+        # identical edge, the grid varied nothing the executor actually reads (e.g. a grid over
+        # strike_low, n_paths, or a typo'd key that _merge_param_override dumps into params and the
+        # pricing model ignores) — so no fragility was tested. Treat it as not-run (`ran: False`) rather
+        # than silently reporting `fragile: False`, which would be a false "passed the gate" signal on
+        # the verdict-critical path. Distinct rounding tolerates float noise; all-errored also lands here.
+        # None (a config that produced no trades / errored) is itself a DISTINCT outcome: a grid where
+        # one config trades and the rest go empty is FRAGILE, not inert. Only when EVERY config yields
+        # the identical outcome (all the same edge, or all None) did the grid vary nothing observable.
+        distinct_outcomes = {
+            (round(r["edge"], 10) if r.get("edge") is not None else None)
+            for r in per_config
+        }
+        if n_configs >= 2 and len(distinct_outcomes) <= 1:
+            return {
+                "ran": False,
+                "reason": "degenerate_grid",
+                "n_configs": int(n_configs),
+                "n_total_configs": int(n_total),
+                "per_config_edge": per_config,
+            }
+        positive_frac = round(float(n_positive) / n_configs, 4) if n_configs else 0.0
+        min_positive_frac = float(gate.get("min_positive_frac", 0.5))
+        return {
+            "ran": True,
+            "n_configs": int(n_configs),
+            "n_total_configs": int(n_total),
+            "positive_frac": positive_frac,
+            "per_config_edge": per_config,
+            "fragile": bool(positive_frac < min_positive_frac),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ran": False, "reason": f"{type(exc).__name__}: {exc}"}
+
+
+def _grid_size_exact(grid: dict) -> int:
+    total = 1
+    for values in grid.values():
+        total *= len(values)
+    return int(total)
+
+
+def _sample_param_configs(grid: dict, n_sample: int, *, seed: int = 0) -> list[dict]:
+    keys = list(grid.keys())
+    values = [list(grid[k]) for k in keys]
+    total = _grid_size_exact(grid)
+    if total <= n_sample:
+        return [dict(zip(keys, vals)) for vals in itertools.product(*values)]
+    if total <= 10000:
+        configs = [dict(zip(keys, vals)) for vals in itertools.product(*values)]
+        configs.sort(key=lambda c: _stable_config_digest(c, seed))
+        return configs[:n_sample]
+
+    seen: set[int] = set()
+    configs = []
+    counter = 0
+    while len(configs) < n_sample:
+        raw = hashlib.sha256(f"{seed}:{counter}".encode("utf-8")).hexdigest()
+        idx = int(raw, 16) % total
+        counter += 1
+        if idx in seen:
+            continue
+        seen.add(idx)
+        configs.append(_config_at_index(keys, values, idx))
+    configs.sort(key=lambda c: _stable_config_digest(c, seed))
+    return configs
+
+
+def _config_at_index(keys: list, values: list[list], idx: int) -> dict:
+    out = {}
+    for key, vals in reversed(list(zip(keys, values))):
+        idx, rem = divmod(idx, len(vals))
+        out[key] = vals[rem]
+    return {key: out[key] for key in keys}
+
+
+def _stable_config_digest(cfg: dict, seed: int) -> str:
+    payload = json.dumps(cfg, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(f"{seed}:{payload}".encode("utf-8")).hexdigest()
+
+
+def _oos_mean_edge(net, *, oos_frac: float) -> float | None:
+    try:
+        s = pd.Series(net).dropna().astype(float)
+        s = s[np.isfinite(s)]
+        n = len(s)
+        if n == 0:
+            return None
+        frac = min(1.0, max(0.0, float(oos_frac)))
+        start = int(n * 0.50)
+        stop = int(n * (0.50 + frac))
+        window = s.iloc[start:stop]
+        if window.empty:
+            return None
+        return float(window.mean())
+    except Exception:  # noqa: BLE001
+        return None
 
 
 # --------------------------------------------------------------------------- #

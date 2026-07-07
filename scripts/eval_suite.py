@@ -16,6 +16,9 @@ Exit code 1 on any FAIL — loop-friendly, same contract as `make verify`.
 from __future__ import annotations
 
 import sys
+import hashlib
+import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +31,11 @@ sys.path.insert(0, str(ROOT))
 from penrose.pipeline import p7_backtest as P7   # noqa: E402 (self-adds harness path)
 from penrose.pipeline import run as RUN          # noqa: E402
 from penrose.pipeline import fidelity_memory     # noqa: E402
+from penrose.pipeline import robustness as R     # noqa: E402
 from penrose.pipeline import stages              # noqa: E402
+from penrose.pipeline import event_market        # noqa: E402
+from penrose.data.event_market import EventMarketPanel  # noqa: E402
+from penrose.pipeline.event_market_backtest import run_event_market_backtest  # noqa: E402
 from penrose.brain import Claim                  # noqa: E402
 from penrose import config                       # noqa: E402
 
@@ -54,9 +61,31 @@ def _idx(n: int) -> pd.DatetimeIndex:
     return pd.date_range("2023-01-01", periods=n, freq="D")
 
 
-def _verdict(net: pd.Series):
-    bt = P7.run_backtest("eval", net, pd.Series(1.0, index=net.index), BPY, log=False)
+def _verdict(result):
+    if isinstance(result, dict):
+        net = result["net"]
+        positions = result["positions"]
+        bars_per_year = result["bars_per_year"]
+        spec = result.get("_spec")
+        module = result.get("_module")
+    elif isinstance(result, tuple):
+        net, positions, bars_per_year = result[:3]
+        spec = None
+        module = None
+    else:
+        net = result
+        positions = pd.Series(1.0, index=net.index)
+        bars_per_year = BPY
+        spec = None
+        module = None
+    bt = P7.run_backtest(
+        "eval", net, positions, bars_per_year, log=False,
+        declared_grid_size=P7.declared_grid_size(spec))
     dec = stages.p8_verdict(_claim(), bt, {}, synthetic=False)
+    if spec and module is not None and dec.verdict in ("watch", "research-supported"):
+        bt["parameter_fragility"] = R.parameter_fragility(
+            module, None, _claim(), 0.0, spec, P7.OOS_FRAC)
+        dec = stages.p8_verdict(_claim(), bt, {}, synthetic=False)
     return dec, bt
 
 
@@ -101,6 +130,137 @@ def build_thin(rng):
     return pd.Series(rng.normal(0.012, 0.01, n), index=_idx(n))
 
 
+def _normal_cdf(z: float) -> float:
+    import math
+
+    return 0.5 * (1.0 + math.erf(float(z) / math.sqrt(2.0)))
+
+
+def _normal_bracket_prob(underlying, strike_low, strike_high, params):
+    del params
+    mu = float(underlying["mu"])
+    sigma = float(underlying["sigma"])
+    return _normal_cdf((strike_high - mu) / sigma) - _normal_cdf((strike_low - mu) / sigma)
+
+
+def _event_market_panel(n: int, *, entry_offset: float) -> EventMarketPanel:
+    strike_low, strike_high = -0.5, 1.0
+    prob = _normal_bracket_prob({"mu": 0.0, "sigma": 1.0}, strike_low, strike_high, {})
+    rows = []
+    wins_per_10 = int(round(prob * 10))
+    for i in range(n):
+        decision = pd.Timestamp("2023-01-01", tz="UTC") + pd.Timedelta(days=i)
+        rows.append({
+            "event_id": f"eval-bracket-{i:03d}",
+            "decision_time": decision,
+            "close_time": decision + pd.Timedelta(hours=12),
+            "strike_low": strike_low,
+            "strike_high": strike_high,
+            "entry_price": max(0.01, min(0.99, prob + entry_offset)),
+            "outcome": 1 if (i % 10) < wins_per_10 else 0,
+            "underlying": {"mu": 0.0, "sigma": 1.0},
+        })
+    return EventMarketPanel("eval_event_market", pd.DataFrame(rows), "planted-eval")
+
+
+def build_event_market_calibrated(rng):
+    """Model equals truth and entry is underpriced. Must reach a survivor verdict."""
+    del rng
+    return run_event_market_backtest(
+        _event_market_panel(260, entry_offset=-0.18),
+        _normal_bracket_prob,
+        min_ev=0.05,
+        max_price=0.80,
+        kelly_fraction=0.75,
+        size_cap=1.0,
+    )
+
+
+def build_event_market_noedge(rng):
+    """Model equals market price everywhere. Zero Kelly size means no survivor."""
+    del rng
+    return run_event_market_backtest(
+        _event_market_panel(260, entry_offset=0.0),
+        _normal_bracket_prob,
+        min_ev=0.0,
+        max_price=0.99,
+        kelly_fraction=1.0,
+        size_cap=1.0,
+    )
+
+
+def _overpriced_model(underlying, strike_low, strike_high, params):
+    del underlying, strike_low, strike_high, params
+    return 0.90  # systematically OVERestimates the bracket probability
+
+
+def build_event_market_losing(rng):
+    """M-4: exercise the bracket KILL branch. The model overestimates, so it BUYS (nonzero Kelly size)
+    brackets priced ABOVE their true value; the outcomes lose. Trades ARE taken and the edge is
+    negative — so this must reach `kill`, unlike the no-edge case which takes no trades."""
+    del rng
+    return run_event_market_backtest(
+        _event_market_panel(260, entry_offset=0.17),  # entry ~0.70, above the true ~0.53 value
+        _overpriced_model,
+        min_ev=0.05, max_price=0.90, kelly_fraction=0.75, size_cap=1.0,
+    )
+
+
+def _event_market_table(path: Path, n: int, *, entry_offset: float) -> None:
+    strike_low, strike_high = -0.5, 1.0
+    prob = _normal_bracket_prob({"mu": 0.0, "sigma": 1.0}, strike_low, strike_high, {})
+    wins_per_10 = int(round(prob * 10))
+    rows = []
+    for i in range(n):
+        decision = pd.Timestamp("2023-01-01", tz="UTC") + pd.Timedelta(days=i)
+        rows.append({
+            "event_id": f"eval-param-bracket-{i:03d}",
+            "decision_time": decision.isoformat(),
+            "close_time": (decision + pd.Timedelta(hours=12)).isoformat(),
+            "strike_low": strike_low,
+            "strike_high": strike_high,
+            "entry_price": max(0.01, min(0.99, prob + entry_offset)),
+            "outcome": 1 if (i % 10) < wins_per_10 else 0,
+            "underlying": json.dumps({"mu": 0.0, "sigma": 1.0}),
+            "underlying_time": decision.isoformat(),
+        })
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def _event_market_param_module(param_grid: dict) -> dict:
+    digest = hashlib.sha256(json.dumps(param_grid, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    tmp = Path(tempfile.gettempdir()) / f"penrose_eval_param_{digest}.csv"
+    _event_market_table(tmp, 260, entry_offset=-0.18)
+    spec = {
+        "module_id": "eval_event_market_param",
+        "strategy_class": "eval_event_market_param",
+        "claim_type": "event_market_strategy",
+        "event_market": {"path": str(tmp), "name": "eval_param_brackets"},
+        "pricing_model": {"family": "normal_bracket"},
+        "entry": {"min_ev": 0.05, "max_price": 0.80, "kelly_fraction": 0.75, "size_cap": 1.0},
+        "param_grid": param_grid,
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "eval_event_market_param"
+    module = event_market.build_module(spec, claim)
+    out = module.run(None, claim, 0.0)
+    out["_module"] = module
+    out["_spec"] = spec
+    return out
+
+
+def build_event_market_param_stable(rng):
+    """Declared grid keeps the bracket edge across nearby entry thresholds. Must survive."""
+    del rng
+    return _event_market_param_module({"min_ev": [0.01, 0.03, 0.05, 0.07]})
+
+
+def build_event_market_param_fragile(rng):
+    """Edge trades only at the declared threshold; higher thresholds produce no positive OOS edge."""
+    del rng
+    return _event_market_param_module({"min_ev": [0.05, 0.25, 0.30, 0.35]})
+
+
 # (name, builder, expected verdict(s), expected kill_reason substring or None)
 CASES = [
     # PEN-01: the low-power 3-fold failure may reclassify; this planted case must not survive.
@@ -109,6 +269,11 @@ CASES = [
     ("regime-fragile (weekend)", build_regime_fragile, ("kill",),                           "regime_fragile"),
     ("random noise",             build_random,         ("kill",),                           None),
     ("thin sample",              build_thin,           ("insufficient_data",),              None),
+    ("event-market calibrated",   build_event_market_calibrated, ("watch", "research-supported"), None),
+    ("event-market no-edge",      build_event_market_noedge, ("kill", "underpowered", "insufficient_data"), None),
+    ("event-market losing",       build_event_market_losing, ("kill", "underpowered"), None),
+    ("event-market param-stable",  build_event_market_param_stable, ("watch", "research-supported"), None),
+    ("event-market param-fragile", build_event_market_param_fragile, ("kill",), "parameter_fragile"),
 ]
 
 
@@ -914,7 +1079,16 @@ def run(bundle, claim, cost_frac):
     _sg = {"nodes": [{"node_id": "cross-1", "level": "cross_family_mechanism"}]}
     _sc, _sn = _normalize_synthesis("edge-s", [{
         "statement": "candidate hypothesis", "candidate_class": "testable_now",
-        "strategy_class": "edge", "inspired_by": ["cross-1"]}], _sg)
+        "strategy_class": "edge", "inspired_by": ["cross-1"],
+        "spec": {
+            "signal": "zscore(edge_series, window)",
+            "series": ["edge_series"],
+            "params": {"window": 20},
+            "param_grid": {"window": [10, 20, 60]},
+            "conditioning": None,
+            "entry_exit": "enter when signal > 1; exit after horizon",
+            "horizon": "1d",
+        }}], _sg)
     out.append(("EDGE-WP4: synthesized hypotheses are unanchored candidates with grounded lineage",
                 len(_sc) == 1 and _sc[0].source_type == "synthesized_hypothesis"
                 and _sn[0]["grounded"] and _sn[0]["admitted"]))

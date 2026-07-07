@@ -426,6 +426,84 @@ def test_single_claim_cohort_is_byte_identical_to_running_count(tmp_path):
     )
 
 
+def test_declared_grid_size_counts_product_fail_open_and_caps():
+    assert p7.declared_grid_size({
+        "param_grid": {"window": [10, 20, 60], "thr": [1, 2]},
+    }) == 6
+    assert p7.declared_grid_size(None) == 1
+    assert p7.declared_grid_size({}) == 1
+    assert p7.declared_grid_size({"param_grid": {}}) == 1
+    assert p7.declared_grid_size({"param_grid": {"window": []}}) == 1
+    assert p7.declared_grid_size({"param_grid": {"window": "10,20,60"}}) == 1
+    assert p7.declared_grid_size({
+        "param_grid": {"window": list(range(101)), "thr": list(range(101))},
+    }) == p7.DECLARED_GRID_SIZE_CAP
+
+
+def test_declared_parameter_grid_floors_trials_and_deflates_more(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        net = _net()
+        positions = pd.Series(1.0, index=net.index)
+        baseline = p7.run_backtest(
+            "grid-baseline", net, positions, 252.0, family="unit::grid", log=False)
+        unit_grid = p7.run_backtest(
+            "grid-unit", net, positions, 252.0, family="unit::grid",
+            declared_grid_size=1, log=False)
+        wide_grid = p7.run_backtest(
+            "grid-wide", net, positions, 252.0, family="unit::grid",
+            declared_grid_size=20, log=False)
+    finally:
+        p7.LEDGER = old
+
+    base_family_n = baseline["n_trials"] - int(baseline["regime"].get("n_partitions", 0))
+    wide_family_n = wide_grid["n_trials"] - int(wide_grid["regime"].get("n_partitions", 0))
+    assert unit_grid["n_trials"] == baseline["n_trials"]
+    assert unit_grid["dsr"] == baseline["dsr"]
+    assert baseline["declared_grid_size"] == 1
+    assert wide_grid["declared_grid_size"] == 20
+    assert wide_family_n >= 20
+    assert wide_family_n > base_family_n
+    assert wide_grid["n_trials"] > baseline["n_trials"]
+    assert wide_grid["dsr"] < baseline["dsr"]
+
+
+def test_preregistered_provided_series_ignores_declared_grid_floor(tmp_path):
+    old = p7.LEDGER
+    p7.LEDGER = tmp_path / "ledger.tsv"
+    try:
+        n, _ = p7._trial_stats(
+            "provided-series::claim", "provided-grid",
+            generation_source="provided_series_statistic",
+            preregistered_single_cohort=True,
+            declared_grid_size=20,
+        )
+        net = _net()
+        bt = p7.run_backtest(
+            "provided-grid",
+            net,
+            pd.Series(1.0, index=net.index),
+            252.0,
+            family="provided-series::claim",
+            generation_source="provided_series_statistic",
+            preregistered_single_cohort=True,
+            declared_grid_size=20,
+            log=False,
+        )
+    finally:
+        p7.LEDGER = old
+
+    assert n == 1
+    assert bt["declared_grid_size"] == 20
+    assert bt["regime"] == {
+        "n_partitions": 0,
+        "fragile": False,
+        "provided_series_statistic": True,
+    }
+    assert bt["n_trials"] == 1
+
+
 def test_run_cohort_registration_failure_falls_back_to_running_count(tmp_path, monkeypatch):
     old = p7.LEDGER
     p7.LEDGER = tmp_path / "ledger.tsv"
@@ -660,3 +738,25 @@ def _isolate_run_outputs(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(runmod.config, "LIVE_JSON", tmp_path / "live.json")
     monkeypatch.setattr(runmod.config, "PROGRESS_JSON", tmp_path / "progress.json")
     monkeypatch.setattr(runmod.config, "MODULES", tmp_path / "modules")
+
+
+def test_declared_grid_size_deflation_floor(tmp_path):
+    """#58 core: a declared param grid floors n_trials (charges the parameter search); grid<=1 is inert.
+    Isolates the global ledger so the floor — not accumulated history — determines n_trials."""
+    import numpy as np, pandas as pd
+    from penrose.pipeline import p7_backtest as P
+    assert P.declared_grid_size({"param_grid": {"w": [10, 20, 60], "t": [1, 2]}}) == 6
+    assert P.declared_grid_size({}) == 1 and P.declared_grid_size({"param_grid": "x"}) == 1
+    idx = pd.date_range("2023-01-01", periods=200, freq="D", tz="UTC")
+    net = pd.Series(np.random.default_rng(0).normal(0.001, 0.01, 200), index=idx)
+    pos = pd.Series(1.0, index=idx)
+    old = P.LEDGER
+    try:
+        P.LEDGER = tmp_path / "base.tsv"
+        base = P.run_backtest("g1", net, pos, 252.0, log=False, declared_grid_size=1)
+        P.LEDGER = tmp_path / "grid.tsv"
+        grid = P.run_backtest("g2", net, pos, 252.0, log=False, declared_grid_size=30)
+    finally:
+        P.LEDGER = old
+    assert grid["n_trials"] >= 30            # the declared 30-wide grid floors n_trials
+    assert grid["n_trials"] > base["n_trials"]  # and deflates strictly more than the no-grid run

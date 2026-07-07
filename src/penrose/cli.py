@@ -104,6 +104,7 @@ def _cmd_run(args) -> int:
             claims_override=claims_override,
             force=args.force,
             max_claims=args.max_claims,
+            max_claim_workers=args.workers,
         )
         if args.json:
             print(json.dumps(_run_json_object(out), sort_keys=True, default=str))
@@ -127,6 +128,8 @@ def _cmd_run(args) -> int:
         argv += ["--force"]
     if args.max_claims is not None:
         argv += ["--max-claims", str(args.max_claims)]
+    if args.workers is not None:
+        argv += ["--workers", str(args.workers)]
     sys.argv = ["penrose-run"] + argv
     runmod.main()
     return 0
@@ -312,6 +315,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--max-claims", type=int,
                    help=("process at most N extracted claims; setting "
                          "PENROSE_CLAIM_TIME_BUDGET_SECONDS makes budget skips wall-clock-dependent"))
+    p.add_argument("--workers",
+                   help="per-claim worker threads; default min(4, auto) (auto-reduced on small hardware); accepts int or 'auto'")
     p.add_argument("--json", action="store_true",
                    help="print one parseable JSON result object to stdout")
     p.add_argument("--claims", help="path to a JSON list of structured Claim objects")

@@ -17,6 +17,7 @@ from .. import config
 
 CLAIM_TYPES = frozenset({
     "descriptive_statistical",
+    "event_market_strategy",
     "trading_strategy",
     "structural_proposition",
     "provided_series_statistic",
@@ -64,6 +65,26 @@ _TRADING_CONSTRUCTION_PATTERNS = [
     r"\bsignal\b",
     r"\bmomentum\b",
     r"\brebalance\b|\brebalanced\b|\brebalancing\b",
+]
+
+_EVENT_MARKET_MARKET_PATTERNS = [
+    r"\bevent[- ]market\b",
+    r"\bprediction[- ]market\b",
+    r"\bkalshi\b",
+    r"\bpolymarket\b",
+]
+_EVENT_MARKET_BRACKET_PATTERNS = [
+    r"\bbracket(?:s|ed)?\b",
+    r"\bstrike(?:s)?\b",
+    r"\bbinary\s+market\b",
+    r"\bsettled?\s+(?:inside|within)\b",
+]
+_EVENT_MARKET_PRICING_PATTERNS = [
+    r"\bdeclared\s+(?:bracket\s+)?pricing\s+model\b",
+    r"\bnormal[_ -]bracket\b",
+    r"\bpricing\s+model\b.{0,80}\b(?:mu|forecast|spot)\b.{0,40}\bsigma\b",
+    r"\bphi\s*\(",
+    r"\bprobability\s+model\b.{0,80}\bbracket\b",
 ]
 
 _DESCRIPTIVE_PATTERNS = [
@@ -178,6 +199,19 @@ def classify_claim_type(claim, source=None) -> str:
     if not claim_text.strip():
         return DEFAULT_CLAIM_TYPE
 
+    source_text = (getattr(source, "text", "") or "").lower()
+    event_text = " ".join([claim_text, source_text])
+    # M-3: the declared-pricing-model cue (the strongest signal this IS a bracket strategy) must appear
+    # in the CLAIM itself, not merely somewhere in the source body — otherwise a paper whose main claim
+    # is unrelated but whose data/related-work section mentions a bracket pricing model gets misrouted to
+    # event_market_strategy and parks at a false needs_data. Venue+bracket cues may still come from either.
+    if (
+        any(re.search(pat, event_text) for pat in _EVENT_MARKET_MARKET_PATTERNS)
+        and any(re.search(pat, event_text) for pat in _EVENT_MARKET_BRACKET_PATTERNS)
+        and any(re.search(pat, claim_text) for pat in _EVENT_MARKET_PRICING_PATTERNS)
+    ):
+        return "event_market_strategy"
+
     # Checked FIRST and independently of the descriptive/trading tally, but only for
     # explicit provided-series declarations. Ambiguous pooled/cohort/one-sample prose is
     # handled by the declaration-gated weak branch below.
@@ -194,7 +228,6 @@ def classify_claim_type(claim, source=None) -> str:
         if trading_construction >= 2 and not high_confidence_encoded:
             return "trading_strategy"
         return "provided_series_statistic"
-    source_text = (getattr(source, "text", "") or "").lower()
     stat_text = " ".join([claim_text, source_text])
     has_weak_stat = any(
         re.search(pat, stat_text) for pat in _PROVIDED_SERIES_STAT_WEAK_PATTERNS

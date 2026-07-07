@@ -39,7 +39,7 @@ The minimum:
 
 ```bash
 pip install -e .                              # editable install; Penrose runs scripts from the clone
-python scripts/eval_suite.py                  # invariant suite — must print 101/101 passed
+python scripts/eval_suite.py                  # invariant suite — must print 106/106 passed
 python -m pytest -q                           # unit tests — must stay green
 python scripts/calibration_placebo.py         # placebo: no no-edge signal may be certified
 ```
@@ -65,6 +65,31 @@ unset.
   chat assistant.
 - `modules/` — reviewed, deterministic strategy modules the pipeline can route claims to.
 - `docs/` — `GATES.md` (plain-language gate reference) and assets.
+
+## Building data adapters
+
+Penrose reads data through provenance-carrying contracts in `src/penrose/data/`: `Series` (daily scalar
+time series), `Panel` (dates × entity columns, for cross-sectional claims), and `EventMarketPanel`
+(per-event bracket markets, for prediction-market/bracket claims). Vendor adapters live in
+`src/penrose/data/vendors/` and `src/penrose/data/*.py` (stooq, polygon, tiingo, fred, sec_edgar, …).
+
+When you add or extend an adapter:
+
+- **Satisfy a contract, don't invent a shape.** Return one of the contracts above (extend a contract only
+  with a spec + tests). Carry `provenance` honestly; return `Unavailable`, never a fabricated value, when
+  the contract can't be met.
+- **No lookahead, checked at the boundary.** Only data known at/before the decision time may enter a row;
+  frequency is checked so intraday can't be silently treated as daily. A settlement/outcome field must
+  not leak information available only after close.
+- **Deterministic + seeded.** No wall-clock dependence, no unseeded RNG, stable ordering.
+- **Fail gracefully.** Missing keys, empty pulls, and degenerate inputs produce a clear message, never a
+  traceback (invariant #5).
+- **Public vs internal is enforced by tooling, not vigilance.** Build in the open; `scripts/build_public.sh`
+  (allowlist + leak-check) decides what syncs to the public repo and aborts on a leak. Public-venue
+  adapters (e.g. Kalshi, SEC EDGAR) can ship public; adapters that reference our private catalog contents
+  or paths stay internal — keep those under an internal-only path/name so the allowlist excludes them.
+- **Test it.** A new adapter/contract ships with deterministic tests (including a lookahead-rejection
+  test) and keeps `eval_suite.py` green.
 
 ## Non-negotiable invariants (do not violate these)
 

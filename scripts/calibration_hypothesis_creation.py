@@ -16,6 +16,18 @@ PLANTED_PRINCIPLE = (
 )
 
 
+def _buildable_spec(series: str = "stress_signal") -> dict:
+    return {
+        "signal": f"zscore({series}, window) - ma({series}, slow_window)",
+        "series": [series],
+        "params": {"window": 20, "slow_window": 60},
+        "param_grid": {"window": [10, 20, 40], "slow_window": [40, 60, 120]},
+        "conditioning": "lag(liquidity_stress, 1) > threshold",
+        "entry_exit": "enter when signal > 1; exit after horizon or signal <= 0",
+        "horizon": "1d",
+    }
+
+
 def planted_concepts() -> list[dict]:
     rows = []
     for family, domain, dataset in [
@@ -111,6 +123,7 @@ def grounding_check(graph: dict, mechanism: dict) -> bool:
         "candidate_class": "testable_now",
         "inspired_by": [mechanism["node_id"]],
         "falsifier": "no OOS lift after conditioning",
+        "spec": _buildable_spec(),
     }, {
         "statement": "Hallucinated planted candidate hypothesis",
         "mechanism": "fake mechanism",
@@ -129,6 +142,7 @@ def grounding_check(graph: dict, mechanism: dict) -> bool:
         "candidate_class": "testable_now",
         "inspired_by": [mechanism["node_id"]],
         "falsifier": "no OOS lift after conditioning",
+        "spec": _buildable_spec(),
     }]
     _claims, normalized = normalize("calib-hypothesis-recovery", raw, {"nodes": graph["nodes"]})
     return (

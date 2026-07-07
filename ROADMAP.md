@@ -12,7 +12,7 @@ others can adopt, audit, and extend, plus a growing, shared **corpus of invalida
 new claim cheaper to judge than the last. Penrose is the referee layer; it does not generate alpha and
 makes no profitability claims, and that will not change.
 
-## Where v0.4.0 stands
+## Where v0.5.0 stands
 
 The falsification pipeline, the power-aware verdict taxonomy (now tested against a frozen
 realistic-edge floor and enforced by a Monte-Carlo control), the anti-mining deflation and
@@ -25,7 +25,11 @@ false-killing true marginal edges and passing best-of-K mined noise, are now clo
 controls at the frozen floor. Costs and capacity are still modeled rather than measured, several data
 domains lack production adapters, independent replication is not yet automated, and the generative
 layer (dream, synthesize, distill) is frozen behind a default-off flag pending a corpus re-score under
-the new taxonomy. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full status.
+the new taxonomy. **0.5.0** adds an event-market (bracket) adapter — a new data contract and strategy
+class for resolution-outcome markets — a parameter-robustness treatment (the declared grid is charged to
+the multiple-testing denominator, and a fragility gate kills edges that survive only at isolated parameter
+points), reconstructable synthesis candidates, and opt-in parallel claim execution whose verdicts are
+byte-identical to a serial run. See the [systems paper](docs/PENROSE_SYSTEMS_PAPER.md) for the full status.
 
 ## Directions we are pursuing
 

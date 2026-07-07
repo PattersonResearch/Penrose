@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-from .. import config
+from .. import config, worker_control
 
 
 # --- response types --------------------------------------------------------- #
@@ -64,6 +64,19 @@ class _Budget:
 
 
 _BUDGET = _Budget()
+
+
+def _is_rate_limit_error_text(text: str) -> bool:
+    msg = (text or "").lower()
+    return "llm http 429" in msg or "429" in msg or "rate limit" in msg or "rate_limit" in msg
+
+
+def _report_rate_limit() -> None:
+    worker_control.report_rate_limit()
+
+
+def _report_success() -> None:
+    worker_control.report_success()
 
 
 def reset_budget() -> None:
@@ -151,6 +164,8 @@ class OpenAICompatProvider:
                 break
             except urllib.error.HTTPError as e:
                 err = e.read().decode()[:500] if hasattr(e, "read") else str(e)
+                if e.code == 429:
+                    _report_rate_limit()
                 raise RuntimeError(f"LLM HTTP {e.code}: {err}") from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last_err = e
@@ -278,19 +293,26 @@ def call(role: str, messages: list[dict], *,
             timeout=timeout,
             extra_body=request_extra_body,
         )
-    except Exception:  # noqa: BLE001 - verifier provider must degrade to the default path
+    except Exception as exc:  # noqa: BLE001 - verifier provider must degrade to the default path
+        if _is_rate_limit_error_text(str(exc)):
+            _report_rate_limit()
         if role != "fidelity_refuter" or not verifier_provider_configured:
             raise
         verifier_fallback = True
         independent_verifier = False
-        payload = _provider().complete(
-            model, messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            response_format={"type": "json_object"} if json_mode else None,
-            timeout=timeout,
-            extra_body=request_extra_body,
-        )
+        try:
+            payload = _provider().complete(
+                model, messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                response_format={"type": "json_object"} if json_mode else None,
+                timeout=timeout,
+                extra_body=request_extra_body,
+            )
+        except Exception as fallback_exc:  # noqa: BLE001
+            if _is_rate_limit_error_text(str(fallback_exc)):
+                _report_rate_limit()
+            raise
     elapsed = time.time() - t0
     cost = _estimate_cost(payload["model"], payload["in_tokens"], payload["out_tokens"])
 
@@ -315,6 +337,7 @@ def call(role: str, messages: list[dict], *,
                          "in_tokens": resp.in_tokens, "out_tokens": resp.out_tokens,
                          "cost_usd": resp.cost_usd, "elapsed_s": resp.elapsed_s,
                          "cached": False, "independent_verifier": resp.independent_verifier})
+    _report_success()
     return resp
 
 
@@ -420,6 +443,8 @@ def call_json(role: str, messages: list[dict], *, _max_attempts: int = 3,
             # call() wraps HTTPError as 'LLM HTTP <code>'. Retry transient 429/5xx; a 4xx
             # (auth / bad request) is not transient -> re-raise immediately.
             msg = str(e)
+            if _is_rate_limit_error_text(msg):
+                _report_rate_limit()
             if ("LLM HTTP 5" in msg or "LLM HTTP 429" in msg) and attempt < _max_attempts - 1:
                 last_err = e
                 time.sleep(1.5 * (attempt + 1))

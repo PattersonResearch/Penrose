@@ -10,7 +10,7 @@ whether the edge is real or just an artifact of how it was found. The same retur
 edge or a lucky fluke, depending on how many things you tried to get there. It never tells you what to
 trade; it tells you what not to believe._
 
-[![Version](https://img.shields.io/badge/version-0.4.2-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.5.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -136,11 +136,15 @@ by default: its volume is single-venue, not consolidated tape volume, so volume-
 route to `needs_data` unless a consolidated intraday feed such as paid Polygon is supplied. Untrusted
 auto-generated code **only ever runs inside a Docker sandbox,** never in Penrose's own process.
 
-For cross-sectional claims, the data layer also has a `Panel` contract (UTC dates x entity columns)
-and pure `xsection` transforms for point-in-time reconstruction: as-of panel assembly, deterministic
-cross-sectional ranks/z-scores, liquidity screens, and long-short factor formation. These are referee
-primitives for rebuilding what a claim describes; they are not signal-generation tools and make no
-claim that any factor is profitable. SEC EDGAR is available as a keyless, point-in-time fundamentals
+Penrose reads data through three contracts — `Series` (daily time series), `Panel` (dates × entities,
+for cross-sectional claims), and `EventMarketPanel` (per-event bracket markets, for prediction-market
+claims) — and any source plugs in behind them via a small **adapter**. See
+[docs/ADAPTERS.md](docs/ADAPTERS.md) to add one (the contracts, the no-look-ahead/deterministic
+invariants, and examples to copy). For cross-sectional claims the data layer also has pure `xsection`
+transforms for point-in-time reconstruction: as-of panel assembly, deterministic cross-sectional
+ranks/z-scores, liquidity screens, and long-short factor formation. These are referee primitives for
+rebuilding what a claim describes; they are not signal-generation tools and make no claim that any
+factor is profitable. SEC EDGAR is available as a keyless, point-in-time fundamentals
 panel source for public company filings; set `SEC_EDGAR_UA` to your contact string for SEC fair-access
 requests, or Penrose uses a generic project contact.
 
@@ -210,7 +214,7 @@ pip install -e .             # editable: Penrose runs the scripts that ship in t
 jupyter notebook notebooks/penrose_demo.ipynb
 
 # or from the command line (no key needed):
-penrose eval                 # ground-truth: planted strategies with known verdicts (101/101)
+penrose eval                 # ground-truth: planted strategies with known verdicts (106/106)
 python scripts/worked_example_process_conditional.py  # start here: identical returns, opposite verdicts by search scope
 make calib-nulls            # the 5-null specificity battery (0/300)
 make calib-sensitivity      # the detection-threshold sweep

@@ -367,6 +367,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     boot = bt.get("bootstrap") or {}
     perm = bt.get("permutation") or {}
     regime = bt.get("regime") or {}
+    parameter_fragility = bt.get("parameter_fragility") or {}
     declared_regime = regime.get("declared_regime") or getattr(claim, "declared_regime", None)
     cpcv = dict(bt.get("cpcv") or {})
     pbo = _genuine_cscv_pbo(bt.get("cpcv_candidate_oos_series"), cpcv)
@@ -409,6 +410,12 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                     f"CPCV overfit: prob_oos_loss={cpcv.get('prob_oos_loss')}, "
                     f"median_oos_sharpe={cpcv.get('median_oos_sharpe')}, "
                     f"combos={cpcv.get('combos_used')}")
+            elif parameter_fragility.get("ran") and parameter_fragility.get("fragile"):
+                verdict, kill = "kill", "parameter_fragile"
+                reasons.append(
+                    "parameter-fragile: "
+                    f"positive_frac={parameter_fragility.get('positive_frac')} across "
+                    f"{parameter_fragility.get('n_configs')} configs")
 
     # Trust/tail caps are independent and all must remain VISIBLE. Capture whether the statistical
     # path reached the strongest verdict BEFORE any cap (tail or trust); otherwise the first cap
@@ -500,7 +507,8 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     # A NON-structural null — low DSR (`no_oos_edge`), low edge t-stat (`low_edge_t`), or a
     # bootstrap CI that includes zero (`edge_ci_zero`) — on data that could NOT resolve a realistic
     # edge is NOT proven dead; it is below the detection floor. Relabel it `underpowered`.
-    # Structural kills (in_sample_only, regime_fragile, walk_forward_drift, no_signal_alignment)
+    # Structural kills (in_sample_only, regime_fragile, parameter_fragile,
+    # walk_forward_drift, no_signal_alignment)
     # are power-INDEPENDENT and stand. This is the fix for "a skeptic that rejects everything real
     # == a broken always-no".
     _AMBIGUOUS_NULL = {"no_oos_edge", "edge_ci_zero", "overfit_cpcv", "low_edge_t"}
@@ -523,7 +531,8 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     if resolution is None and not power_sufficient:
         resolution = _power_resolution(_n_oos, _bpy, mde_ic, pw)
     # The "~N more trades would resolve it" RATIONALE applies ONLY to the power-limited labels.
-    # Structural kills (in_sample_only, regime_fragile, no_signal_alignment, walk_forward_drift, ...)
+    # Structural kills (in_sample_only, regime_fragile, parameter_fragile,
+    # no_signal_alignment, walk_forward_drift, ...)
     # are power-INDEPENDENT and stand — telling a researcher to collect more data there is false. The
     # resolution OBJECT is still attached in metrics (above) as neutral data for any not-powered case.
     if resolution and verdict in ("underpowered", "insufficient_data"):
@@ -561,6 +570,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "tail_skew": tail.get("skew"),
                  "tail_tail_ratio": tail.get("tail_ratio"),
                  "tail_max_loss": tail.get("max_loss"),
+                 "parameter_fragility": parameter_fragility,
                  "cpcv": cpcv,
                  "capacity_ci": bt.get("capacity_ci"),
                  "cost_sensitivity": bt.get("cost_sensitivity"),
