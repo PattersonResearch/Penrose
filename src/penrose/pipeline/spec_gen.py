@@ -18,6 +18,7 @@ import yaml
 from .. import config, llm
 from ..brain import Claim
 from ..data.contract import load_catalog_loader
+from ..strategy_family import declared_strategy_family
 from . import fidelity_memory
 from .p1_ingest import IngestedSource
 
@@ -76,6 +77,7 @@ Output JSON with this exact shape:
 {{
   "module_id": str (snake_case identifier for the module),
   "strategy_class": str (echo or refine the strategy class),
+  "strategy_family": {{"components": [str], "method": "single|regime_blend|ensemble|overlay"}},
   "claim_translation": str (how the academic claim becomes a tradeable, falsifiable test),
   "inputs": [str] (list of F7a data contract series names the module needs),
   "signal_logic": str (pseudocode or precise description of how the module computes positions),
@@ -105,6 +107,7 @@ Output JSON with this exact shape:
 {{
   "module_id": str (snake_case identifier for the module),
   "strategy_class": str (echo or refine the strategy class),
+  "strategy_family": {{"components": [str], "method": "single"}},
   "claim_type": "descriptive_statistical",
   "claim_translation": str (the exact statistic/hypothesis to test, e.g. unconditional mean + CI),
   "inputs": [str] (list of F7a data contract series names the module needs),
@@ -135,6 +138,7 @@ Output JSON with this exact shape:
 {{
   "module_id": str (snake_case identifier for the module),
   "strategy_class": str (echo or refine the strategy class),
+  "strategy_family": {{"components": [str], "method": "single"}},
   "claim_type": "structural_proposition",
   "claim_translation": str (what can and cannot be falsified),
   "inputs": [str] (list of F7a data contract series names the module needs),
@@ -196,6 +200,8 @@ def generate_spec(claim: Claim, source: IngestedSource,
             spec = _stub_spec(claim, source)
             spec["_llm_error"] = str(e)
     spec.setdefault("claim_type", claim_type)
+    spec["strategy_family"] = declared_strategy_family(
+        claim, source, raw=spec.get("strategy_family"))
 
     spec["_generated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
     spec["_claim_id"] = claim.claim_id
@@ -268,7 +274,7 @@ def _llm_spec(claim: Claim, source: IngestedSource, *, claim_type: str | None = 
         temperature=0.1,
     )
     # ensure required keys exist
-    required = ["module_id", "strategy_class", "claim_translation", "inputs",
+    required = ["module_id", "strategy_class", "strategy_family", "claim_translation", "inputs",
                 "signal_logic", "kill_criterion", "unknowns"]
     for k in required:
         if k not in parsed:
@@ -378,6 +384,7 @@ def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
         "version": 0,
         "status": "spec-only",
         "strategy_class": claim.applicable_strategy_class or "unspecified",
+        "strategy_family": declared_strategy_family(claim, source),
         "claim_type": "provided_series_statistic",
         "source": source.source_id,
         "claim_statement": claim.statement,
@@ -445,6 +452,7 @@ def _stub_spec(claim: Claim, source: IngestedSource) -> dict:
         "version": 0,
         "status": "spec-only",
         "strategy_class": claim.applicable_strategy_class or "unspecified",
+        "strategy_family": declared_strategy_family(claim, source),
         "claim_type": claim_type,
         "source": source.source_id,
         "claim_statement": claim.statement,

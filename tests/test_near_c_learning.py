@@ -15,10 +15,10 @@ def test_propose_only_store_read_api_never_touches_approved_principles(tmp_path,
     from penrose.brain import read_proposals
     from penrose.proposals import write_proposals
 
-    proposals = tmp_path / "reports" / "proposals.jsonl"
+    proposals = tmp_path / "reports" / "principles_proposed.jsonl"
     approved = tmp_path / "principles.jsonl"
     approved.write_text("sentinel approved store\n")
-    monkeypatch.setattr(config, "PROPOSALS_LOG", proposals)
+    monkeypatch.setattr(config, "PRINCIPLES_PROPOSED", proposals)
     monkeypatch.setattr(config, "PRINCIPLES_LOG", approved)
 
     assert read_proposals() == []
@@ -41,8 +41,8 @@ def test_proposals_store_corrupt_or_missing_fails_open(tmp_path, monkeypatch):
     from penrose import config
     from penrose.brain import read_proposals
 
-    store = tmp_path / "reports" / "proposals.jsonl"
-    monkeypatch.setattr(config, "PROPOSALS_LOG", store)
+    store = tmp_path / "reports" / "principles_proposed.jsonl"
+    monkeypatch.setattr(config, "PRINCIPLES_PROPOSED", store)
 
     assert read_proposals() == []
     store.parent.mkdir(parents=True)
@@ -52,14 +52,14 @@ def test_proposals_store_corrupt_or_missing_fails_open(tmp_path, monkeypatch):
 
 def test_proposals_store_is_gitignored():
     check = subprocess.run(
-        ["git", "check-ignore", "reports/proposals.jsonl"],
+        ["git", "check-ignore", "reports/principles_proposed.jsonl"],
         check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
     assert check.returncode == 0
-    assert check.stdout.strip() == "reports/proposals.jsonl"
+    assert check.stdout.strip() == "reports/principles_proposed.jsonl"
 
 
 def test_distill_principles_cross_run_finds_what_per_run_rule_misses(tmp_path, monkeypatch):
@@ -130,11 +130,11 @@ def test_distill_principles_empty_or_corrupt_corpus_fails_open(tmp_path, monkeyp
 def test_cli_proposals_reads_and_principles_distills_to_propose_only_store(tmp_path, monkeypatch, capsys):
     from penrose import cli, config
 
-    proposals = tmp_path / "reports" / "proposals.jsonl"
+    proposals = tmp_path / "reports" / "principles_proposed.jsonl"
     decisions = tmp_path / "decisions.jsonl"
     approved = tmp_path / "principles.jsonl"
     approved.write_text("approved sentinel\n")
-    monkeypatch.setattr(config, "PROPOSALS_LOG", proposals)
+    monkeypatch.setattr(config, "PRINCIPLES_PROPOSED", proposals)
     monkeypatch.setattr(config, "DECISIONS_LOG", decisions)
     monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "reports" / "analysis_index.jsonl")
     monkeypatch.setattr(config, "PRINCIPLES_LOG", approved)

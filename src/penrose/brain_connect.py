@@ -22,6 +22,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
+from .strategy_family import family_key, normalize_strategy_family
 # Genuine STRUCTURAL kills — power-INDEPENDENT (an edge that is actually broken). Only these inform
 # suppressive priors. `below_detection_floor` (underpowered) is excluded ON PURPOSE.
 STRUCTURAL_KILLS = {"in_sample_only", "regime_fragile", "walk_forward_drift",
@@ -61,6 +62,8 @@ class Record:
     power_sufficient: Optional[bool]
     date: str = ""                   # ISO; for confidence decay
     synthetic: bool = False
+    claim_id: Optional[str] = None
+    strategy_family: Optional[dict] = None
 
 
 @dataclass
@@ -106,41 +109,233 @@ def cross_domain_links(records: list[Record]) -> list[dict]:
     return sorted(out, key=lambda c: -c["n_domains"])
 
 
-def propose_principles(records: list[Record], current_year: int = 2026,
-                       min_obs: int = 3, half_life_years: float = 4.0) -> list[dict]:
-    """Power-aware principles from STRUCTURAL kills only. Confidence decays with the age of the
-    supporting evidence (kills are conditional, not eternal). NO LLM here — a deterministic,
-    auditable statement; an LLM phrasing pass can sit on top later, gated by reproduce-not-trust."""
-    import math
-    groups = defaultdict(list)
+def _support_key(r: Record) -> str:
+    return str(r.claim_id or r.id)
+
+
+def _support_sort_key(r: Record) -> tuple[str, str]:
+    return (str(r.claim_id or r.id), str(r.id))
+
+
+def _unique_structural_records(records: list[Record]) -> list[Record]:
+    by_support: dict[str, Record] = {}
     for r in records:
+        if not r.structural:
+            continue
+        support = _support_key(r)
+        if support and support not in by_support:
+            by_support[support] = r
+    return sorted(by_support.values(), key=_support_sort_key)
+
+
+def _sanitize_id(value: str) -> str:
+    return re.sub(r"[^a-z0-9_+.-]+", "-", str(value or "").lower()).strip("-")
+
+
+def _plural_method(method: str) -> str:
+    return method + "s"
+
+
+def _principle_confidence(rs: list[Record], current_year: int, half_life_years: float) -> tuple[int, float]:
+    years = [y for y in (_year(r.date) for r in rs) if y]
+    newest = max(years) if years else current_year
+    age = max(0, current_year - newest)
+    confidence = round(0.5 * (0.5 ** (age / half_life_years)), 3)
+    return newest, confidence
+
+
+def _principle_row(
+    *,
+    level: str,
+    label: str,
+    kill_reason: str,
+    rs: list[Record],
+    current_year: int,
+    half_life_years: float,
+    strategy_family: dict | None = None,
+    domain: str | None = None,
+) -> dict:
+    rs = sorted(rs, key=_support_sort_key)
+    newest, confidence = _principle_confidence(rs, current_year, half_life_years)
+    example_claim_ids = sorted({_support_key(r) for r in rs if _support_key(r)})[:5]
+    supporting = [r.id for r in rs]
+    if level == "exact":
+        components = "+".join(strategy_family["components"]) if strategy_family else label
+        method = strategy_family["method"] if strategy_family else "single"
+        statement = (
+            f"{components} {_plural_method(method)} fail with '{kill_reason}': "
+            f"{len(rs)} independent claims died this way. Treat matching composite claims as "
+            "a review prior, then independently test the next claim."
+        )
+        meaning = (
+            f"{components} {_plural_method(method)} repeatedly die with {kill_reason}; "
+            "treat the exact family as a review prior, then independently test the next claim."
+        )
+        pid = f"principle-family-{_sanitize_id(label)}-{_sanitize_id(kill_reason)}"
+    elif level == "method":
+        statement = (
+            f"{_plural_method(label)} fail with '{kill_reason}': {len(rs)} independent claims "
+            "died this way. Treat matching method claims as a review prior, then independently "
+            "test the next claim."
+        )
+        meaning = (
+            f"{_plural_method(label)} repeatedly die with {kill_reason}; treat the method as a "
+            "review prior, then independently test the next claim."
+        )
+        pid = f"principle-method-{_sanitize_id(label)}-{_sanitize_id(kill_reason)}"
+    elif level == "component":
+        statement = (
+            f"{label}-containing strategies fail with '{kill_reason}': {len(rs)} independent "
+            "claims died this way. Treat matching component claims as a review prior, then "
+            "independently test the next claim."
+        )
+        meaning = (
+            f"{label}-containing strategies repeatedly die with {kill_reason}; treat the component "
+            "as a review prior, then independently test the next claim."
+        )
+        pid = f"principle-component-{_sanitize_id(label)}-{_sanitize_id(kill_reason)}"
+    else:
+        statement = (
+            f"In the {label} domain, claims that fail with '{kill_reason}' recur: "
+            f"{len(rs)} independent claims died this way. Treat new {label} claims as "
+            f"likely to share this failure mode - but TEST them; this is a prior, not a verdict."
+        )
+        meaning = (
+            f"{label} claims repeatedly die with {kill_reason}; treat the pattern as a review prior, "
+            "then independently test the next claim."
+        )
+        pid = f"principle-{label}-{kill_reason}"
+    row = {
+        "principle_id": pid,
+        "statement": statement,
+        "domain": domain or label,
+        "kill_reason": kill_reason,
+        "family_level": level,
+        "n_observations": len(rs),
+        "supporting_kill_count": len(rs),
+        "example_claim_ids": example_claim_ids,
+        "meaning": meaning,
+        "supporting": supporting,
+        "newest_evidence_year": newest,
+        "confidence": confidence,
+        "caveat": "Advisory only (inform-never-gate). Built from structural kills, excludes "
+                  "underpowered. Confidence decays with age; a stale kill does not bar a new test.",
+    }
+    if strategy_family is not None:
+        row["strategy_family"] = strategy_family
+    return row
+
+
+def _family_or_none(r: Record) -> dict | None:
+    return normalize_strategy_family(r.strategy_family)
+
+
+def propose_principles(records: list[Record], current_year: int = 2026,
+                       min_kills: Optional[int] = None, half_life_years: float = 4.0,
+                       min_obs: Optional[int] = None) -> list[dict]:
+    """Power-aware principles from STRUCTURAL kills only. Confidence decays with the age of the
+    supporting evidence (kills are conditional, not eternal). NO LLM here - a deterministic,
+    auditable statement; an LLM phrasing pass can sit on top later, gated by reproduce-not-trust.
+
+    This is a cross-run proposal distiller: it groups all recorded structural kills by the same
+    reason and domain/class across the full corpus. The result is advisory only. Promotion into
+    ``principles.jsonl`` or the trusted BrainStore remains a human P9 action.
+    """
+    threshold = min_kills if min_kills is not None else (min_obs if min_obs is not None else 3)
+    try:
+        threshold = max(3, int(threshold))
+    except (TypeError, ValueError):
+        threshold = 3
+    principles = []
+    assigned: set[str] = set()
+    structural = _unique_structural_records(records)
+
+    exact_groups: dict[tuple[str, str], list[Record]] = defaultdict(list)
+    fallback_groups: dict[tuple[str, str], list[Record]] = defaultdict(list)
+    for r in structural:
         # `r.structural` is the correct (and only needed) guardrail: an `underpowered` verdict
         # has structural=False and is already excluded. A genuine STRUCTURAL kill (e.g. 3-fold
         # sign-instability) is power-INDEPENDENT evidence the edge is broken, so it counts toward a
         # principle even on a thin sample. (Do NOT also exclude on power_sufficient — that wrongly
         # drops legitimate structural kills and was a real bug found in testing.)
-        if r.structural:
-            groups[(r.kill_reason, r.domain)].append(r)
-    principles = []
-    for (kr, dom), rs in groups.items():
-        if len(rs) < min_obs:
+        fam = _family_or_none(r)
+        if fam is None:
+            fallback_groups[(str(r.kill_reason), r.domain)].append(r)
             continue
-        years = [y for y in (_year(r.date) for r in rs) if y]
-        newest = max(years) if years else current_year
-        age = max(0, current_year - newest)
-        confidence = round(0.5 * (0.5 ** (age / half_life_years)), 3)   # base 0.5, halves every ~4yr
-        principles.append({
-            "principle_id": f"principle-{dom}-{kr}",
-            "statement": (f"In the {dom} domain, claims that fail with '{kr}' recur: "
-                          f"{len(rs)} independent claims died this way. Treat new {dom} claims as "
-                          f"likely to share this failure mode — but TEST them; this is a prior, not a verdict."),
-            "domain": dom, "kill_reason": kr, "n_observations": len(rs),
-            "supporting": [r.id for r in rs],
-            "newest_evidence_year": newest, "confidence": confidence,
-            "caveat": "Advisory only (inform-never-gate). Built from structural kills, excludes "
-                      "underpowered. Confidence decays with age; a stale kill does not bar a new test.",
-        })
-    return sorted(principles, key=lambda p: -p["n_observations"])
+        exact_groups[(str(r.kill_reason), family_key(fam))].append(r)
+
+    for (kr, key), rs in sorted(exact_groups.items()):
+        if len(rs) < threshold:
+            continue
+        fam = _family_or_none(rs[0])
+        if fam is None:
+            continue
+        principles.append(_principle_row(
+            level="exact", label=key, kill_reason=kr, rs=rs,
+            current_year=current_year, half_life_years=half_life_years,
+            strategy_family=fam, domain=key,
+        ))
+        assigned.update(_support_key(r) for r in rs)
+
+    method_groups: dict[tuple[str, str], list[Record]] = defaultdict(list)
+    for r in structural:
+        if _support_key(r) in assigned:
+            continue
+        fam = _family_or_none(r)
+        if fam is not None:
+            method_groups[(str(r.kill_reason), fam["method"])].append(r)
+
+    for (kr, method), rs in sorted(method_groups.items()):
+        if len(rs) < threshold:
+            continue
+        principles.append(_principle_row(
+            level="method", label=method, kill_reason=kr, rs=rs,
+            current_year=current_year, half_life_years=half_life_years,
+            domain=method,
+        ))
+        assigned.update(_support_key(r) for r in rs)
+
+    component_candidates: dict[tuple[str, str], list[Record]] = defaultdict(list)
+    for r in structural:
+        if _support_key(r) in assigned:
+            continue
+        fam = _family_or_none(r)
+        if fam is None:
+            continue
+        for component in fam["components"]:
+            component_candidates[(str(r.kill_reason), component)].append(r)
+    while True:
+        available = {
+            key: [r for r in rs if _support_key(r) not in assigned]
+            for key, rs in component_candidates.items()
+        }
+        eligible = [
+            (key, sorted(rs, key=_support_sort_key))
+            for key, rs in available.items()
+            if len(rs) >= threshold
+        ]
+        if not eligible:
+            break
+        (kr, component), rs = sorted(eligible, key=lambda item: (-len(item[1]), item[0]))[0]
+        principles.append(_principle_row(
+            level="component", label=component, kill_reason=kr, rs=rs,
+            current_year=current_year, half_life_years=half_life_years,
+            domain=component,
+        ))
+        assigned.update(_support_key(r) for r in rs)
+
+    for (kr, dom), rs in sorted(fallback_groups.items()):
+        if len(rs) < threshold:
+            continue
+        principles.append(_principle_row(
+            level="domain", label=dom, kill_reason=kr, rs=rs,
+            current_year=current_year, half_life_years=half_life_years,
+            domain=dom,
+        ))
+
+    return sorted(principles, key=lambda p: (
+        -p["n_observations"], p["family_level"], p["domain"], p["kill_reason"]
+    ))
 
 
 def propose_contrastive_principles(records: list[Record], current_year: int = 2026,

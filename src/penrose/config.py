@@ -51,13 +51,15 @@ DATA_CACHE = ROOT / ".data_cache"
 LLM_CACHE_DIR = ROOT / ".llm_cache"
 DECISIONS_LOG = ROOT / "decisions.jsonl"               # decisions log (atoms also go to brain)
 PRINCIPLES_LOG = ROOT / "principles.jsonl"
-PROPOSALS_LOG = REPORTS / "proposals.jsonl"            # propose-only, never P9-approved knowledge
+PRINCIPLES_PROPOSED = REPORTS / "principles_proposed.jsonl"  # propose-only; human P9 promotion required
+PROPOSALS_LOG = PRINCIPLES_PROPOSED                    # backward-compatible alias for the proposal surface
 REVIEW_QUEUE = ROOT / "review_queue.jsonl"             # P9 Action Required queue
 DATA_REQUESTS = ROOT / "data_requests.jsonl"          # backlog: data a claim needs but the catalog lacks
 PROCESSED_PAPERS = ROOT / "processed_papers.json"     # filenames already run, so the loop advances through inbox/
 DREAM_RUNS = ROOT / "dream_runs.jsonl"                # registered generator searches + lifecycle summaries
 PROGRESS_JSON = ROOT / "dashboard" / "progress.json"  # live per-stage progress for the dashboard activity panel
 ANALYSIS_INDEX = ROOT / "reports" / "analysis_index.jsonl"  # backtested outcomes + chart paths for the Reports page
+TRACES = ROOT / "reports" / "traces.jsonl"                  # structured per-claim observability trace
 FIDELITY_REJECTIONS = ROOT / "reports" / "fidelity_rejections.jsonl"
 CONCEPTS = REPORTS / "concepts.jsonl"
 CORPUS_GRAPH = REPORTS / "corpus_graph.jsonl"
@@ -270,6 +272,9 @@ COST_PROVENANCE = "modeled"
 # cold-start loop). The generated code is validated by running on the live bundle
 # before it's registered; on any failure the claim stays pending_module.
 AUTO_IMPLEMENT_MODULES = True
+# Stop auto-implementation early when consecutive rejected attempts have the
+# same normalized failure signature. This is a throughput guard, not a verdict.
+IMPL_NO_PROGRESS_LIMIT = int(os.environ.get("PENROSE_IMPL_NO_PROGRESS_LIMIT", "2"))
 
 # Relevance gate (pre-P2): cheap LLM screen of the abstract vs penrose's data domains;
 # off-domain papers are skipped before the expensive stages. Fails open. (pipeline/relevance.py)
@@ -284,6 +289,7 @@ FIDELITY_KILL_CONFIDENCE = 0.6     # unfaithful at >= this confidence -> flag + 
 # Advisory corpus promotion. These thresholds never participate in P8.
 CORPUS_MIN_SUPPORT = int(os.environ.get("PENROSE_CORPUS_MIN_SUPPORT", "3"))
 CORPUS_HALF_LIFE_YEARS = float(os.environ.get("PENROSE_CORPUS_HALF_LIFE_YEARS", "4"))
+PRINCIPLE_MIN_KILLS = int(os.environ.get("PENROSE_PRINCIPLE_MIN_KILLS", "3"))
 
 # The generator is never shown the confirmation reserve. Confirmation requires one distinct,
 # held-aside epoch per candidate; no default/sentinel epoch is treated as real data.

@@ -37,12 +37,14 @@ def load_live_corpus() -> list[Record]:
         verdict = r.get("verdict")
         text = f"{r.get('statement','')} {r.get('source_title','')}"
         metrics = r.get("metrics") or {}
+        data_prov = r.get("data_provenance") if isinstance(r.get("data_provenance"), dict) else {}
         recs.append(Record(
             id=str(r.get("claim_id")), domain=BC.infer_domain(text),
             verdict=verdict, kill_reason=kr, statement=r.get("statement", "")[:240],
             structural=(verdict == "kill" and kr in BC.STRUCTURAL_KILLS),
             power_sufficient=metrics.get("power_sufficient"),
-            date=r.get("run_at", ""), synthetic=bool(r.get("synthetic"))))
+            date=r.get("run_at", ""), synthetic=bool(r.get("synthetic")),
+            strategy_family=data_prov.get("strategy_family_structured")))
     return recs
 
 

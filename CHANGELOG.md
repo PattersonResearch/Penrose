@@ -3,6 +3,40 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.6.0] — 2026-07-07
+
+A release on one theme: the referee **learns across runs, becomes observable, and grows operable and
+extensible**. Green bar: eval 106/106, pytest 416 passed.
+
+### Added
+- **Cross-run principle distillation → a propose-only store.** Recurring lessons are now distilled from
+  the *whole* decision corpus (not only from ≥3 kills within a single run, a bar most papers never met),
+  and persisted to a propose-only review surface. New `penrose distill` / `penrose proposals` commands.
+  The human approval gate is intact: distilled principles are proposals only — nothing self-promotes into
+  the trusted brain.
+- **Composite strategy families.** Hybrid strategies (e.g. carry+trend regime blends) now carry a
+  structured family identity and cluster *hierarchically* (exact combination → method → component), so a
+  composite's failures form a meaningful principle instead of over-lumping into a generic bucket or
+  starving the threshold.
+- **Structured per-run traces + `penrose triage`.** A uniform trace of every claim (spec → data-requests
+  → gate outcomes → verdict) plus a triage command that clusters recurring failure signatures: verdict
+  distribution, per-stage drop-off, and the top failure clusters — where claims die, and why.
+- **Bring-your-own-data contract + reference loader.** A typed `CatalogLoaderProtocol`, a runnable
+  `examples/reference_loader/`, `docs/DATA_CONTRACT.md`, and an intraday→daily OHLC resample helper, so a
+  newcomer can supply their own data by implementing an interface rather than reverse-engineering internals.
+- **Agent surface additions (MCP).** `penrose_triage` (read-only failure-cluster analysis) and
+  `penrose_mine_principles` (distill into the propose-only store, management-gated), keeping the
+  "expose operations, not escape hatches" firewall — no tool can approve a verdict, write the approved
+  corpus, run a model-written module outside the Docker sandbox, or touch the single-use holdout.
+- **Auto-implementation loop-detection.** Reconstruction short-circuits to `needs_review` when it makes no
+  progress (the same failure signature repeats) instead of burning model calls on a dead end.
+
+### Changed
+- **README rewritten** narrative-first (what a verdict means up top, how it validates itself, one worked
+  result), and a documentation consistency pass across `docs/`: `GATES.md` now documents the
+  parameter-robustness/fragility gate, and eval counts, routing-state vocabulary, and version references are
+  reconciled across README/AGENTS/OPERATING and the systems paper.
+
 ## [0.5.0] — 2026-07-07
 
 A capability release on one theme: the referee learns to adjudicate a new *kind* of claim, to judge a

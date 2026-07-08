@@ -45,7 +45,7 @@ def test_accessors_return_structured_data(tmp_path, monkeypatch):
 def test_proposal_and_principle_accessors_are_readonly_lists(tmp_path, monkeypatch):
     from penrose import config, views
 
-    monkeypatch.setattr(config, "PROPOSALS_LOG", tmp_path / "proposals.jsonl")
+    monkeypatch.setattr(config, "PRINCIPLES_PROPOSED", tmp_path / "principles_proposed.jsonl")
     monkeypatch.setattr(config, "DECISIONS_LOG", tmp_path / "decisions.jsonl")
     monkeypatch.setattr(config, "ANALYSIS_INDEX", tmp_path / "analysis_index.jsonl")
 
@@ -76,7 +76,7 @@ def test_build_server_registers_five_readonly_tools_or_fails_gracefully():
         if not names and hasattr(server, "_tool_manager"):
             names = set(server._tool_manager._tools.keys())
         expected = {"penrose_verdicts", "penrose_proposals", "penrose_principles",
-                    "penrose_data_requests", "penrose_status"}
+                    "penrose_data_requests", "penrose_status", "penrose_triage"}
         assert names == expected
     else:
         with pytest.raises(ImportError) as e:

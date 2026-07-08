@@ -18,6 +18,8 @@ from typing import Optional
 
 import pandas as pd
 
+from .loader_protocol import CatalogLoaderProtocol
+
 LOG = logging.getLogger(__name__)
 
 # Filler tokens stripped when normalizing a series name, so naming drift from auto-generated

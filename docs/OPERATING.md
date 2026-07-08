@@ -18,7 +18,7 @@ pip install -e .          # editable install; Penrose runs from the clone
 Confirm the install is sound before you trust any verdict it produces:
 
 ```bash
-python scripts/eval_suite.py           # must print 101/101 passed
+python scripts/eval_suite.py           # must print 106/106 passed
 python scripts/calibration_placebo.py  # placebo control: no no-edge signal may be certified
 ```
 

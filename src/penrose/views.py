@@ -119,3 +119,19 @@ def status() -> dict:
         "updated_at": d.get("updated_at"),
         "stats": d.get("stats") or {},
     }
+
+
+def triage(top: int = 15, source: str | None = None) -> dict:
+    """Read-only failure-cluster analysis of the trace corpus: verdict distribution, per-stage
+    drop-off, and top recurring failure signatures. Reads reports/traces.jsonl (decisions fallback).
+    READ-ONLY; never writes anything."""
+    from pathlib import Path
+    from . import config
+    from .trace import load_trace_rows, triage_report
+    rows, loaded_from = load_trace_rows(Path(config.TRACES), Path(config.DECISIONS_LOG))
+    if not rows:
+        return {"status": "empty",
+                "message": "No traces or decisions found yet (reports/traces.jsonl and decisions.jsonl empty)."}
+    report = triage_report(rows, top=int(top), source=source)
+    report["input"] = loaded_from
+    return report

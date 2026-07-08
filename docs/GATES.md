@@ -207,6 +207,18 @@ input is invisible to every other gate and poisons every statistic downstream wi
 Penrose infers a series' actual frequency at the data boundary and warns on a mismatch, the input-side
 counterpart to the existing check that a strategy's output bars-per-year matches its calendar span.
 
+### 20. Parameter-robustness and fragility (default-on)
+
+**Catches:** an edge that exists only at one lucky parameter setting — the classic overfit a single
+backtest at a hand-picked configuration hides. **Dies here:** two ways. First, a claim's *declared
+parameter grid is charged to the multiple-testing denominator*, so declaring "I searched a 27-config
+grid" deflates the evidence as a 27-wide search rather than a free lunch. Second, a fragility check
+re-runs the strategy across that grid and kills an edge that survives only at isolated points (it caps a
+survivor at `watch`/`kill`, never rescues one). **Why you want it:** a genuine edge is robust to
+reasonable parameter choices; a spurious one needs a magic point. It is the parameter-space analogue of
+the regime kill-lens (#9) — and it is why "how do we know we didn't just pick lucky parameters?" has a
+built-in answer.
+
 ---
 
 ## The philosophy, in one paragraph

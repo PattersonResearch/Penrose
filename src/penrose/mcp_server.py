@@ -295,6 +295,12 @@ def build_server(management: bool = False):
         """Current pipeline status. READ-ONLY."""
         return _views.status()
 
+    @server.tool()
+    def penrose_triage(top: int = 15, source: str | None = None) -> dict:
+        """Failure-cluster analysis across the trace corpus: verdict distribution, per-stage drop-off,
+        and the top recurring failure signatures (where claims die, and why). READ-ONLY."""
+        return _views.triage(top=top, source=source)
+
     if management:
         _management_imports()
 
@@ -317,6 +323,15 @@ def build_server(management: bool = False):
             """Run a paper or inline claim through the guarded pipeline. Produces verdict
             proposals only; P9 human review remains required."""
             return _run_claim(paper_path=paper_path, claim=claim, max_claims=max_claims)
+
+        @server.tool()
+        def penrose_mine_principles() -> dict:
+            """Distill cross-run principle PROPOSALS from the full corpus and persist them to the
+            propose-only store (status: proposed). Produces proposals ONLY — promotion into the
+            approved brain is the human P9 path, NEVER this server."""
+            from .learning import persist_distilled_proposals
+            out = persist_distilled_proposals()
+            return {**out, "distilled": len(out.get("distilled") or [])}
 
     return server
 

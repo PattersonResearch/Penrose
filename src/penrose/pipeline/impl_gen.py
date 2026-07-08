@@ -19,12 +19,14 @@ Module contract (what the generated impl.py must expose):
 from __future__ import annotations
 
 import ast
+import hashlib
 import importlib.util
 import re
 from pathlib import Path
 
 from .. import config, llm
 from ..brain import Claim
+from ..trace import normalize_failure_reason
 
 # Human-readable description of every series the data bundle currently provides, so
 # the LLM maps spec inputs to what actually exists (and returns a data blocker otherwise).
@@ -62,6 +64,24 @@ _CATALOG_DESCRIPTIONS = {
     "weather_temp_lax": "LAX daily actual temperature (NOAA), degrees",
     "btc_close_daily": "BTC hourly close resampled to daily (exchange OHLCV)",
 }
+
+
+def _normalize_failure_reason(reason: object) -> str:
+    return normalize_failure_reason(reason)
+
+
+def _failure_signature(spec: dict, reason: object) -> dict:
+    """Stable signature for no-progress detection; fail-open at call sites."""
+    strategy_class = str(spec.get("strategy_class") or "").strip().lower() or "unspecified"
+    claim_type = str(spec.get("claim_type") or "").strip().lower() or "unspecified"
+    category = _normalize_failure_reason(reason)
+    payload = f"{strategy_class}\0{claim_type}\0{category}"
+    return {
+        "signature": hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16],
+        "category": category[:160],
+        "strategy_class": strategy_class,
+        "claim_type": claim_type,
+    }
 
 
 def _catalog_keys() -> dict:
@@ -733,15 +753,85 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
     last_err = None
     last_validated = None
     fidelity_attempts = []
+    last_failure_sig = None
+    repeated_failure_count = 0
+    no_progress_audit = []
+    try:
+        no_progress_limit = int(getattr(config, "IMPL_NO_PROGRESS_LIMIT", 2) or 0)
+    except Exception:  # noqa: BLE001
+        no_progress_limit = 2
+    # LD-3: the guard needs >=2 attempts to have a "repeat" (the counter starts at 1 on the first
+    # rejection). <=0 disables the guard; 1 is a degenerate footgun (would fire on the FIRST failure,
+    # disabling the self-repair loop entirely) so it is clamped up to the minimum meaningful value 2.
+    no_progress_limit = 0 if no_progress_limit <= 0 else max(2, no_progress_limit)
+
+    def _write_rejected_stub(reason, attempts_tried: int) -> None:
+        try:
+            _safe_err = repr(str(reason))[:300].replace("\n", " ")
+            impl_path.write_text(
+                "__auto_generated__ = True  # REJECTED stub — never exec'd in-process (D-002/D-005)\n"
+                f"# auto-impl REJECTED after {attempts_tried} attempts: {_safe_err}\n"
+                "# spec kept; operator may implement.\n")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _track_rejected_attempt(reason, attempt: int):
+        nonlocal last_failure_sig, repeated_failure_count
+        try:
+            sig = _failure_signature(spec, reason)
+            if sig["signature"] == last_failure_sig:
+                repeated_failure_count += 1
+            else:
+                last_failure_sig = sig["signature"]
+                repeated_failure_count = 1
+            row = {
+                "attempt": attempt,
+                "signature": sig["signature"],
+                "category": sig["category"],
+                "consecutive": repeated_failure_count,
+            }
+            no_progress_audit.append(row)
+            if no_progress_limit and repeated_failure_count >= no_progress_limit:
+                review_reason = (
+                    "auto-impl made no progress: "
+                    f"{repeated_failure_count} attempts, same failure signature ({sig['category']})"
+                )
+                audit = {
+                    "attempts_tried": attempt,
+                    "limit": no_progress_limit,
+                    "consecutive_attempts": repeated_failure_count,
+                    "signature": sig["signature"],
+                    "category": sig["category"],
+                    "attempts": list(no_progress_audit),
+                }
+                _write_rejected_stub(review_reason, attempt)
+                return {
+                    "ok": False,
+                    "needs_review": True,
+                    "reason": review_reason,
+                    "attempts": attempt,
+                    "no_progress": audit,
+                    **({"fidelity_attempts": fidelity_attempts} if fidelity_attempts else {}),
+                }
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     for attempt in range(1, max_attempts + 1):
         try:
             code = _generate_code(spec, BUNDLE_KEYS, feedback=feedback)
         except Exception as e:  # noqa: BLE001
             last_err = f"generation failed: {e}"
+            short = _track_rejected_attempt(last_err, attempt)
+            if short is not None:
+                return short
             continue
         if "def run" not in code or "__strategy_class__" not in code:
             last_err = "generated code missing contract (run/__strategy_class__)"
             feedback = (code, last_err)
+            short = _track_rejected_attempt(last_err, attempt)
+            if short is not None:
+                return short
             continue
         # A-010 / A-012: static safety scan of the code TEXT BEFORE we ever write or
         # exec it. Denylisted ops or look-ahead patterns -> reject (feed back for repair),
@@ -750,6 +840,9 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
         if scan_err is not None:
             last_err = scan_err
             feedback = (code, scan_err)
+            short = _track_rejected_attempt(scan_err, attempt)
+            if short is not None:
+                return short
             continue
         # Mark auto-generated. This module is UNTRUSTED: it lives on the _auto provenance shelf,
         # is NEVER registered for cross-claim routing (_register_known_modules skips it), and is
@@ -764,6 +857,9 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
         if not isinstance(sbx, dict) or "sandbox" in str(sbx.get("reason", "")).lower():
             last_err = f"sandbox unavailable/failed: {sbx.get('reason') if isinstance(sbx, dict) else sbx}"
             feedback = (code, last_err)
+            short = _track_rejected_attempt(last_err, attempt)
+            if short is not None:
+                return short
             continue
         validation_meta = {}
         ok, result = _validate_module(
@@ -799,6 +895,13 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
                     and fid_attempt["confidence"] >= config.FIDELITY_KILL_CONFIDENCE
                 )
                 if confidently_unfaithful and attempt < max_attempts:
+                    fidelity_reason = (
+                        "fidelity: "
+                        f"{'; '.join(fid_attempt['divergences']) or str(fid.get('note') or 'unspecified divergence')}"
+                    )
+                    short = _track_rejected_attempt(fidelity_reason, attempt)
+                    if short is not None:
+                        return short
                     guidance = (
                         "The previous module was VALIDATED but judged UNFAITHFUL to the claim "
                         "for these reasons: "
@@ -809,12 +912,23 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
                     last_err = guidance
                     feedback = (module_code, f"FIDELITY: {guidance}")
                     continue
+                if confidently_unfaithful:
+                    fidelity_reason = (
+                        "fidelity: "
+                        f"{'; '.join(fid_attempt['divergences']) or str(fid.get('note') or 'unspecified divergence')}"
+                    )
+                    short = _track_rejected_attempt(fidelity_reason, attempt)
+                    if short is not None:
+                        return short
 
             return {"ok": True, "module": result, "module_id": mid, "attempts": attempt,
                     "validation": validation_meta,
                     **({"fidelity_attempts": fidelity_attempts} if fidelity_attempts else {}),
                     "note": f"auto-implemented + validated on the live bundle (attempt {attempt})"}
         last_err = result
+        short = _track_rejected_attempt(result, attempt)
+        if short is not None:
+            return short
         feedback = (code, result)              # repair on the next pass
 
     # If fidelity self-correction spent the remaining attempts without finding a faithful
@@ -833,12 +947,6 @@ def try_implement(spec: dict, claim: Claim, bundle, cost_frac: float,
     # executable code. Two defenses: (1) the stub is marked __auto_generated__=True, so
     # _register_known_modules skips it via the static check and NEVER imports it; (2) last_err is
     # collapsed to a single safe line (repr drops real newlines) before it touches the file.
-    try:
-        _safe_err = repr(str(last_err))[:300].replace("\n", " ")
-        impl_path.write_text(
-            "__auto_generated__ = True  # REJECTED stub — never exec'd in-process (D-002/D-005)\n"
-            f"# auto-impl REJECTED after {max_attempts} attempts: {_safe_err}\n"
-            "# spec kept; operator may implement.\n")
-    except Exception:  # noqa: BLE001
-        pass
-    return {"ok": False, "reason": f"validation failed after {max_attempts} attempts: {last_err}"}
+    _write_rejected_stub(last_err, max_attempts)
+    return {"ok": False, "reason": f"validation failed after {max_attempts} attempts: {last_err}",
+            **({"no_progress": {"attempts": no_progress_audit}} if no_progress_audit else {})}

@@ -1,0 +1,15 @@
+series:
+  equity_spy_close:
+    file: data/equity_spy_close.csv
+    domain: equity
+    unit: price
+    provenance: reference-csv:spy-close:v1
+    agg: last
+    description: SPY adjusted close, daily UTC sample data.
+  btc_spot_close:
+    file: data/btc_spot_close.csv
+    domain: crypto
+    unit: price
+    provenance: reference-csv:btc-close:v1
+    agg: last
+    description: BTC spot close, daily UTC sample data.

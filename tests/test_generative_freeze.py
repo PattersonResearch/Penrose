@@ -54,13 +54,9 @@ def test_pen17_run_dream_enabled_uses_existing_path(tmp_path, monkeypatch):
     assert out["candidates_generated"] == 1
 
 
-def test_pen17_distill_principles_guard_and_override(monkeypatch):
+def test_pen17_distill_principles_remains_available_when_generation_is_frozen(monkeypatch):
     from penrose import config
     from penrose.learning import distill_principles
 
     monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", False)
-    with pytest.raises(RuntimeError, match="generative layer is frozen"):
-        distill_principles(records=[])
-
-    monkeypatch.setattr(config, "GENERATIVE_LAYER_ENABLED", True)
     assert distill_principles(records=[]) == []

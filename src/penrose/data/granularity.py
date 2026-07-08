@@ -83,3 +83,36 @@ def check_granularity(data, expected: str = "daily") -> dict:
                f"resample to {expected} or set the correct bars_per_year before testing.")
     return {"ok": ok, "expected": expected, "actual": actual,
             "empirical_bars_per_year": bpy, "message": msg}
+
+
+def resample_ohlc(frame: pd.DataFrame) -> pd.DataFrame:
+    """Collapse intraday OHLC rows to daily UTC OHLC.
+
+    Expected input columns are ``open``, ``high``, ``low``, and ``close`` with a
+    ``DatetimeIndex``. Naive timestamps are treated as UTC. The output keeps the
+    scalar convention used by Penrose loaders: each OHLC leg can be published as
+    its own named daily series, e.g. ``asset_open`` / ``asset_high`` /
+    ``asset_low`` / ``asset_close``.
+    """
+    required = ["open", "high", "low", "close"]
+    missing = [c for c in required if c not in frame.columns]
+    if missing:
+        raise ValueError(f"missing OHLC columns: {', '.join(missing)}")
+    if not isinstance(frame.index, pd.DatetimeIndex):
+        raise ValueError("resample_ohlc requires a DatetimeIndex")
+
+    out = frame[required].copy()
+    idx = pd.DatetimeIndex(out.index)
+    if idx.tz is None:
+        idx = idx.tz_localize("UTC")
+    else:
+        idx = idx.tz_convert("UTC")
+    out.index = idx
+    out = out.sort_index()
+    daily = out.resample("1D").agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+    })
+    return daily.dropna(how="all")

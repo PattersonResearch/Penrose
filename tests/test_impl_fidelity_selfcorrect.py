@@ -129,7 +129,11 @@ def test_impl_fidelity_self_correction_exhausted_returns_last_validated(tmp_path
         tmp_path,
         monkeypatch,
         [_code("attempt_1"), _code("attempt_2"), _code("attempt_3")],
-        [_unfaithful([f"divergence {i}"]) for i in range(max_attempts)],
+        [
+            _unfaithful(["uses a 1-day return instead of the claimed 10-day lookback"]),
+            _unfaithful(["trades the inverse direction of the claimed momentum rule"]),
+            _unfaithful(["omits the required BTC spot input from the signal"]),
+        ],
     )
 
     out = impl_gen.try_implement(_spec(), _claim(), bundle=object(), cost_frac=0.001,

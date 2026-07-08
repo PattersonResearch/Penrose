@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI coding agents (Claude Code, Cursor, and similar) working in this repository. Humans:
+Guidance for AI coding agents working in this repository. Humans:
 see [README.md](README.md) for the project overview and [CONTRIBUTING.md](CONTRIBUTING.md) for the
 contribution rules. This file is the short, operational version for agents.
 

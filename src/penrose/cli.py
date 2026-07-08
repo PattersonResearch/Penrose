@@ -6,6 +6,7 @@ fast and work even when the backtest stack can't import. `run` pulls in the full
 
   penrose run [--paper P] [--all] [--no-llm]   ingest + evaluate a paper (default: next inbox paper)
   penrose verdicts [-n N]                       recent backtested verdicts (reports/analysis_index)
+  penrose triage [--json] [--top N]             trace drop-offs and recurring failure clusters
   penrose data-requests                         open data blockers (what a claim needs)
   penrose status                                pipeline status badge
   penrose eval                                  run the planted-strategy eval suite (ground truth)
@@ -61,6 +62,49 @@ def _cmd_data_requests(args) -> int:
     for r in rows:
         miss = ", ".join(r.get("missing_series", []) or [])[:70]
         print(f"  {str(r.get('claim_id'))[:30]:<30} needs: {miss}")
+    return 0
+
+
+def _cmd_triage(args) -> int:
+    from . import config
+    from .trace import load_trace_rows, triage_report
+
+    rows, loaded_from = load_trace_rows(Path(config.TRACES), Path(config.DECISIONS_LOG))
+    if not rows:
+        msg = "No traces or decisions found yet (reports/traces.jsonl and decisions.jsonl are empty)."
+        if args.json:
+            print(json.dumps({"status": "empty", "message": msg}, sort_keys=True))
+        else:
+            print(msg)
+        return 0
+    report = triage_report(rows, top=args.top, source=args.source)
+    report["input"] = loaded_from
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+        return 0
+
+    source_note = f" source={args.source}" if args.source else ""
+    print(f"Trace triage ({report['total']} claims{source_note}; input={loaded_from})")
+    print("")
+    print("Verdict distribution:")
+    for verdict, count in report["verdict_distribution"].items():
+        print(f"  {verdict:<20} {count}")
+    print("")
+    print("Per-stage drop-off:")
+    for stage, count in report["stage_dropoff"].items():
+        print(f"  {stage:<24} {count}")
+    print("")
+    print("Top recurring failure clusters:")
+    if not report["failure_clusters"]:
+        print("  none")
+        return 0
+    print(f"  {'count':>5} {'signature':<16} {'verdict':<18} {'exit_stage':<22} example")
+    for cluster in report["failure_clusters"]:
+        reason = cluster.get("kill_reason") or cluster.get("gate_outcome") or ""
+        print(f"  {cluster['count']:>5} {str(cluster['failure_signature'])[:16]:<16} "
+              f"{str(cluster.get('verdict') or '')[:18]:<18} "
+              f"{str(cluster.get('exit_stage') or '')[:22]:<22} "
+              f"{str(cluster.get('example_claim_id') or '')}  {str(reason)[:48]}")
     return 0
 
 
@@ -289,11 +333,8 @@ def _cmd_proposals(args) -> int:
 
 
 def _cmd_principles(args) -> int:
-    from .learning import distill_principles
-    from .proposals import write_proposals
-    rows = distill_principles()
-    stored = write_proposals(rows, source="distilled") if rows else []
-    out = {"distilled": rows, "stored": len(stored), "status": "proposed"}
+    from .learning import persist_distilled_proposals
+    out = persist_distilled_proposals()  # guarded distill+persist (CR-2/CR2-1); shared with the MCP tool
     if args.json:
         print(json.dumps(out, sort_keys=True))
     else:
@@ -325,6 +366,12 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("verdicts", help="recent backtested verdicts")
     p.add_argument("-n", type=int, default=20, help="how many to show (default 20)")
     p.set_defaults(fn=_cmd_verdicts)
+
+    p = sub.add_parser("triage", help="analyze per-claim trace drop-offs and failure clusters")
+    p.add_argument("--json", action="store_true", help="print a stable machine-readable report")
+    p.add_argument("--top", type=int, default=15, help="maximum recurring failure clusters to show")
+    p.add_argument("--source", help="filter to one source_id")
+    p.set_defaults(fn=_cmd_triage)
 
     sub.add_parser("data-requests", help="open F7b data blockers").set_defaults(fn=_cmd_data_requests)
     sub.add_parser("status", help="pipeline status").set_defaults(fn=_cmd_status)

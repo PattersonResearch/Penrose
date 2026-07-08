@@ -17,11 +17,13 @@ READ_ONLY = {
     "penrose_principles",
     "penrose_data_requests",
     "penrose_status",
+    "penrose_triage",
 }
 MANAGEMENT = {
     "penrose_fetch_verdict",
     "penrose_register_cohort",
     "penrose_run_claim",
+    "penrose_mine_principles",
 }
 
 

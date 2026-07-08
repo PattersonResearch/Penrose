@@ -38,6 +38,8 @@ from .. import worker_control
 from ..brain import BrainReader, Claim, source_is_unanchored, validate_source_type
 from ..data import client as dataclient
 from ..report import write_report
+from ..strategy_family import declared_strategy_family, normalize_strategy_family
+from ..trace import project_trace_record
 from . import stages, p7_backtest
 # NB: claims.py is per-paper P2 output and gitignored (cold-start = none), so it is NOT imported
 # here — a fresh clone has no claims.py. extract.fallback_claims loads it lazily when present.
@@ -84,6 +86,25 @@ def _append_jsonl(path, obj) -> None:
 def _emit_jsonl_events(events: list[tuple[Path, dict]]) -> None:
     for path, obj in events:
         _append_jsonl(path, obj)
+
+
+def _effective_traces_path() -> Path:
+    default = config.ROOT / "reports" / "traces.jsonl"
+    configured = Path(getattr(config, "TRACES", default))
+    if configured != default:
+        return configured
+    if Path(config.DECISIONS_LOG) != config.ROOT / "decisions.jsonl":
+        return Path(config.DECISIONS_LOG).parent / "reports" / "traces.jsonl"
+    if Path(config.REPORTS) != config.ROOT / "reports":
+        return Path(config.REPORTS) / "traces.jsonl"
+    return configured
+
+
+def _emit_trace(claim, dec, rec, run_log) -> None:
+    try:
+        _append_jsonl(_effective_traces_path(), project_trace_record(claim, dec, rec, run_log))
+    except Exception:  # noqa: BLE001 — observability must never change control flow
+        pass
 
 
 def _llm_available() -> bool:
@@ -528,6 +549,18 @@ def _family(claim, module, source=None, spec: dict | None = None) -> str:
     return f"{cls}::{_data_domain(claim)}"
 
 
+def _structured_strategy_family(claim, source=None, spec: dict | None = None) -> dict:
+    raw = (spec or {}).get("strategy_family")
+    if raw is None:
+        raw = getattr(claim, "strategy_family", None)
+    family = declared_strategy_family(claim, source, raw=raw)
+    try:
+        setattr(claim, "strategy_family", family)
+    except Exception:  # noqa: BLE001
+        pass
+    return family
+
+
 def _generation_source_for(claim: Claim, spec: dict | None = None, source=None) -> str:
     if _authoritative_claim_type(claim, spec, source) == "provided_series_statistic":
         return "provided_series_statistic"
@@ -568,6 +601,7 @@ def _register_run_cohorts(ready_for_backtest: list[dict], source_id: str, source
         except Exception:  # noqa: BLE001
             pass
         family = _family(claim, item["module"], source, spec)
+        _structured_strategy_family(claim, source, spec)
         item["family"] = family
         if claim_type == "provided_series_statistic" and preregistered_single_cohort:
             cohort_id = f"{source_id}:provided_series:{claim.claim_id}"
@@ -888,6 +922,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             spec = spec_gen.generate_spec(
                                 claim, source, use_llm=use_llm,
                                 prior_divergences=prior_divergences)
+                            _record_spec_inputs(rec, spec)
                             _authoritative_claim_type(claim, spec, source)
                             local_specs.append(spec)
                             try:
@@ -897,6 +932,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             if missing_inputs:
                                 rec["stages"]["P6_data_availability"] = {
                                     "blocked": True,
+                                    "inputs_requested": list(rec.get("inputs_requested", [])),
                                     "missing_series": missing_inputs,
                                     "spec_path": str(spec.get("_path", "")),
                                 }
@@ -977,6 +1013,20 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                     if impl.get("deterministic_provided_series")
                                     else "spec auto-implemented + validated on the live bundle; backtesting"
                                 )}
+                        elif impl.get("needs_review"):
+                            audit = impl.get("no_progress") or {}
+                            rec["stages"]["P6"] = {
+                                "module_id": None, "spec_generated": True,
+                                "auto_implemented": False,
+                                "auto_impl_reason": str(impl.get("reason", ""))[:240],
+                                "auto_impl_no_progress": audit,
+                                "spec_path": str(spec.get("_path", "")),
+                                "note": "ModuleSpec generated; auto-impl no-progress guard -> needs_review"}
+                            rec["stages"]["P6_auto_impl_no_progress"] = audit
+                            local_decisions.append(_needs_review(
+                                claim, impl.get("reason"), rec, local_run_log,
+                                metrics={"auto_impl_no_progress": audit}))
+                            continue
                         else:
                             rec["stages"]["P6"] = {
                                 "module_id": None, "spec_generated": True,
@@ -1112,6 +1162,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 spec = spec_gen.generate_spec(
                     claim, source, use_llm=use_llm,
                     prior_divergences=prior_divergences)
+                _record_spec_inputs(rec, spec)
                 _authoritative_claim_type(claim, spec, source)
                 specs_generated.append(spec)
                 try:
@@ -1121,6 +1172,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 if missing_inputs:
                     rec["stages"]["P6_data_availability"] = {
                         "blocked": True,
+                        "inputs_requested": list(rec.get("inputs_requested", [])),
                         "missing_series": missing_inputs,
                         "spec_path": str(spec.get("_path", "")),
                     }
@@ -1198,6 +1250,19 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                            else "spec auto-implemented + validated on the live bundle; backtesting"
                                        )}
                 # fall through to P7 with the freshly-built module
+            elif impl.get("needs_review"):
+                audit = impl.get("no_progress") or {}
+                rec["stages"]["P6"] = {"module_id": None, "spec_generated": True,
+                                       "auto_implemented": False,
+                                       "auto_impl_reason": str(impl.get("reason", ""))[:240],
+                                       "auto_impl_no_progress": audit,
+                                       "spec_path": str(spec.get("_path", "")),
+                                       "note": "ModuleSpec generated; auto-impl no-progress guard -> needs_review"}
+                rec["stages"]["P6_auto_impl_no_progress"] = audit
+                decisions.append(_needs_review(
+                    claim, impl.get("reason"), rec, run_log,
+                    metrics={"auto_impl_no_progress": audit}))
+                continue
             else:
                 rec["stages"]["P6"] = {"module_id": None, "spec_generated": True,
                                        "auto_implemented": False,
@@ -1317,6 +1382,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             rec, local_run_log))
                         continue
                     family = _family(claim, module, source, spec)
+                    structured_family = _structured_strategy_family(claim, source, spec)
                     reg_schemes = {}
                     for _rk in ("btc_vol_regime", "btc_trend_regime"):
                         _rs = local_bundle.series.get(_rk)
@@ -1443,7 +1509,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                         competing = []
                     rec["competing_explanations"] = competing
                     local_decisions.append(dec)
-                    _queue_and_log(claim, dec, local_run_log)
+                    _queue_and_log(claim, dec, local_run_log, rec)
                     chart = charts.render_backtest_chart(claim.claim_id, _short_name(claim),
                                                          mres["net"], bt, dec.verdict)
                     analysis_record = {
@@ -1460,6 +1526,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                         "data_provenance": {
                             **(getattr(claim, "data_provenance", {}) or {}),
                             "data_domain": _data_domain(claim), "strategy_family": family,
+                            "strategy_family_structured": structured_family,
                             "datasets": _accessed_keys(local_bundle, conservative_for_auto=is_auto),
                             "periods": ([{"start": str(local_bundle.requested_window[0]),
                                           "end": str(local_bundle.requested_window[1])}]
@@ -1579,6 +1646,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     claim, f"data_unavailable: module result missing keys {_missing}", rec, run_log))
                 continue
             family = _family(claim, module, source, spec)        # C1: strategy_class + data_domain
+            structured_family = _structured_strategy_family(claim, source, spec)
             # Pre-registered point-in-time MARKET-regime labels for the kill-lens. PRIMARY source is
             # the bundle's regime catalog series (btc_vol_regime / btc_trend_regime) — the SAME labels
             # a module conditions on via bundle.get(), so the lens partitions by exactly what the
@@ -1728,7 +1796,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 competing = []
             rec["competing_explanations"] = competing
             decisions.append(dec)
-            _queue_and_log(claim, dec, run_log)
+            _queue_and_log(claim, dec, run_log, rec)
 
             # ---- Analysis report: chart the backtested equity curve + index it --- #
             chart = charts.render_backtest_chart(claim.claim_id, _short_name(claim),
@@ -1747,6 +1815,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 "data_provenance": {
                     **(getattr(claim, "data_provenance", {}) or {}),
                     "data_domain": _data_domain(claim), "strategy_family": family,
+                    "strategy_family_structured": structured_family,
                     "datasets": sorted(
                         (getattr(bundle, "_accessed", None) or bundle.series.keys())
                         if is_auto else (getattr(bundle, "_accessed", None) or [])),
@@ -1827,7 +1896,7 @@ def _kill(claim, reason, note, synthetic, rec, run_log):
                    metrics={"synthetic_signal": synthetic}, revisit_at="2026-07-01")
     rec["stages"]["P8"] = {"verdict": "kill", "kill_reason": reason}
     run_log["claims"].append(rec)
-    _queue_and_log(claim, dec, run_log)
+    _queue_and_log(claim, dec, run_log, rec)
     return dec
 
 
@@ -1838,6 +1907,24 @@ def _short_name(claim) -> str:
         return s[:60]
     words = (getattr(claim, "statement", "") or "").split()
     return (" ".join(words[:8])[:60]) or claim.claim_id
+
+
+def _record_spec_inputs(rec: dict, spec: dict | None) -> None:
+    try:
+        inputs = (spec or {}).get("inputs", [])
+        if not isinstance(inputs, list):
+            return
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in inputs:
+            name = str(raw or "").strip()
+            if name and name not in seen:
+                seen.add(name)
+                out.append(name)
+        if out:
+            rec["inputs_requested"] = out
+    except Exception:  # noqa: BLE001 — trace metadata only
+        pass
 
 
 def _skip(claim, reason, note, rec, run_log):
@@ -1853,6 +1940,7 @@ def _skip(claim, reason, note, rec, run_log):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
+    _emit_trace(claim, dec, rec, run_log)
     return dec
 
 
@@ -1895,6 +1983,7 @@ def _cannot_replicate_unfaithful_spec(claim, spec: dict, fid: dict, rec, run_log
     rec["stages"]["P8"] = {"verdict": "cannot_replicate", "kill_reason": "unfaithful_spec"}
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG, asdict(dec) | _decision_log_metadata(claim, run_log))
+    _emit_trace(claim, dec, rec, run_log)
     return dec
 
 
@@ -2195,13 +2284,16 @@ def _zero_extraction_engine_error(source, source_id: str, p2_prov: dict, run_log
                    kill_reason=None, rationale=rationale[:600],
                    metrics={"stage": "P2 extraction", "p2_mode": mode,
                            "n_chars": getattr(source, "n_chars", 0)})
-    run_log["claims"].append({"claim_id": claim_id,
-                              "stages": {"P2": p2_prov,
-                                        "P8": {"verdict": "engine_error", "stage": "P2 extraction"}}})
+    rec = {"claim_id": claim_id,
+           "source_id": source_id,
+           "stages": {"P2": p2_prov,
+                      "P8": {"verdict": "engine_error", "stage": "P2 extraction"}}}
+    run_log["claims"].append(rec)
     meta = {"source_id": source_id,
             "run_id": (run_log.get("idempotency") or {}).get("run_id", ""),
             "logged_at": _now()}
     _append_jsonl(config.DECISIONS_LOG, asdict(dec) | meta)
+    _emit_trace({"claim_id": claim_id, "source_id": source_id}, dec, rec, run_log)
     _append_jsonl(config.REVIEW_QUEUE,
                   {"type": "engine_error", "queued_at": _now(), "status": "pending",
                    "proposal_id": f"{claim_id}-err", "name": source_id,
@@ -2255,6 +2347,7 @@ def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))   # log, do NOT queue
+    _emit_trace(claim, dec, rec, run_log)
     return dec
 
 
@@ -2274,6 +2367,7 @@ def _needs_review(claim, reason, rec, run_log, metrics=None):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))
+    _emit_trace(claim, dec, rec, run_log)
     _append_jsonl(config.REVIEW_QUEUE,
                   {"type": "needs_review", "queued_at": _now(), "status": "pending",
                    "proposal_id": dec.decision_id, "name": _short_name(claim),
@@ -2297,6 +2391,7 @@ def _engine_error(claim, stage: str, err: BaseException, rec, run_log):
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))
+    _emit_trace(claim, dec, rec, run_log)
     _append_jsonl(config.REVIEW_QUEUE,
                   {"type": "engine_error", "queued_at": _now(), "status": "pending",
                    "proposal_id": f"{claim.claim_id}-err", "name": _short_name(claim),
@@ -2309,16 +2404,26 @@ def _engine_error(claim, stage: str, err: BaseException, rec, run_log):
 def _decision_log_metadata(claim, run_log) -> dict:
     source_id = getattr(claim, "source_id", "") or run_log.get("source_id", "")
     idempotency = run_log.get("idempotency", {}) if isinstance(run_log, dict) else {}
-    return {
+    out = {
         "source_id": source_id,
         "run_id": idempotency.get("run_id", ""),
         "logged_at": _now(),
+        "strategy_class": getattr(claim, "applicable_strategy_class", "") or "",
     }
+    try:
+        family = normalize_strategy_family(getattr(claim, "strategy_family", None))
+        if family is None:
+            family = _structured_strategy_family(claim)
+        out["strategy_family"] = family
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
-def _queue_and_log(claim, dec, run_log) -> None:
+def _queue_and_log(claim, dec, run_log, rec=None) -> None:
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))
+    _emit_trace(claim, dec, rec, run_log)
     _append_jsonl(config.REVIEW_QUEUE,
                   {"type": "decision", "queued_at": _now(), "status": "pending",
                    "proposal_id": dec.decision_id, "name": _short_name(claim),
