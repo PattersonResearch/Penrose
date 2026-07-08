@@ -34,6 +34,12 @@ from penrose.pipeline import fidelity_memory     # noqa: E402
 from penrose.pipeline import robustness as R     # noqa: E402
 from penrose.pipeline import stages              # noqa: E402
 from penrose.pipeline import event_market        # noqa: E402
+from penrose.pipeline import predictive_regression  # noqa: E402
+from penrose.pipeline import factor_spanning     # noqa: E402
+from penrose.pipeline import cross_sectional_sort  # noqa: E402
+from penrose.pipeline import event_study         # noqa: E402
+from penrose.pipeline import forecast_skill      # noqa: E402
+from penrose.data.contract import DataBundle, Series  # noqa: E402
 from penrose.data.event_market import EventMarketPanel  # noqa: E402
 from penrose.pipeline.event_market_backtest import run_event_market_backtest  # noqa: E402
 from penrose.brain import Claim                  # noqa: E402
@@ -62,12 +68,14 @@ def _idx(n: int) -> pd.DatetimeIndex:
 
 
 def _verdict(result):
+    claim_type = None
     if isinstance(result, dict):
         net = result["net"]
         positions = result["positions"]
         bars_per_year = result["bars_per_year"]
         spec = result.get("_spec")
         module = result.get("_module")
+        claim_type = result.get("_claim_type")
     elif isinstance(result, tuple):
         net, positions, bars_per_year = result[:3]
         spec = None
@@ -78,9 +86,12 @@ def _verdict(result):
         bars_per_year = BPY
         spec = None
         module = None
+        claim_type = None
     bt = P7.run_backtest(
         "eval", net, positions, bars_per_year, log=False,
         declared_grid_size=P7.declared_grid_size(spec))
+    if claim_type:
+        bt["claim_type"] = claim_type
     dec = stages.p8_verdict(_claim(), bt, {}, synthetic=False)
     if spec and module is not None and dec.verdict in ("watch", "research-supported"):
         bt["parameter_fragility"] = R.parameter_fragility(
@@ -261,6 +272,373 @@ def build_event_market_param_fragile(rng):
     return _event_market_param_module({"min_ev": [0.05, 0.25, 0.30, 0.35]})
 
 
+def _predictive_regression_result(x: pd.Series, y: pd.Series, *, horizon: int = 5) -> dict:
+    spec = {
+        "module_id": "eval_predictive_regression",
+        "strategy_class": "predictive_regression",
+        "claim_type": "predictive_regression",
+        "inputs": ["predictor", "target"],
+        "predictor": "predictor",
+        "target": "target",
+        "horizon": horizon,
+        "estimator": "single_predictor_ols_covariance_sign",
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "predictive_regression"
+    module = predictive_regression.build_module(spec, claim)
+    bundle = DataBundle(series={
+        "predictor": Series("predictor", x, "planted-eval", "z"),
+        "target": Series("target", y, "planted-eval", "z"),
+    })
+    out = module.run(bundle, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "predictive_regression"
+    return out
+
+
+def _target_from_aligned(aligned_y: np.ndarray, horizon: int, rng) -> np.ndarray:
+    del rng
+    return np.concatenate([np.full(horizon, 0.0), aligned_y[:-horizon]])
+
+
+def build_predictive_regression_null(rng):
+    """Unrelated predictor and target: must not certify."""
+    n, h = 5000, 5
+    idx = _idx(n)
+    x = rng.normal(0.0, 1.0, n)
+    aligned_y = rng.normal(0.0, 1.0, n)
+    y = _target_from_aligned(aligned_y, h, rng)
+    return _predictive_regression_result(pd.Series(x, index=idx), pd.Series(y, index=idx), horizon=h)
+
+
+def build_predictive_regression_real(rng):
+    """Genuine lead relationship with adequate sample: must survive."""
+    n, h = 5000, 5
+    idx = _idx(n)
+    x = rng.normal(0.0, 1.0, n)
+    eps = rng.normal(0.0, 1.0, n)
+    aligned_y = 0.45 * x + 0.55 * eps
+    y = _target_from_aligned(aligned_y, h, rng)
+    return _predictive_regression_result(pd.Series(x, index=idx), pd.Series(y, index=idx), horizon=h)
+
+
+def build_predictive_regression_is_only(rng):
+    """Strong IS fit, no OOS predictive survival: must kill.
+
+    N is sized so that after non-overlapping h-sampling (~N/h emitted obs) the OOS segment still
+    carries enough independent observations for the engine to CONFIDENTLY reject an OOS edge and
+    kill (in_sample_only) rather than fall back to underpowered."""
+    n, h = 25000, 5
+    idx = _idx(n)
+    x = rng.normal(0.0, 1.0, n)
+    cut = int((n - h) * P7.IS_FRAC)
+    aligned_y = rng.normal(0.0, 1.0, n)
+    aligned_y[:cut] = 0.75 * x[:cut] + 0.25 * rng.normal(0.0, 1.0, cut)
+    y = _target_from_aligned(aligned_y, h, rng)
+    return _predictive_regression_result(pd.Series(x, index=idx), pd.Series(y, index=idx), horizon=h)
+
+
+def _factor_spanning_result(candidate: pd.Series, b1: pd.Series, b2: pd.Series) -> dict:
+    spec = {
+        "module_id": "eval_factor_spanning",
+        "strategy_class": "factor_spanning",
+        "claim_type": "factor_spanning",
+        "inputs": ["candidate", "b1", "b2"],
+        "candidate_factor": "candidate",
+        "benchmark_set": "ff3",
+        "benchmark_factors": ["b1", "b2"],
+        "estimator": "multivariate_ols_is_frozen_betas",
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "factor_spanning"
+    module = factor_spanning.build_module(spec, claim)
+    bundle = DataBundle(series={
+        "candidate": Series("candidate", candidate, "planted-eval", "ret"),
+        "b1": Series("b1", b1, "planted-eval", "ret"),
+        "b2": Series("b2", b2, "planted-eval", "ret"),
+    })
+    out = module.run(bundle, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "factor_spanning"
+    return out
+
+
+def build_factor_spanning_null(rng):
+    """Spanned factor, true alpha zero: must not certify."""
+    n = 5000
+    idx = _idx(n)
+    b1 = rng.normal(0.0, 0.01, n)
+    b2 = rng.normal(0.0, 0.01, n)
+    eps = rng.normal(0.0, 0.002, n)
+    candidate = 0.3 * b1 + 0.2 * b2 + eps
+    return _factor_spanning_result(
+        pd.Series(candidate, index=idx),
+        pd.Series(b1, index=idx),
+        pd.Series(b2, index=idx),
+    )
+
+
+def build_factor_spanning_real(rng):
+    """Genuine benchmark-net alpha with adequate sample: must survive."""
+    n = 5000
+    idx = _idx(n)
+    b1 = rng.normal(0.0, 0.01, n)
+    b2 = rng.normal(0.0, 0.01, n)
+    eps = rng.normal(0.0, 0.002, n)
+    candidate = 0.0009 + 0.3 * b1 + 0.2 * b2 + eps
+    return _factor_spanning_result(
+        pd.Series(candidate, index=idx),
+        pd.Series(b1, index=idx),
+        pd.Series(b2, index=idx),
+    )
+
+
+def build_factor_spanning_is_only(rng):
+    """Alpha appears in IS only and vanishes OOS: must kill."""
+    n = 20000
+    idx = _idx(n)
+    b1 = rng.normal(0.0, 0.01, n)
+    b2 = rng.normal(0.0, 0.01, n)
+    eps = rng.normal(0.0, 0.002, n)
+    cut = int(n * P7.IS_FRAC)
+    alpha = np.zeros(n)
+    alpha[:cut] = 0.0012
+    candidate = alpha + 0.3 * b1 + 0.2 * b2 + eps
+    return _factor_spanning_result(
+        pd.Series(candidate, index=idx),
+        pd.Series(b1, index=idx),
+        pd.Series(b2, index=idx),
+    )
+
+
+def _write_panel_table(path: Path, data: pd.DataFrame) -> None:
+    out = data.copy()
+    out.insert(0, "date", out.index.astype(str))
+    out.to_csv(path, index=False)
+
+
+def _cross_sectional_sort_result(returns: pd.DataFrame, characteristic: pd.DataFrame) -> dict:
+    digest = hashlib.sha256(
+        pd.util.hash_pandas_object(returns.fillna(0.0), index=True).values.tobytes()
+        + pd.util.hash_pandas_object(characteristic.fillna(0.0), index=True).values.tobytes()
+    ).hexdigest()[:12]
+    ret_path = Path(tempfile.gettempdir()) / f"penrose_eval_css_returns_{digest}.csv"
+    char_path = Path(tempfile.gettempdir()) / f"penrose_eval_css_char_{digest}.csv"
+    _write_panel_table(ret_path, returns)
+    _write_panel_table(char_path, characteristic)
+    spec = {
+        "module_id": "eval_cross_sectional_sort",
+        "strategy_class": "cross_sectional_sort",
+        "claim_type": "cross_sectional_sort",
+        "panel_inputs": {
+            "returns": {"path": str(ret_path), "survivorship": "corrected", "name": "returns"},
+            "characteristic": {"path": str(char_path), "name": "characteristic"},
+        },
+        "characteristic": "synthetic characteristic",
+        "n_buckets": 10,
+        "rebalance": "ME",
+        "hold": "1M",
+        "min_names": 40,
+        "estimator": "characteristic_sorted_top_minus_bottom",
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "cross_sectional_sort"
+    module = cross_sectional_sort.build_module(spec, claim)
+    out = module.run(None, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "cross_sectional_sort"
+    return out
+
+
+def _cross_sectional_panels(rng, *, kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    n_months, n_names = (4200 if kind == "is_only" else 420), 80
+    dates = pd.date_range("1985-01-31", periods=n_months, freq="ME", tz="UTC")
+    names = [f"stock_{i:03d}" for i in range(n_names)]
+    characteristic = pd.DataFrame(rng.normal(0.0, 1.0, (n_months, n_names)), index=dates, columns=names)
+    returns = pd.DataFrame(rng.normal(0.0, 0.012, (n_months, n_names)), index=dates, columns=names)
+    if kind == "real":
+        for i in range(n_months - 1):
+            returns.iloc[i + 1] += 0.020 * characteristic.iloc[i].to_numpy()
+    elif kind == "is_only":
+        cut = int((n_months - 1) * P7.IS_FRAC)
+        for i in range(cut):
+            returns.iloc[i + 1] += 0.024 * characteristic.iloc[i].to_numpy()
+    elif kind != "null":
+        raise ValueError(kind)
+    # Survivorship fixture: a delisted name is retained while alive, then NaN after delisting.
+    characteristic.iloc[:120, 0] = 5.0
+    returns.iloc[1:120, 0] += 0.02 if kind == "real" else 0.0
+    returns.iloc[120:, 0] = np.nan
+    characteristic.iloc[120:, 0] = np.nan
+    return returns, characteristic
+
+
+def build_cross_sectional_sort_null(rng):
+    """Characteristic independent of forward returns: must not certify."""
+    returns, characteristic = _cross_sectional_panels(rng, kind="null")
+    return _cross_sectional_sort_result(returns, characteristic)
+
+
+def build_cross_sectional_sort_real(rng):
+    """Forward returns are genuinely monotone in C: must survive."""
+    returns, characteristic = _cross_sectional_panels(rng, kind="real")
+    return _cross_sectional_sort_result(returns, characteristic)
+
+
+def build_cross_sectional_sort_is_only(rng):
+    """Spread is planted only in-sample and vanishes OOS: must kill."""
+    returns, characteristic = _cross_sectional_panels(rng, kind="is_only")
+    return _cross_sectional_sort_result(returns, characteristic)
+
+
+def _event_calendar_table(path: Path, events: pd.DatetimeIndex) -> None:
+    pd.DataFrame({"date": [d.isoformat() for d in events]}).to_csv(path, index=False)
+
+
+def _event_study_result(returns: pd.Series, events: pd.DatetimeIndex, *,
+                        window: list[int] | None = None,
+                        estimation_window: int = 20) -> dict:
+    digest = hashlib.sha256(
+        pd.util.hash_pandas_object(returns.fillna(0.0), index=True).values.tobytes()
+        + "|".join(d.isoformat() for d in events).encode("utf-8")
+    ).hexdigest()[:12]
+    calendar_path = Path(tempfile.gettempdir()) / f"penrose_eval_event_calendar_{digest}.csv"
+    _event_calendar_table(calendar_path, events)
+    spec = {
+        "module_id": "eval_event_study",
+        "strategy_class": "event_study",
+        "claim_type": "event_study",
+        "inputs": ["asset_returns"],
+        "return_series": "asset_returns",
+        "event_calendar": {"path": str(calendar_path), "date_col": "date", "name": "events"},
+        "window": window or [0, 2],
+        "estimation_window": estimation_window,
+        "baseline": "mean_adjusted",
+        "statistic": "average_car",
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "event_study"
+    module = event_study.build_module(spec, claim)
+    bundle = DataBundle(series={
+        "asset_returns": Series("asset_returns", returns, "planted-eval", "return"),
+    })
+    out = module.run(bundle, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "event_study"
+    return out
+
+
+def _event_study_fixture(rng, *, kind: str) -> tuple[pd.Series, pd.DatetimeIndex]:
+    n_events = 260 if kind != "is_only" else 4000
+    spacing = 24
+    estimation_window = 20
+    event_offsets = estimation_window + 5 + np.arange(n_events) * spacing
+    n_days = int(event_offsets[-1] + 10)
+    idx = pd.date_range("2000-01-01", periods=n_days, freq="D", tz="UTC")
+    returns = rng.normal(0.0, 0.006, n_days)
+    if kind == "real":
+        for pos in event_offsets:
+            returns[pos:pos + 3] += 0.016
+    elif kind == "is_only":
+        cut = int(n_events * P7.IS_FRAC)
+        for pos in event_offsets[:cut]:
+            returns[pos:pos + 3] += 0.018
+    elif kind != "null":
+        raise ValueError(kind)
+    events = idx[event_offsets]
+    return pd.Series(returns, index=idx), events
+
+
+def build_event_study_null(rng):
+    """Random event dates with no event effect: average CAR must not certify."""
+    returns, events = _event_study_fixture(rng, kind="null")
+    return _event_study_result(returns, events)
+
+
+def build_event_study_real(rng):
+    """Persistent event-window return bump: average CAR must survive."""
+    returns, events = _event_study_fixture(rng, kind="real")
+    return _event_study_result(returns, events)
+
+
+def build_event_study_is_only(rng):
+    """CAR bump appears only in-sample and vanishes OOS: must kill."""
+    returns, events = _event_study_fixture(rng, kind="is_only")
+    return _event_study_result(returns, events)
+
+
+def _forecast_skill_result(forecast: pd.Series, target: pd.Series, *, benchmark=None) -> dict:
+    spec = {
+        "module_id": "eval_forecast_skill",
+        "strategy_class": "forecast_skill",
+        "claim_type": "forecast_skill",
+        "inputs": ["model_forecast", "target"],
+        "model_forecast": "model_forecast",
+        "target": "target",
+        "benchmark": benchmark or {"kind": "implied", "method": "random_walk"},
+        "loss": "squared_error",
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "forecast_skill"
+    module = forecast_skill.build_module(spec, claim)
+    bundle = DataBundle(series={
+        "model_forecast": Series("model_forecast", forecast, "planted-eval", "forecast"),
+        "target": Series("target", target, "planted-eval", "target"),
+    })
+    out = module.run(bundle, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "forecast_skill"
+    return out
+
+
+def _forecast_target(rng, n: int) -> pd.Series:
+    idx = _idx(n)
+    shocks = rng.normal(0.0, 1.0, n)
+    target = np.cumsum(shocks)
+    return pd.Series(target, index=idx)
+
+
+def build_forecast_skill_null(rng):
+    """Naive random-walk forecast: zero loss differential must not certify."""
+    y = _forecast_target(rng, 1800)
+    f = y.shift(1)
+    f.iloc[0] = y.iloc[0]
+    return _forecast_skill_result(f, y)
+
+
+def build_forecast_skill_real(rng):
+    """Model forecast is genuinely closer to Y than the random-walk benchmark."""
+    y = _forecast_target(rng, 1800)
+    f = y + rng.normal(0.0, 0.15, len(y))
+    return _forecast_skill_result(pd.Series(f, index=y.index), y)
+
+
+def build_forecast_skill_is_only(rng):
+    """Model beats the benchmark in-sample only and vanishes OOS: must kill."""
+    y = _forecast_target(rng, 4000)
+    rw = y.shift(1)
+    rw.iloc[0] = y.iloc[0]
+    f = rw.copy()
+    cut = int(len(y) * P7.IS_FRAC)
+    f.iloc[:cut] = y.iloc[:cut] + rng.normal(0.0, 0.12, cut)
+    return _forecast_skill_result(f, y)
+
+
 # (name, builder, expected verdict(s), expected kill_reason substring or None)
 CASES = [
     # PEN-01: the low-power 3-fold failure may reclassify; this planted case must not survive.
@@ -274,6 +652,21 @@ CASES = [
     ("event-market losing",       build_event_market_losing, ("kill", "underpowered"), None),
     ("event-market param-stable",  build_event_market_param_stable, ("watch", "research-supported"), None),
     ("event-market param-fragile", build_event_market_param_fragile, ("kill",), "parameter_fragile"),
+    ("predictive-reg null",        build_predictive_regression_null, ("kill", "underpowered", "insufficient_data"), None),
+    ("predictive-reg real",        build_predictive_regression_real, ("watch", "research-supported"), None),
+    ("predictive-reg IS-only",     build_predictive_regression_is_only, ("kill",), None),
+    ("factor-spanning null",       build_factor_spanning_null, ("kill", "underpowered", "insufficient_data"), None),
+    ("factor-spanning real",       build_factor_spanning_real, ("watch", "research-supported"), None),
+    ("factor-spanning IS-only",    build_factor_spanning_is_only, ("kill",), None),
+    ("cross-sectional null",       build_cross_sectional_sort_null, ("kill", "underpowered", "insufficient_data"), None),
+    ("cross-sectional real",       build_cross_sectional_sort_real, ("watch", "research-supported"), None),
+    ("cross-sectional IS-only",    build_cross_sectional_sort_is_only, ("kill",), None),
+    ("event-study null",           build_event_study_null, ("kill", "underpowered", "insufficient_data"), None),
+    ("event-study real",           build_event_study_real, ("watch", "research-supported"), None),
+    ("event-study IS-only",        build_event_study_is_only, ("kill",), None),
+    ("forecast-skill null",        build_forecast_skill_null, ("kill", "underpowered", "insufficient_data"), None),
+    ("forecast-skill real",        build_forecast_skill_real, ("watch", "research-supported"), None),
+    ("forecast-skill IS-only",     build_forecast_skill_is_only, ("kill",), None),
 ]
 
 
@@ -549,6 +942,42 @@ def invariants() -> list[tuple[str, bool]]:
     out.append(("6g: explicit pre-registered provided-series claim keeps singleton deflation break",
                 _provided_prereg_ok))
 
+    # EVENT_STUDY: baseline estimation is strictly pre-event. Mutating returns after the event
+    # window must not change the prior event's baseline, and overlapping event windows are skipped
+    # instead of contaminating another event's estimation window.
+    _es_idx = pd.date_range("2020-01-01", periods=90, freq="D", tz="UTC")
+    _es_returns = pd.Series(np.linspace(-0.002, 0.003, len(_es_idx)), index=_es_idx)
+    _es_events = pd.DatetimeIndex([_es_idx[40]])
+    _car_a, _rows_a = event_study._event_car_rows(
+        _es_returns, _es_events, event_window=(0, 2), estimation_window=20,
+        baseline="mean_adjusted")
+    _mut = _es_returns.copy()
+    _mut.loc[_es_idx[50:]] = _mut.loc[_es_idx[50:]] + 10.0
+    _car_b, _rows_b = event_study._event_car_rows(
+        _mut, _es_events, event_window=(0, 2), estimation_window=20,
+        baseline="mean_adjusted")
+    out.append(("event-study no-lookahead: post-event mutation leaves prior baseline unchanged",
+                len(_car_a) == len(_car_b) == 1
+                and _rows_a[0]["baseline"] == _rows_b[0]["baseline"]))
+    _near_events = pd.DatetimeIndex([_es_idx[40], _es_idx[41], _es_idx[70]])
+    _car_overlap, _rows_overlap = event_study._event_car_rows(
+        _es_returns, _near_events, event_window=(0, 2), estimation_window=20,
+        baseline="mean_adjusted")
+    out.append(("event-study overlap handling: overlapping event window is skipped",
+                len(_car_overlap) == 2
+                and any(r.get("skipped") == "overlaps_prior_event_window" for r in _rows_overlap)))
+
+    # FORECAST_SKILL: constructed benchmarks must be strictly causal. Mutating Y_t
+    # or later cannot change the benchmark value used at t.
+    _fs_idx = pd.date_range("2020-01-01", periods=8, freq="D")
+    _fs_y = pd.Series(np.arange(8, dtype=float), index=_fs_idx)
+    _fs_b = forecast_skill._construct_implied_benchmark(_fs_y, "historical_mean")
+    _fs_mut = _fs_y.copy()
+    _fs_mut.loc[_fs_idx[4:]] = 1000.0
+    _fs_b_mut = forecast_skill._construct_implied_benchmark(_fs_mut, "historical_mean")
+    out.append(("forecast-skill no-lookahead: constructed benchmark uses only Y before t",
+                _fs_b.loc[_fs_idx[4]] == _fs_b_mut.loc[_fs_idx[4]]))
+
     # ===================== Wave 2/3 audit-fix regression guards ===================== #
     import tempfile
     import pathlib
@@ -715,7 +1144,7 @@ def run(bundle, claim, cost_frac):
 
     # F-finding (CZ swarm): calibration/referee harnesses must NOT pollute the PRODUCTION holdout
     # lock. final_holdout_eval honors $PENROSE_HOLDOUT_LOCK -> an isolated lock writes there, never
-    # to P7.HOLDOUT_LOCK (the real .holdout_burned the live pipeline depends on).
+    # to P7.HOLDOUT_LOCK (the real .holdout/burned the live pipeline depends on).
     import os as _os, tempfile as _tf
     _iso = _os.path.join(_tf.gettempdir(), "_eval_iso_holdout.lock")
     if _os.path.exists(_iso): _os.unlink(_iso)

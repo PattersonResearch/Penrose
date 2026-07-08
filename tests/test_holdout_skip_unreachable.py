@@ -46,7 +46,8 @@ def test_modeled_costs_skip_holdout_and_preserve_lock(tmp_path, monkeypatch):
     from penrose.pipeline import p7_backtest as p7, run as run_mod, stages
 
     monkeypatch.delenv("PENROSE_HOLDOUT_LOCK", raising=False)
-    monkeypatch.setattr(p7, "HOLDOUT_LOCK", tmp_path / ".holdout_burned")
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "HOLDOUT_DIR", tmp_path / ".holdout")
     monkeypatch.setattr(config, "COST_PROVENANCE", "modeled")
 
     dec0 = stages.p8_verdict(_claim(), _bt(), {}, synthetic=False)
@@ -56,7 +57,7 @@ def test_modeled_costs_skip_holdout_and_preserve_lock(tmp_path, monkeypatch):
     assert holdout["not_consulted"] is True
     assert "preserved for a measured-cost run" in holdout["reason"]
     assert "preserved for a measured-cost run" in dec.rationale
-    assert list(tmp_path.glob(".holdout_burned.*.lock")) == []
+    assert list((tmp_path / ".holdout" / "locks").glob("*.lock")) == []
 
 
 def test_measured_costs_consult_holdout(tmp_path, monkeypatch):
@@ -64,7 +65,8 @@ def test_measured_costs_consult_holdout(tmp_path, monkeypatch):
     from penrose.pipeline import p7_backtest as p7, run as run_mod, stages
 
     monkeypatch.delenv("PENROSE_HOLDOUT_LOCK", raising=False)
-    monkeypatch.setattr(p7, "HOLDOUT_LOCK", tmp_path / ".holdout_burned")
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "HOLDOUT_DIR", tmp_path / ".holdout")
     monkeypatch.setattr(config, "COST_PROVENANCE", "measured")
 
     dec0 = stages.p8_verdict(_claim(), _bt(), {}, synthetic=False)
@@ -73,4 +75,4 @@ def test_measured_costs_consult_holdout(tmp_path, monkeypatch):
     assert holdout.get("refused") is not True
     assert "holdout_sharpe" in holdout
     assert dec.verdict == "research-supported"
-    assert len(list(tmp_path.glob(".holdout_burned.*.lock"))) == 1
+    assert len(list((tmp_path / ".holdout" / "locks").glob("*.lock"))) == 1

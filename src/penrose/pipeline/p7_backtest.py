@@ -34,7 +34,7 @@ from . import robustness as R
 from .. import stats as H        # vendored DSR/Sharpe/capacity — penrose is self-contained
 
 LEDGER = config.ROOT / "backtest_ledger.tsv"
-HOLDOUT_LOCK = config.ROOT / ".holdout_burned"
+HOLDOUT_LOCK = config.HOLDOUT_DIR / "burned"
 IS_FRAC, OOS_FRAC = 0.50, 0.30                 # holdout = final 0.20
 DECLARED_GRID_SIZE_CAP = 10000
 
@@ -59,14 +59,54 @@ def declared_param_grid(spec) -> dict | None:
         return None
 
 
+def _holdout_dir() -> Path:
+    return Path(getattr(config, "HOLDOUT_DIR", config.ROOT / ".holdout"))
+
+
+def _base_holdout_lock() -> Path:
+    return _holdout_dir() / "burned"
+
+
+def _legacy_base_holdout_lock() -> Path:
+    return config.ROOT / ".holdout_burned"
+
+
+def _claim_lock_filename(name: str) -> str:
+    raw = str(name or "unknown-claim")
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")[:80] or "claim"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+    return f"{slug}.{digest}.lock"
+
+
 def _claim_holdout_lock(name: str) -> Path:
     """Return the atomic holdout lock for this claim identity."""
     if os.environ.get("PENROSE_HOLDOUT_LOCK"):
         return Path(os.environ["PENROSE_HOLDOUT_LOCK"])
-    raw = str(name or "unknown-claim")
-    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", raw).strip("-._")[:80] or "claim"
-    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-    return HOLDOUT_LOCK.parent / f"{HOLDOUT_LOCK.name}.{slug}.{digest}.lock"
+    return _holdout_dir() / "locks" / _claim_lock_filename(name)
+
+
+def _legacy_claim_holdout_lock(name: str) -> Path:
+    return config.ROOT / f".holdout_burned.{_claim_lock_filename(name)}"
+
+
+def _holdout_burned_lock(name: str) -> Path | None:
+    """Return the burn lock that makes this identity unavailable, if any.
+
+    New state is authoritative, but legacy root locks still count as burned so
+    relocation can never silently re-open an already-consulted holdout.
+    """
+    if os.environ.get("PENROSE_HOLDOUT_LOCK"):
+        lock = Path(os.environ["PENROSE_HOLDOUT_LOCK"])
+        return lock if lock.exists() else None
+    for lock in (
+        _claim_holdout_lock(name),
+        _base_holdout_lock(),
+        _legacy_claim_holdout_lock(name),
+        _legacy_base_holdout_lock(),
+    ):
+        if lock.exists():
+            return lock
+    return None
 
 
 def declared_grid_size(spec) -> int:
@@ -319,14 +359,17 @@ def _three_fold(net: np.ndarray) -> dict:
             "min_fold_t": min(valid_t) if valid_t else None}
 
 
-def _turnover_from_position(pos: pd.Series) -> pd.Series:
+def _turnover_from_position(pos: pd.Series | pd.DataFrame) -> pd.Series:
+    if isinstance(pos, pd.DataFrame):
+        p = pos.fillna(0.0).astype(float)
+        return p.diff().abs().fillna(p.abs()).sum(axis=1)
     p = pd.Series(pos).fillna(0.0).astype(float)
     return p.diff().abs().fillna(p.abs())
 
 
-def _align_to_index(series: pd.Series, index: pd.Index) -> pd.Series:
+def _align_to_index(series: pd.Series | pd.DataFrame, index: pd.Index) -> pd.Series | pd.DataFrame:
     """Align a contract series while preserving duplicate timestamps when already aligned."""
-    if isinstance(series, pd.Series) and series.index.equals(index):
+    if isinstance(series, (pd.Series, pd.DataFrame)) and series.index.equals(index):
         return series
     return series.reindex(index)
 
@@ -492,7 +535,10 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
         pos_seen.index = seen.index
     else:
         pos_seen = positions.reindex(seen.index)
-    pos_df = pd.DataFrame({"VOL:BTC": pos_seen.fillna(0.0)})
+    if isinstance(pos_seen, pd.DataFrame):
+        pos_df = pos_seen.fillna(0.0).astype(float)
+    else:
+        pos_df = pd.DataFrame({"VOL:BTC": pos_seen.fillna(0.0).astype(float)})
     ann_ret = float(seen.values.mean()) * bars_per_year
     out["ann_ret"] = round(ann_ret, 4)
     out["capacity_usd"] = H._capacity_usd(pos_df, ann_ret, bars_per_year,
@@ -545,7 +591,7 @@ def final_holdout_eval(name: str, net_per_trade: pd.Series, bars_per_year: float
 
     The lock path honors $PENROSE_HOLDOUT_LOCK if set, so CALIBRATION/REFEREE harnesses (which
     force-consult hundreds of synthetic holdouts) point it at an isolated temp file and never
-    pollute penrose's PRODUCTION per-claim `.holdout_burned.*.lock` state (state-safety fix;
+    pollute penrose's PRODUCTION per-claim `.holdout/locks/*.lock` state (state-safety fix;
     the prod default is used by the real pipeline run.py)."""
     # Dream triage is categorically forbidden from peeking at a shared holdout. Check this before
     # `force`: even an accidental force=True call cannot burn or read the lock in read-only mode.
@@ -554,6 +600,9 @@ def final_holdout_eval(name: str, net_per_trade: pd.Series, bars_per_year: float
     lock = _claim_holdout_lock(name)
     claimed = False
     if not force:
+        burned = _holdout_burned_lock(name)
+        if burned is not None:
+            return {"refused": True, "reason": f"holdout already burned for this claim (lock {burned.name})"}
         lock.parent.mkdir(parents=True, exist_ok=True)
         try:
             fd = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -576,7 +625,8 @@ def final_holdout_eval(name: str, net_per_trade: pd.Series, bars_per_year: float
                "holdout_psr": round(H.probabilistic_sharpe(hold), 4), "nbars": len(hold)}
         digest = hashlib.sha256(repr(res).encode()).hexdigest()[:16]
         burned_at = pd.Timestamp.now(tz="UTC").isoformat()
-        lock.write_text(f"strategy={name} bars={len(hold)} digest={digest} burned_at={burned_at}")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(f"strategy={name} digest={digest} burned_at={burned_at}\n")
     except Exception as e:  # noqa: BLE001
         if claimed:
             lock.unlink(missing_ok=True)

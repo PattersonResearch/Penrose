@@ -9,7 +9,7 @@ strategy, stress-tests its evidence the way a skeptical reviewer would, and tell
 real or just an artifact of how it was found. It never tells you what to trade; it tells you what not to
 believe._
 
-[![Version](https://img.shields.io/badge/version-0.6.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.7.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -76,7 +76,12 @@ A single corrected statistic doesn't catch all the ways a backtest lies. Penrose
 
 ## How it works
 
-<img src="docs/assets/system-diagram.svg" width="100%" alt="How a claim moves through Penrose: ingestion and grounded extraction, screening, routing to a trusted module or a sandboxed reconstruction, the robustness and power gates, a power-aware verdict, and the corpus of invalidations that feeds back as a prior on new claims."/>
+<img src="docs/assets/system-diagram.svg" width="100%" alt="How a claim moves through Penrose: ingestion and grounded extraction, screening, routing to one of several claim-type executors (a sandboxed strategy reconstruction, or a trusted deterministic executor for regression / factor-spanning / cross-sectional-sort / event-study / forecast-skill claims), the shared robustness and power gates, a power-aware verdict, and the corpus of invalidations that feeds back as a prior on new claims."/>
+
+<sub><i>The diagram shows the original strategy-backtest path. As of 0.7.0, six claim-type executors —
+predictive regression, factor spanning, cross-sectional sort, event study, forecast skill, and the
+event-market adapter — route through the same robustness gates and verdict stack; an updated diagram is
+tracked for 0.7.1.</i></sub>
 
 ```
 claim -> sandboxed reconstruction -> robustness stack -> power-aware verdict -> corpus
@@ -101,14 +106,20 @@ The **brain** accumulates verdicts and finds structure across them — shared fa
 links, distilled **principles**. Hard rule: these connections **inform, they never gate.** Every new claim
 is tested independently on its own data.
 
-## Data: three contracts, bring your own
+## Data: four contracts, bring your own
 
-Penrose reads data through three contracts — `Series` (daily time series), `Panel` (dates × entities, for
-cross-sectional claims), and `EventMarketPanel` (per-event bracket markets, for prediction-market claims).
+Penrose reads data through four contracts — `Series` (daily time series), `Panel` (dates × entities, for
+cross-sectional claims), `EventCalendar` (event timestamps, for event-study claims), and
+`EventMarketPanel` (per-event bracket markets, for prediction-market claims).
 Any source plugs in behind them via a small **adapter**. Keyless crypto and equity venues ship by default;
 add your own with the [adapter guide](docs/ADAPTERS.md), or point `PENROSE_DATA_DIR` at your own catalog
 using the documented [bring-your-own-data contract](docs/DATA_CONTRACT.md) and its runnable reference
 loader (`examples/reference_loader/`).
+
+Whatever data you feed it, Penrose holds it to a bar — the
+[**Data Acquisition Standard**](docs/DATA_ACQUISITION_STANDARD.md) sets what's trustworthy enough to referee
+on (no silent proxies, point-in-time correctness, survivorship handling, per-series fingerprints), because a
+verdict is only as good as its weakest input series.
 
 ## Quickstart
 

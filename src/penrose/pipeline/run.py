@@ -45,8 +45,10 @@ from . import stages, p7_backtest
 # here — a fresh clone has no claims.py. extract.fallback_claims loads it lazily when present.
 from . import (
     p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox,
-    fidelity_memory, provided_series, event_market, robustness,
+    fidelity_memory, provided_series, event_market, predictive_regression, factor_spanning,
+    cross_sectional_sort, event_study, forecast_skill, robustness,
 )
+from .human_review import human_review_explanation
 
 MAX_CLAIM_WORKERS = worker_control.MAX_REQUESTED_WORKERS
 _JSONL_DEFER = threading.local()
@@ -538,6 +540,16 @@ def _family(claim, module, source=None, spec: dict | None = None) -> str:
         and _is_preregistered_single_cohort(claim, source)
     ):
         return f"provided_series_statistic::{getattr(claim, 'claim_id', 'unknown')}"
+    if _authoritative_claim_type(claim, spec, source) == "predictive_regression":
+        return f"predictive_regression::{_data_domain(claim)}"
+    if _authoritative_claim_type(claim, spec, source) == "factor_spanning":
+        return f"factor_spanning::{_data_domain(claim)}"
+    if _authoritative_claim_type(claim, spec, source) == "cross_sectional_sort":
+        return f"cross_sectional_sort::{_data_domain(claim)}"
+    if _authoritative_claim_type(claim, spec, source) == "event_study":
+        return f"event_study::{_data_domain(claim)}"
+    if _authoritative_claim_type(claim, spec, source) == "forecast_skill":
+        return f"forecast_skill::{_data_domain(claim)}"
     if source_is_unanchored(getattr(claim, "source_type", "external_source")):
         return f"generated::{_data_domain(claim)}"
     cls = (getattr(claim, "applicable_strategy_class", "") or
@@ -564,6 +576,16 @@ def _structured_strategy_family(claim, source=None, spec: dict | None = None) ->
 def _generation_source_for(claim: Claim, spec: dict | None = None, source=None) -> str:
     if _authoritative_claim_type(claim, spec, source) == "provided_series_statistic":
         return "provided_series_statistic"
+    if _authoritative_claim_type(claim, spec, source) == "predictive_regression":
+        return "predictive_regression"
+    if _authoritative_claim_type(claim, spec, source) == "factor_spanning":
+        return "factor_spanning"
+    if _authoritative_claim_type(claim, spec, source) == "cross_sectional_sort":
+        return "cross_sectional_sort"
+    if _authoritative_claim_type(claim, spec, source) == "event_study":
+        return "event_study"
+    if _authoritative_claim_type(claim, spec, source) == "forecast_skill":
+        return "forecast_skill"
     if claim.source_type == "confirmation":
         return "confirmation"
     if source_is_unanchored(claim.source_type):
@@ -648,7 +670,8 @@ def _cleanup_run_cohorts(ready_for_backtest: list[dict]) -> None:
         str(getattr(item["claim"], "search_cohort_id", "") or "")
         for item in ready_for_backtest
         if _generation_source_for(item["claim"], item.get("spec")) in {
-            "paper", "provided_series_statistic"
+            "paper", "provided_series_statistic", "predictive_regression",
+            "factor_spanning", "cross_sectional_sort", "event_study", "forecast_skill",
         }
     }
     try:
@@ -913,6 +936,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                         pre_fid = {}
                         prior_divergences: list[str] | None = None
                         missing_inputs: list[str] = []
+                        binding_review: dict | None = None
                         max_spec_attempts = (
                             SPEC_SELF_CORRECTION_MAX_ATTEMPTS
                             if use_llm and getattr(config, "FIDELITY_CHECK", False)
@@ -925,6 +949,38 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             _record_spec_inputs(rec, spec)
                             _authoritative_claim_type(claim, spec, source)
                             local_specs.append(spec)
+                            binding_review = (
+                                _predictive_regression_binding_review(claim, spec)
+                                or _factor_spanning_binding_review(claim, spec)
+                                or _cross_sectional_sort_binding_review(claim, spec)
+                                or _event_study_binding_review(claim, spec)
+                                or _forecast_skill_binding_review(claim, spec)
+                            )
+                            if binding_review:
+                                explanation = binding_review.get("explanation") or {}
+                                rec["stages"]["P6"] = {
+                                    "module_id": None,
+                                    "spec_generated": True,
+                                    "auto_implemented": False,
+                                    "spec_path": str(spec.get("_path", "")),
+                                    "binding_uncertainty": binding_review.get("reason"),
+                                    "human_review": explanation,
+                                    "note": f"{binding_review.get('kind')} -> needs_review",
+                                }
+                                local_decisions.append(_needs_review(
+                                    claim,
+                                    binding_review.get("reason"),
+                                    rec,
+                                    local_run_log,
+                                    metrics={
+                                        "claim_type": spec.get("claim_type"),
+                                        "binding_uncertainty": binding_review.get("reason"),
+                                        "binding_detail": binding_review.get("detail", {}),
+                                        "spec_path": str(spec.get("_path", "")),
+                                    },
+                                    review=explanation,
+                                ))
+                                break
                             try:
                                 missing_inputs = _missing_spec_inputs_from_bundle(spec, local_bundle)
                             except Exception:  # noqa: BLE001
@@ -965,6 +1021,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             prior_divergences = list(pre_fid.get("divergences") or [])
                             if not prior_divergences and pre_fid.get("note"):
                                 prior_divergences = [str(pre_fid.get("note"))]
+                        if binding_review:
+                            continue
                         if missing_inputs:
                             continue
                         if _fidelity_confidently_unfaithful(pre_fid):
@@ -980,6 +1038,31 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             impl = {"ok": True, "module": module, "module_id": module.__module_id__,
                                     "validation": {"deterministic": "event_market_strategy"},
                                     "deterministic_event_market": True}
+                        elif claim_type == "predictive_regression":
+                            module = predictive_regression.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "predictive_regression"},
+                                    "deterministic_regression": True}
+                        elif claim_type == "factor_spanning":
+                            module = factor_spanning.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "factor_spanning"},
+                                    "deterministic_factor_spanning": True}
+                        elif claim_type == "cross_sectional_sort":
+                            module = cross_sectional_sort.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "cross_sectional_sort"},
+                                    "deterministic_cross_sectional_sort": True}
+                        elif claim_type == "event_study":
+                            module = event_study.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "event_study"},
+                                    "deterministic_event_study": True}
+                        elif claim_type == "forecast_skill":
+                            module = forecast_skill.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "forecast_skill"},
+                                    "deterministic_forecast_skill": True}
                         elif not config.AUTO_IMPLEMENT_MODULES:
                             impl = {"ok": False, "reason": "auto-impl disabled"}
                         elif not (sandbox.docker_available() and sandbox.ensure_image()):
@@ -992,6 +1075,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             deterministic_module = (
                                 impl.get("deterministic_provided_series")
                                 or impl.get("deterministic_event_market")
+                                or impl.get("deterministic_regression")
+                                or impl.get("deterministic_factor_spanning")
+                                or impl.get("deterministic_cross_sectional_sort")
+                                or impl.get("deterministic_event_study")
+                                or impl.get("deterministic_forecast_skill")
                             )
                             if not deterministic_module:
                                 with _REGISTRY_LOCK:
@@ -1004,9 +1092,29 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                     impl.get("deterministic_provided_series")),
                                 "deterministic_event_market": bool(
                                     impl.get("deterministic_event_market")),
+                                "deterministic_regression": bool(
+                                    impl.get("deterministic_regression")),
+                                "deterministic_factor_spanning": bool(
+                                    impl.get("deterministic_factor_spanning")),
+                                "deterministic_cross_sectional_sort": bool(
+                                    impl.get("deterministic_cross_sectional_sort")),
+                                "deterministic_event_study": bool(
+                                    impl.get("deterministic_event_study")),
+                                "deterministic_forecast_skill": bool(
+                                    impl.get("deterministic_forecast_skill")),
                                 "spec_path": str(spec.get("_path", "")),
                                 "validation": impl.get("validation", {}),
                                 "note": (
+                                    "deterministic predictive-regression executor; backtesting"
+                                    if impl.get("deterministic_regression") else
+                                    "deterministic factor-spanning executor; backtesting"
+                                    if impl.get("deterministic_factor_spanning") else
+                                    "deterministic cross-sectional-sort executor; backtesting"
+                                    if impl.get("deterministic_cross_sectional_sort") else
+                                    "deterministic event-study executor; backtesting"
+                                    if impl.get("deterministic_event_study") else
+                                    "deterministic forecast-skill executor; backtesting"
+                                    if impl.get("deterministic_forecast_skill") else
                                     "deterministic event-market executor; backtesting"
                                     if impl.get("deterministic_event_market") else
                                     "deterministic provided-series executor; backtesting"
@@ -1015,17 +1123,27 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                 )}
                         elif impl.get("needs_review"):
                             audit = impl.get("no_progress") or {}
+                            explanation = human_review_explanation(
+                                "auto_impl_no_progress",
+                                {
+                                    "reason": impl.get("reason"),
+                                    "attempts": audit.get("attempts_tried")
+                                    or audit.get("consecutive_attempts"),
+                                },
+                            )
                             rec["stages"]["P6"] = {
                                 "module_id": None, "spec_generated": True,
                                 "auto_implemented": False,
                                 "auto_impl_reason": str(impl.get("reason", ""))[:240],
                                 "auto_impl_no_progress": audit,
+                                "human_review": explanation,
                                 "spec_path": str(spec.get("_path", "")),
                                 "note": "ModuleSpec generated; auto-impl no-progress guard -> needs_review"}
                             rec["stages"]["P6_auto_impl_no_progress"] = audit
                             local_decisions.append(_needs_review(
                                 claim, impl.get("reason"), rec, local_run_log,
-                                metrics={"auto_impl_no_progress": audit}))
+                                metrics={"auto_impl_no_progress": audit},
+                                review=explanation))
                             continue
                         else:
                             rec["stages"]["P6"] = {
@@ -1153,6 +1271,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             pre_fid = {}
             prior_divergences: list[str] | None = None
             missing_inputs: list[str] = []
+            binding_review: dict | None = None
             max_spec_attempts = (
                 SPEC_SELF_CORRECTION_MAX_ATTEMPTS
                 if use_llm and getattr(config, "FIDELITY_CHECK", False)
@@ -1165,6 +1284,38 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 _record_spec_inputs(rec, spec)
                 _authoritative_claim_type(claim, spec, source)
                 specs_generated.append(spec)
+                binding_review = (
+                    _predictive_regression_binding_review(claim, spec)
+                    or _factor_spanning_binding_review(claim, spec)
+                    or _cross_sectional_sort_binding_review(claim, spec)
+                    or _event_study_binding_review(claim, spec)
+                    or _forecast_skill_binding_review(claim, spec)
+                )
+                if binding_review:
+                    explanation = binding_review.get("explanation") or {}
+                    rec["stages"]["P6"] = {
+                        "module_id": None,
+                        "spec_generated": True,
+                        "auto_implemented": False,
+                        "spec_path": str(spec.get("_path", "")),
+                        "binding_uncertainty": binding_review.get("reason"),
+                        "human_review": explanation,
+                        "note": f"{binding_review.get('kind')} -> needs_review",
+                    }
+                    decisions.append(_needs_review(
+                        claim,
+                        binding_review.get("reason"),
+                        rec,
+                        run_log,
+                        metrics={
+                            "claim_type": spec.get("claim_type"),
+                            "binding_uncertainty": binding_review.get("reason"),
+                            "binding_detail": binding_review.get("detail", {}),
+                            "spec_path": str(spec.get("_path", "")),
+                        },
+                        review=explanation,
+                    ))
+                    break
                 try:
                     missing_inputs = _missing_spec_inputs_from_bundle(spec, bundle)
                 except Exception:  # noqa: BLE001 — pre-fidelity availability check must fail open
@@ -1202,6 +1353,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 prior_divergences = list(pre_fid.get("divergences") or [])
                 if not prior_divergences and pre_fid.get("note"):
                     prior_divergences = [str(pre_fid.get("note"))]
+            if binding_review:
+                continue
             if missing_inputs:
                 continue
             if _fidelity_confidently_unfaithful(pre_fid):
@@ -1217,6 +1370,31 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 impl = {"ok": True, "module": module, "module_id": module.__module_id__,
                         "validation": {"deterministic": "event_market_strategy"},
                         "deterministic_event_market": True}
+            elif claim_type == "predictive_regression":
+                module = predictive_regression.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "predictive_regression"},
+                        "deterministic_regression": True}
+            elif claim_type == "factor_spanning":
+                module = factor_spanning.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "factor_spanning"},
+                        "deterministic_factor_spanning": True}
+            elif claim_type == "cross_sectional_sort":
+                module = cross_sectional_sort.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "cross_sectional_sort"},
+                        "deterministic_cross_sectional_sort": True}
+            elif claim_type == "event_study":
+                module = event_study.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "event_study"},
+                        "deterministic_event_study": True}
+            elif claim_type == "forecast_skill":
+                module = forecast_skill.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "forecast_skill"},
+                        "deterministic_forecast_skill": True}
             # Auto-implementation REQUIRES the Docker sandbox — model-written code never execs unsandboxed.
             # No Docker -> no auto-implement (the claim stays pending_module for the operator).
             elif not config.AUTO_IMPLEMENT_MODULES:
@@ -1230,6 +1408,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 deterministic_module = (
                     impl.get("deterministic_provided_series")
                     or impl.get("deterministic_event_market")
+                    or impl.get("deterministic_regression")
+                    or impl.get("deterministic_factor_spanning")
+                    or impl.get("deterministic_cross_sectional_sort")
+                    or impl.get("deterministic_event_study")
+                    or impl.get("deterministic_forecast_skill")
                 )
                 if not deterministic_module:
                     _register_known_modules()      # discover the just-written, validated module
@@ -1240,9 +1423,29 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                            impl.get("deterministic_provided_series")),
                                        "deterministic_event_market": bool(
                                            impl.get("deterministic_event_market")),
+                                       "deterministic_regression": bool(
+                                           impl.get("deterministic_regression")),
+                                       "deterministic_factor_spanning": bool(
+                                           impl.get("deterministic_factor_spanning")),
+                                       "deterministic_cross_sectional_sort": bool(
+                                           impl.get("deterministic_cross_sectional_sort")),
+                                       "deterministic_event_study": bool(
+                                           impl.get("deterministic_event_study")),
+                                       "deterministic_forecast_skill": bool(
+                                           impl.get("deterministic_forecast_skill")),
                                        "spec_path": str(spec.get("_path", "")),
                                        "validation": impl.get("validation", {}),
                                        "note": (
+                                           "deterministic predictive-regression executor; backtesting"
+                                           if impl.get("deterministic_regression") else
+                                           "deterministic factor-spanning executor; backtesting"
+                                           if impl.get("deterministic_factor_spanning") else
+                                           "deterministic cross-sectional-sort executor; backtesting"
+                                           if impl.get("deterministic_cross_sectional_sort") else
+                                           "deterministic event-study executor; backtesting"
+                                           if impl.get("deterministic_event_study") else
+                                           "deterministic forecast-skill executor; backtesting"
+                                           if impl.get("deterministic_forecast_skill") else
                                            "deterministic event-market executor; backtesting"
                                            if impl.get("deterministic_event_market") else
                                            "deterministic provided-series executor; backtesting"
@@ -1252,16 +1455,26 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 # fall through to P7 with the freshly-built module
             elif impl.get("needs_review"):
                 audit = impl.get("no_progress") or {}
+                explanation = human_review_explanation(
+                    "auto_impl_no_progress",
+                    {
+                        "reason": impl.get("reason"),
+                        "attempts": audit.get("attempts_tried")
+                        or audit.get("consecutive_attempts"),
+                    },
+                )
                 rec["stages"]["P6"] = {"module_id": None, "spec_generated": True,
                                        "auto_implemented": False,
                                        "auto_impl_reason": str(impl.get("reason", ""))[:240],
                                        "auto_impl_no_progress": audit,
+                                       "human_review": explanation,
                                        "spec_path": str(spec.get("_path", "")),
                                        "note": "ModuleSpec generated; auto-impl no-progress guard -> needs_review"}
                 rec["stages"]["P6_auto_impl_no_progress"] = audit
                 decisions.append(_needs_review(
                     claim, impl.get("reason"), rec, run_log,
-                    metrics={"auto_impl_no_progress": audit}))
+                    metrics={"auto_impl_no_progress": audit},
+                    review=explanation))
                 continue
             else:
                 rec["stages"]["P6"] = {"module_id": None, "spec_generated": True,
@@ -1323,6 +1536,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     if not isinstance(mres, dict) or not mres.get("ok"):
                         mres = mres if isinstance(mres, dict) else {
                             "ok": False, "reason": "module returned non-dict"}
+                        if mres.get("needs_review"):
+                            local_decisions.append(_needs_review(
+                                claim, mres.get("reason") or "module requested review",
+                                rec, local_run_log))
+                            continue
                         if not _is_data_unavailable_reason(mres.get("reason")):
                             local_decisions.append(_engine_error(
                                 claim, "module run",
@@ -1587,6 +1805,10 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             mres = _run_module_once(module, bundle, claim, cost_frac, is_auto)
             if not isinstance(mres, dict) or not mres.get("ok"):
                 mres = mres if isinstance(mres, dict) else {"ok": False, "reason": "module returned non-dict"}
+                if mres.get("needs_review"):
+                    decisions.append(_needs_review(
+                        claim, mres.get("reason") or "module requested review", rec, run_log))
+                    continue
                 if not _is_data_unavailable_reason(mres.get("reason")):
                     decisions.append(_engine_error(
                         claim, "module run", RuntimeError(str(mres.get("reason") or "module returned not-ok")),
@@ -1927,6 +2149,412 @@ def _record_spec_inputs(rec: dict, spec: dict | None) -> None:
         pass
 
 
+def _series_ref_name(value) -> str:
+    try:
+        return fidelity._series_ref_name(value)
+    except Exception:  # noqa: BLE001
+        if isinstance(value, dict):
+            return str(value.get("series") or value.get("base_series") or "").strip()
+        return str(value or "").strip()
+
+
+def _predictive_regression_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when a deterministic regression binding is uncertain."""
+    if not isinstance(spec, dict) or spec.get("claim_type") != "predictive_regression":
+        return None
+    try:
+        inputs = spec.get("inputs") or []
+        predictor = spec.get("predictor") or (inputs[0] if inputs else "")
+        target = spec.get("target") or (inputs[1] if len(inputs) > 1 else "")
+        provenance = spec.get("binding_provenance") or {}
+        predictor_prov = provenance.get("predictor") if isinstance(provenance, dict) else {}
+        target_prov = provenance.get("target") if isinstance(provenance, dict) else {}
+        predictor_prov = predictor_prov if isinstance(predictor_prov, dict) else {}
+        target_prov = target_prov if isinstance(target_prov, dict) else {}
+        unknowns = " ".join(str(u or "").lower() for u in (spec.get("unknowns") or []))
+        unresolved = (
+            not _series_ref_name(predictor)
+            or not _series_ref_name(target)
+            or str(predictor_prov.get("kind") or "").lower() == "unresolved"
+            or str(target_prov.get("kind") or "").lower() == "unresolved"
+            or "unresolved binding" in unknowns
+            or "not both resolved" in unknowns
+        )
+        detail = {
+            "reason": "unresolved binding" if unresolved else "unconfirmed binding",
+            "predictor": predictor,
+            "target": target,
+            "binding_provenance": provenance,
+            "confirmed": {"predictor": False, "target": False},
+        }
+        if unresolved:
+            try:
+                detail["confirmed"] = {
+                    "predictor": bool(
+                        predictor_prov
+                        and str(predictor_prov.get("kind") or "").lower() != "unresolved"
+                        and fidelity._binding_matches_spec_value(predictor_prov, predictor)
+                        and fidelity._binding_score_ok(predictor_prov)
+                    ),
+                    "target": bool(
+                        target_prov
+                        and str(target_prov.get("kind") or "").lower() != "unresolved"
+                        and fidelity._binding_matches_spec_value(target_prov, target)
+                        and fidelity._binding_score_ok(target_prov)
+                    ),
+                }
+            except Exception:  # noqa: BLE001
+                pass
+            return {
+                "kind": "predictive_regression_binding_uncertain",
+                "reason": "predictive_regression_binding_unresolved",
+                "detail": detail,
+                "explanation": human_review_explanation(
+                    "predictive_regression_binding_uncertain", detail),
+            }
+        if provenance:
+            text = fidelity._regression_claim_text(claim, spec)
+            predictor_confirmed = bool(
+                predictor_prov
+                and fidelity._binding_matches_spec_value(predictor_prov, predictor)
+                and fidelity._binding_score_ok(predictor_prov)
+            )
+            target_confirmed = bool(
+                target_prov
+                and fidelity._binding_matches_spec_value(target_prov, target)
+                and fidelity._binding_score_ok(target_prov)
+            )
+            detail["confirmed"] = {
+                "predictor": predictor_confirmed,
+                "target": target_confirmed,
+            }
+            if not (
+                predictor_confirmed
+                and target_confirmed
+                and fidelity._ordered_binding_provenance_verified(text, predictor_prov, target_prov)
+            ):
+                return {
+                    "kind": "predictive_regression_binding_uncertain",
+                    "reason": "predictive_regression_binding_unconfirmed",
+                    "detail": detail,
+                    "explanation": human_review_explanation(
+                        "predictive_regression_binding_uncertain", detail),
+                }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "predictive_regression_binding_uncertain",
+            "reason": "predictive_regression_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation(
+                "predictive_regression_binding_uncertain", detail),
+        }
+    return None
+
+
+def _factor_spanning_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when a deterministic spanning binding is uncertain."""
+    if not isinstance(spec, dict) or spec.get("claim_type") != "factor_spanning":
+        return None
+    try:
+        inputs = spec.get("inputs") or []
+        candidate = spec.get("candidate_factor") or (inputs[0] if inputs else "")
+        benchmarks = spec.get("benchmark_factors") or inputs[1:]
+        if isinstance(benchmarks, str):
+            benchmarks = [benchmarks]
+        provenance = spec.get("binding_provenance") or {}
+        candidate_prov = provenance.get("candidate_factor") if isinstance(provenance, dict) else {}
+        candidate_prov = candidate_prov if isinstance(candidate_prov, dict) else {}
+        benchmark_set_prov = provenance.get("benchmark_set") if isinstance(provenance, dict) else {}
+        benchmark_set_prov = benchmark_set_prov if isinstance(benchmark_set_prov, dict) else {}
+        unknowns = " ".join(str(u or "").lower() for u in (spec.get("unknowns") or []))
+        candidate_confirmed = bool(
+            candidate_prov
+            and str(candidate_prov.get("kind") or "").lower() != "unresolved"
+            and fidelity._binding_matches_spec_value(candidate_prov, candidate)
+            and fidelity._binding_score_ok(candidate_prov)
+        )
+        benchmark_confirmed = bool(
+            str(spec.get("benchmark_set") or "").lower() in {"capm", "ff3", "ff5", "carhart"}
+            and benchmarks
+            and all(_series_ref_name(b) for b in benchmarks)
+            and (
+                not benchmark_set_prov
+                or bool(benchmark_set_prov.get("confirmed", True))
+            )
+        )
+        unresolved = (
+            not _series_ref_name(candidate)
+            or not benchmarks
+            or str(candidate_prov.get("kind") or "").lower() == "unresolved"
+            or "candidate factor series was not resolved" in unknowns
+            or "unresolved binding" in unknowns
+        )
+        detail = {
+            "reason": "unresolved binding" if unresolved else "unconfirmed binding",
+            "candidate_factor": candidate,
+            "benchmark_set": spec.get("benchmark_set"),
+            "benchmark_factors": benchmarks,
+            "binding_provenance": provenance,
+            "confirmed": {
+                "candidate_factor": candidate_confirmed,
+                "benchmark_set": benchmark_confirmed,
+            },
+        }
+        if unresolved or not (candidate_confirmed and benchmark_confirmed):
+            return {
+                "kind": "factor_spanning_binding_uncertain",
+                "reason": (
+                    "factor_spanning_binding_unresolved"
+                    if unresolved else
+                    "factor_spanning_binding_unconfirmed"
+                ),
+                "detail": detail,
+                "explanation": human_review_explanation(
+                    "factor_spanning_binding_uncertain", detail),
+            }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "factor_spanning_binding_uncertain",
+            "reason": "factor_spanning_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation(
+                "factor_spanning_binding_uncertain", detail),
+        }
+    return None
+
+
+def _panel_declared(value) -> bool:
+    if isinstance(value, dict):
+        raw = value.get("path") or value.get("table") or value.get("table_path") or value.get("panel_path")
+    else:
+        raw = value
+    text = str(raw or "").strip()
+    return bool(text and text not in {"returns_panel", "characteristic_panel"})
+
+
+def _cross_sectional_sort_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when a deterministic sort binding is uncertain."""
+    if not isinstance(spec, dict) or spec.get("claim_type") != "cross_sectional_sort":
+        return None
+    try:
+        panel_inputs = spec.get("panel_inputs") or {}
+        provenance = spec.get("binding_provenance") or {}
+        characteristic = str(spec.get("characteristic") or "").strip()
+        unknowns = " ".join(str(x).lower() for x in (spec.get("unknowns") or []))
+        char_prov = provenance.get("characteristic") if isinstance(provenance, dict) else {}
+        char_prov = char_prov if isinstance(char_prov, dict) else {}
+        characteristic_confirmed = (
+            bool(characteristic)
+            and str(char_prov.get("kind") or "").lower() != "unresolved"
+            and bool(char_prov.get("confirmed", True))
+            and "characteristic was not resolved" not in unknowns
+        )
+        returns_declared = _panel_declared(panel_inputs.get("returns"))
+        characteristic_declared = _panel_declared(panel_inputs.get("characteristic"))
+        if characteristic_confirmed and returns_declared and characteristic_declared:
+            return None
+        detail = {
+            "reason": "unresolved binding" if not characteristic_confirmed else "unconfirmed panel binding",
+            "characteristic": characteristic,
+            "panel_inputs": panel_inputs,
+            "binding_provenance": provenance,
+            "confirmed": {
+                "characteristic": characteristic_confirmed,
+                "returns_panel": returns_declared,
+                "characteristic_panel": characteristic_declared,
+            },
+        }
+        reason = (
+            "cross_sectional_sort_binding_unresolved"
+            if not characteristic_confirmed else
+            "cross_sectional_sort_binding_unconfirmed"
+        )
+        return {
+            "kind": "cross_sectional_sort_binding_uncertain",
+            "reason": reason,
+            "detail": detail,
+            "explanation": human_review_explanation(
+                "cross_sectional_sort_binding_uncertain", detail),
+        }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "cross_sectional_sort_binding_uncertain",
+            "reason": "cross_sectional_sort_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation(
+                "cross_sectional_sort_binding_uncertain", detail),
+        }
+
+
+def _event_study_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when deterministic event-study bindings are uncertain."""
+    if not isinstance(spec, dict) or spec.get("claim_type") != "event_study":
+        return None
+    try:
+        inputs = spec.get("inputs") or []
+        return_series = spec.get("return_series") or (inputs[0] if inputs else "")
+        baseline = str(spec.get("baseline") or "mean_adjusted").strip().lower()
+        market_series = spec.get("market_series") or ""
+        provenance = spec.get("binding_provenance") or {}
+        ret_prov = provenance.get("return_series") if isinstance(provenance, dict) else {}
+        ret_prov = ret_prov if isinstance(ret_prov, dict) else {}
+        unknowns = " ".join(str(x).lower() for x in (spec.get("unknowns") or []))
+        window = spec.get("window")
+        try:
+            window_ok = (
+                isinstance(window, (list, tuple))
+                and len(window) >= 2
+                and int(window[0]) <= int(window[1])
+            )
+        except (TypeError, ValueError):
+            window_ok = False
+        return_confirmed = bool(
+            _series_ref_name(return_series)
+            and str(ret_prov.get("kind") or "").lower() != "unresolved"
+            and "return series was not resolved" not in unknowns
+        )
+        baseline_ok = baseline in {"mean_adjusted", "market_model"}
+        market_ok = baseline != "market_model" or bool(_series_ref_name(market_series))
+        if return_confirmed and window_ok and baseline_ok and market_ok:
+            return None
+        detail = {
+            "reason": "unresolved binding",
+            "return_series": return_series,
+            "event_calendar": spec.get("event_calendar"),
+            "window": window,
+            "baseline": baseline,
+            "market_series": market_series,
+            "binding_provenance": provenance,
+            "confirmed": {
+                "return_series": return_confirmed,
+                "window": window_ok,
+                "baseline": baseline_ok,
+                "market_series": market_ok,
+            },
+        }
+        return {
+            "kind": "event_study_binding_uncertain",
+            "reason": "event_study_binding_unresolved",
+            "detail": detail,
+            "explanation": human_review_explanation("event_study_binding_uncertain", detail),
+        }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "event_study_binding_uncertain",
+            "reason": "event_study_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation("event_study_binding_uncertain", detail),
+        }
+
+
+def _forecast_benchmark_method(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("method") or value.get("family") or value.get("benchmark") or value.get("kind")
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"random_walk", "rw", "naive", "persistence", "last_value"}:
+        return "random_walk"
+    if text in {"historical_mean", "expanding_mean", "mean", "expanding_historical_mean"}:
+        return "historical_mean"
+    return ""
+
+
+def _forecast_skill_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when deterministic forecast-skill bindings are uncertain."""
+    if not isinstance(spec, dict) or spec.get("claim_type") != "forecast_skill":
+        return None
+    try:
+        inputs = spec.get("inputs") or []
+        model = spec.get("model_forecast") or (inputs[0] if inputs else "")
+        target = spec.get("target") or (inputs[1] if len(inputs) > 1 else "")
+        benchmark = spec.get("benchmark") or spec.get("benchmark_forecast") or spec.get("benchmark_series") or ""
+        benchmark_series = _series_ref_name(benchmark)
+        benchmark_method = _forecast_benchmark_method(benchmark)
+        provenance = spec.get("binding_provenance") or {}
+        model_prov = provenance.get("model_forecast") if isinstance(provenance, dict) else {}
+        target_prov = provenance.get("target") if isinstance(provenance, dict) else {}
+        benchmark_prov = provenance.get("benchmark") if isinstance(provenance, dict) else {}
+        model_prov = model_prov if isinstance(model_prov, dict) else {}
+        target_prov = target_prov if isinstance(target_prov, dict) else {}
+        benchmark_prov = benchmark_prov if isinstance(benchmark_prov, dict) else {}
+        unknowns = " ".join(str(x).lower() for x in (spec.get("unknowns") or []))
+        model_confirmed = bool(
+            _series_ref_name(model)
+            and str(model_prov.get("kind") or "").lower() != "unresolved"
+            and (
+                not model_prov
+                or (
+                    fidelity._binding_matches_spec_value(model_prov, model)
+                    and fidelity._binding_score_ok(model_prov)
+                )
+            )
+        )
+        target_confirmed = bool(
+            _series_ref_name(target)
+            and str(target_prov.get("kind") or "").lower() != "unresolved"
+            and (
+                not target_prov
+                or (
+                    fidelity._binding_matches_spec_value(target_prov, target)
+                    and fidelity._binding_score_ok(target_prov)
+                )
+            )
+        )
+        benchmark_confirmed = False
+        if benchmark_series:
+            benchmark_confirmed = bool(
+                benchmark_series not in {_series_ref_name(model), _series_ref_name(target)}
+                and (
+                    not benchmark_prov
+                    or (
+                        str(benchmark_prov.get("kind") or "").lower() != "unresolved"
+                        and fidelity._binding_matches_spec_value(benchmark_prov, benchmark_series)
+                        and fidelity._binding_score_ok(benchmark_prov)
+                    )
+                )
+            )
+        elif benchmark_method:
+            benchmark_confirmed = benchmark_method in {"random_walk", "historical_mean"}
+        unresolved = (
+            not model_confirmed
+            or not target_confirmed
+            or not benchmark_confirmed
+            or "benchmark forecast was not resolved" in unknowns
+            or "model forecast and target series were not both resolved" in unknowns
+        )
+        if not unresolved:
+            return None
+        detail = {
+            "reason": "unresolved binding",
+            "model_forecast": model,
+            "target": target,
+            "benchmark": benchmark,
+            "binding_provenance": provenance,
+            "confirmed": {
+                "model_forecast": model_confirmed,
+                "target": target_confirmed,
+                "benchmark": benchmark_confirmed,
+            },
+        }
+        return {
+            "kind": "forecast_skill_binding_uncertain",
+            "reason": "forecast_skill_binding_unresolved",
+            "detail": detail,
+            "explanation": human_review_explanation("forecast_skill_binding_uncertain", detail),
+        }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "forecast_skill_binding_uncertain",
+            "reason": "forecast_skill_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation("forecast_skill_binding_uncertain", detail),
+        }
+
+
 def _skip(claim, reason, note, rec, run_log):
     """Spec generated, no module yet — awaiting implementation. This is NOT a backtest
     verdict: it is a distinct 'pending_module' state. Logged to the decisions ledger for
@@ -2077,6 +2705,36 @@ def _missing_spec_inputs_from_bundle(spec: dict, bundle) -> list[str] | None:
     try:
         if isinstance(spec, dict) and spec.get("claim_type") == "event_market_strategy":
             return []
+        if isinstance(spec, dict) and spec.get("claim_type") == "cross_sectional_sort":
+            return []
+        if isinstance(spec, dict) and spec.get("claim_type") == "event_study":
+            inputs = []
+            return_name = spec.get("return_series") or ""
+            if return_name:
+                inputs.append(return_name)
+            if str(spec.get("baseline") or "").strip().lower() == "market_model":
+                market_name = spec.get("market_series") or ""
+                if market_name:
+                    inputs.append(market_name)
+            spec = {**spec, "inputs": inputs}
+        if isinstance(spec, dict) and spec.get("claim_type") == "forecast_skill":
+            inputs = []
+            model_name = spec.get("model_forecast") or ""
+            target_name = spec.get("target") or ""
+            if model_name:
+                inputs.append(model_name)
+            if target_name:
+                inputs.append(target_name)
+            benchmark = (
+                spec.get("benchmark")
+                or spec.get("benchmark_forecast")
+                or spec.get("benchmark_series")
+                or ""
+            )
+            benchmark_name = _series_ref_name(benchmark)
+            if benchmark_name:
+                inputs.append(benchmark_name)
+            spec = {**spec, "inputs": inputs}
         inputs = spec.get("inputs", []) if isinstance(spec, dict) else []
         if inputs is None:
             return []
@@ -2091,7 +2749,18 @@ def _missing_spec_inputs_from_bundle(spec: dict, bundle) -> list[str] | None:
         missing: list[str] = []
         seen: set[str] = set()
         for raw in inputs:
-            name = str(raw or "").strip()
+            if isinstance(raw, dict) and raw.get("kind") == "derived_series":
+                name = str(raw.get("base_series") or "").strip()
+            elif isinstance(raw, dict):
+                name = str(
+                    raw.get("series")
+                    or raw.get("id")
+                    or raw.get("name")
+                    or raw.get("key")
+                    or ""
+                ).strip()
+            else:
+                name = str(raw or "").strip()
             if not name or name in seen:
                 continue
             seen.add(name)
@@ -2351,7 +3020,7 @@ def _needs_data(claim, reason, rec, run_log, auto_fetch_attempted=None):
     return dec
 
 
-def _needs_review(claim, reason, rec, run_log, metrics=None):
+def _needs_review(claim, reason, rec, run_log, metrics=None, review=None):
     """Soft-stop for implementation-fidelity defects that need a human/agent fix.
 
     This is not a falsification verdict. It means the implementation cannot be trusted to
@@ -2359,11 +3028,23 @@ def _needs_review(claim, reason, rec, run_log, metrics=None):
     """
     from ..brain import Decision
     note = str(reason or "implementation needs review")[:300]
+    if review is None:
+        review = human_review_explanation("generic", {"reason": note})
+    review = {
+        "what": str((review or {}).get("what") or "Routed to human review.")[:500],
+        "why": str((review or {}).get("why") or note)[:1000],
+        "action": str((review or {}).get("action") or "Inspect the review item, correct the blocker, then re-run.")[:500],
+    }
     dec = Decision(decision_id=f"{claim.claim_id}-review", claim_id=claim.claim_id,
                    verdict="needs_review", kill_reason=None,
-                   rationale=f"needs_review: {note}; claim untested until implementation is fixed.",
-                   metrics=metrics or {}, revisit_at="2026-07-01")
-    rec["stages"]["P8"] = {"verdict": "needs_review", "reason": note}
+                   rationale=(
+                       f"needs_review: {review['what']} Why: {review['why']} "
+                       f"Action: {review['action']} Existing reason: {note}"
+                   ),
+                   metrics={**(metrics or {}), "human_review": review},
+                   revisit_at="2026-07-01")
+    rec["stages"]["P8"] = {"verdict": "needs_review", "reason": note,
+                           "human_review": review}
     run_log["claims"].append(rec)
     _append_jsonl(config.DECISIONS_LOG,
                   asdict(dec) | _decision_log_metadata(claim, run_log))
@@ -2372,7 +3053,7 @@ def _needs_review(claim, reason, rec, run_log, metrics=None):
                   {"type": "needs_review", "queued_at": _now(), "status": "pending",
                    "proposal_id": dec.decision_id, "name": _short_name(claim),
                    "claim_id": claim.claim_id, "claim_statement": claim.statement,
-                   "rationale": dec.rationale, **asdict(dec)})
+                   "rationale": dec.rationale, "human_review": review, **asdict(dec)})
     return dec
 
 

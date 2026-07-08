@@ -122,6 +122,78 @@ DEFAULT_SERIES: dict[str, dict] = {
         "start": "1990-01-01",
         "unit": "ret",
     },
+    # Ken French benchmark factor families for factor-spanning claims. These are
+    # keyless current/as-displayed research returns, decimal daily returns.
+    "us_equity_ff3_mkt_rf": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_Factors_daily",
+        "column": "Mkt-RF",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff3_smb": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_Factors_daily",
+        "column": "SMB",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff3_hml": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_Factors_daily",
+        "column": "HML",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff3_rf": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_Factors_daily",
+        "column": "RF",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_mkt_rf": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "Mkt-RF",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_smb": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "SMB",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_hml": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "HML",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_rmw": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "RMW",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_cma": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "CMA",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
+    "us_equity_ff5_rf": {
+        "vendor": "kenfrench",
+        "dataset": "F-F_Research_Data_5_Factors_2x3_daily",
+        "column": "RF",
+        "start": "1990-01-01",
+        "unit": "ret",
+    },
     # Local pysystemtrade adjusted futures. Active only when PENROSE_FUTURES_DIR
     # or PYSYS_DIR points at a pysystemtrade-shaped directory; otherwise absent.
     "futures_sp500": {

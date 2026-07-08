@@ -11,11 +11,13 @@ def _net():
 
 
 def test_holdout_lock_is_per_distinct_claim(tmp_path, monkeypatch):
+    from penrose import config
     from penrose.pipeline import p7_backtest as p7
 
     monkeypatch.delenv("PENROSE_HOLDOUT_LOCK", raising=False)
     monkeypatch.delenv("PENROSE_HOLDOUT_MODE", raising=False)
-    monkeypatch.setattr(p7, "HOLDOUT_LOCK", tmp_path / ".holdout_burned")
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "HOLDOUT_DIR", tmp_path / ".holdout")
     net = _net()
 
     first = p7.final_holdout_eval("claim-a", net, 252.0)
@@ -28,20 +30,23 @@ def test_holdout_lock_is_per_distinct_claim(tmp_path, monkeypatch):
     assert third.get("refused") is not True
     assert repeat.get("refused") is True
     assert "claim-a" in repeat["reason"]
-    assert len(list(tmp_path.glob(".holdout_burned.*.lock"))) == 3
+    assert len(list((tmp_path / ".holdout" / "locks").glob("*.lock"))) == 3
+    assert list(tmp_path.glob(".holdout_burned.*.lock")) == []
 
 
 def test_holdout_burn_refusal_does_not_echo_stats(tmp_path, monkeypatch):
+    from penrose import config
     from penrose.pipeline import p7_backtest as p7
 
     monkeypatch.delenv("PENROSE_HOLDOUT_LOCK", raising=False)
     monkeypatch.delenv("PENROSE_HOLDOUT_MODE", raising=False)
-    monkeypatch.setattr(p7, "HOLDOUT_LOCK", tmp_path / ".holdout_burned")
+    monkeypatch.setattr(config, "ROOT", tmp_path)
+    monkeypatch.setattr(config, "HOLDOUT_DIR", tmp_path / ".holdout")
     net = _net()
 
     first = p7.final_holdout_eval("claim-leak-check", net, 252.0)
     second = p7.final_holdout_eval("claim-leak-check", net, 252.0)
-    lock_text = next(tmp_path.glob(".holdout_burned.*.lock")).read_text()
+    lock_text = next((tmp_path / ".holdout" / "locks").glob("*.lock")).read_text()
 
     assert "holdout_sharpe" in first
     assert second.get("refused") is True

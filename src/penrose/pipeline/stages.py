@@ -6,6 +6,7 @@ The expensive P7 backtest only runs if a claim survives P3–P5.
 from __future__ import annotations
 
 import math
+import re
 import sys
 
 import numpy as np
@@ -272,6 +273,23 @@ def p6_routing(claim: Claim, registry: dict) -> dict:
 
 
 # --- P8 verdict + principle proposal ---------------------------------------- #
+def _factor_spanning_candidate_is_strategy(claim) -> bool:
+    """FS-3: is the factor_spanning candidate a self-described TRADEABLE strategy (long-short, rebalanced,
+    executable)? If so the spanning 'not tradeable / costs exempt' justification no longer holds and the
+    verdict must be a qualified (gross-only, net-untested) survivor, never an unqualified one."""
+    text = " ".join([
+        str(getattr(claim, "statement", "") or ""),
+        str(getattr(claim, "mechanism", "") or ""),
+    ]).lower()
+    cues = (
+        r"\bstrateg(?:y|ies)\b", r"\brebalanc", r"\blong[- ]short\b",
+        r"\bgoes?\s+long\b", r"\bshort\s+(?:losers?|the\s+bottom)\b",
+        r"\bportfolio\b.{0,40}\brebalanc", r"\btrading\s+strateg",
+    )
+    return any(re.search(c, text) for c in cues)
+
+
+
 def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decision:
     psr = bt.get("psr", 0.0) or 0.0
     dsr = bt.get("dsr", 0.0) or 0.0
@@ -285,6 +303,15 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
             claim_type = fidelity_memory.classify_claim_type(claim)
         except Exception:  # noqa: BLE001 - verdict caps must fail closed to legacy behavior
             claim_type = "trading_strategy"
+    is_predictive_regression = claim_type == "predictive_regression"
+    is_factor_spanning = claim_type == "factor_spanning"
+    is_cross_sectional_sort = claim_type == "cross_sectional_sort"
+    is_event_study = claim_type == "event_study"
+    is_forecast_skill = claim_type == "forecast_skill"
+    is_non_trading_deterministic = (
+        is_predictive_regression or is_factor_spanning or is_cross_sectional_sort
+        or is_event_study or is_forecast_skill
+    )
 
     # --- POWER: how small an edge could THIS backtest even resolve? ----------------------------
     # MDE (min detectable IC) ~ z/sqrt(n_oos): the smallest per-bar Sharpe (~= IC for a single-asset
@@ -424,7 +451,9 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
 
     trg = getattr(config, "TAIL_RISK_GATE", {"enabled": False})
     tail = bt.get("tail") or {}
-    tail_asymmetric = bool(trg.get("enabled") and tail.get("asymmetric"))
+    tail_asymmetric = bool(
+        trg.get("enabled") and tail.get("asymmetric") and not is_non_trading_deterministic
+    )
     if tail_asymmetric:
         warning = (
             f"tail-asymmetric widow-maker warning: bounded-up/unbounded-down payoff "
@@ -449,7 +478,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
             else:
                 verdict, kill = "kill", "tail_asymmetric"
 
-    if cap is None and verdict in ("watch", "research-supported"):
+    if cap is None and verdict in ("watch", "research-supported") and not is_non_trading_deterministic:
         reasons.append("capacity not estimable")
 
     source_type = getattr(claim, "source_type", "external_source")
@@ -457,7 +486,8 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     fidelity_provenance = "self-authored-unanchored" if unanchored else "external-source"
     # `verdict != "kill"` guards against a cap un-killing a claim the tail gate (cap_only=False)
     # just killed; the message-visibility is preserved via reached_research_supported.
-    if reached_research_supported and verdict != "kill" and getattr(config, "COST_PROVENANCE", "modeled") != "measured":
+    if (reached_research_supported and verdict != "kill" and not is_non_trading_deterministic
+            and getattr(config, "COST_PROVENANCE", "modeled") != "measured"):
         verdict = "watch"
         reasons.append("costs/capacity are MODELED placeholders — capped at watch until measured (E2)")
     if reached_research_supported and verdict != "kill" and unanchored:
@@ -473,6 +503,59 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
         reasons.append(
             "provided-series claim: Penrose tests a pre-computed series it did not construct; "
             "capped at watch/provisional pending primitive reconstruction (EXP-2)")
+    if is_predictive_regression and verdict in ("watch", "research-supported"):
+        reasons.append(
+            "predictive relationship confirmed OOS — NOT a tradeable strategy; costs/capacity "
+            "not modeled")
+    if is_factor_spanning and verdict in ("watch", "research-supported"):
+        if _factor_spanning_candidate_is_strategy(claim):
+            # FS-3 (fable rule): the candidate is a self-described TRADEABLE strategy, so the
+            # "not tradeable / costs exempt" justification collapses — spanning was tested on GROSS
+            # returns and a genuine strategy's alpha may not survive costs. Qualified survivor ONLY:
+            # never unqualified research-supported. Full cost-aware netting of the candidate leg is a
+            # follow-up increment (#67).
+            if verdict == "research-supported":
+                verdict = "watch"
+            reasons.append(
+                "candidate is a self-described tradeable strategy — spanning tested on GROSS returns; "
+                "net-of-cost alpha UNTESTED (a genuine strategy's alpha may not survive costs)")
+        else:
+            reasons.append(
+                "factor alpha confirmed OOS net of the declared benchmark set — NOT a tradeable "
+                "strategy; costs/capacity not modeled")
+    if is_cross_sectional_sort and verdict in ("watch", "research-supported"):
+        if verdict == "research-supported":
+            verdict = "watch"
+        if _factor_spanning_candidate_is_strategy(claim):
+            # CS-2 (mirrors FS-3): the claim frames a tradeable strategy and may assert net-of-cost
+            # performance, but the sort path tests the spread GROSS. Be explicit that the cost claim was
+            # NOT falsified — never let a "profitable after costs" assertion pass silently untested.
+            reasons.append(
+                "claim frames a tradeable sort strategy — the spread was tested GROSS as a paper "
+                "portfolio; net-of-cost performance is UNTESTED (a real strategy's edge may not survive "
+                "costs/borrow); capped at watch")
+        else:
+            reasons.append(
+                "cross-sectional sort spread confirmed OOS as a paper portfolio — costs, capacity, "
+                "borrow, and implementation frictions are not modeled; capped at watch")
+    if is_event_study and verdict in ("watch", "research-supported"):
+        if verdict == "research-supported":
+            verdict = "watch"
+        if _factor_spanning_candidate_is_strategy(claim):
+            reasons.append(
+                "claim frames a tradeable event strategy — CAR was tested GROSS as a paper "
+                "event response; net-of-cost performance is UNTESTED (a real strategy's edge "
+                "may not survive costs); capped at watch")
+        else:
+            reasons.append(
+                "event-study CAR confirmed OOS as a paper event response — NOT a tradeable "
+                "strategy; costs/capacity not modeled; capped at watch")
+    if is_forecast_skill and verdict in ("watch", "research-supported"):
+        if verdict == "research-supported":
+            verdict = "watch"
+        reasons.append(
+            "forecast skill confirmed OOS vs the declared benchmark — a forecasting result, "
+            "not a tradeable strategy; costs/capacity not modeled; capped at watch")
     post_sample_missing = False
     ps = bt.get("post_sample") or {}
     post_cfg = getattr(config, "POST_SAMPLE", {})
@@ -489,7 +572,7 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                 f"{ps.get('data_end')}, claim sample ends {ps.get('sample_end') or 'undeclared'}")
     csg = getattr(config, "COST_SENSITIVITY_GATE", {"enabled": False})
     cs = bt.get("cost_sensitivity") or {}
-    if csg.get("enabled") and verdict in ("watch", "research-supported"):
+    if csg.get("enabled") and verdict in ("watch", "research-supported") and not is_non_trading_deterministic:
         margin = cs.get("margin")
         if margin is not None and margin < csg.get("min_margin", 1.5):
             if verdict == "research-supported":
@@ -500,7 +583,9 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                 reasons.append(f"cost-sensitivity margin {margin}x below {csg.get('min_margin')}x")
     # B-006: make the capacity-CI conditionality visible (it's only over positive-edge resamples)
     cci = bt.get("capacity_ci") or {}
-    if verdict in ("watch", "research-supported") and cci.get("conditional_on_positive_edge"):
+    if (verdict in ("watch", "research-supported")
+            and cci.get("conditional_on_positive_edge")
+            and not is_non_trading_deterministic):
         reasons.append(f"capacity CI conditional on positive edge (p={cci.get('p_positive_edge')})")
 
     # --- POWER-AWARE RECLASSIFICATION ---------------------------------------------------------

@@ -198,6 +198,56 @@ def _template_guidance(spec: dict) -> str:
             "test. Expose a minimal contract-valid result for the engine (as with "
             "descriptive_statistical)."
         )
+    if claim_type == "predictive_regression":
+        return (
+            "PREDICTIVE_REGRESSION: this claim type is normally handled by Penrose's trusted "
+            "deterministic executor, not by generated code. If implementing manually, test the "
+            "declared predictor -> target relationship directly: align X_t with Y_t+h, fit only "
+            "the in-sample sign and z-score moments, emit net=s*zscore_IS(X_t)*zscore_IS(Y_t+h) "
+            "and positions=s*zscore_IS(X_t), and annualize overlapping h-ahead observations as "
+            "observations_per_year / h. Do NOT add entry/exit rules, costs, capacity, or a "
+            "trading overlay."
+        )
+    if claim_type == "factor_spanning":
+        return (
+            "FACTOR_SPANNING: this claim type is normally handled by Penrose's trusted "
+            "deterministic executor, not by generated code. If implementing manually, test "
+            "the declared candidate factor directly against the declared benchmark factors: "
+            "fit multivariate OLS F_t = alpha + beta'B_t on the in-sample prefix only, freeze "
+            "the beta vector, emit net=F_t - beta_IS'B_t and positions as the benchmark-hedged "
+            "factor exposure, and compute bars_per_year from the emitted factor-return cadence. "
+            "Do NOT add entry/exit rules, costs, capacity, unclaimed controls, or a trading overlay."
+        )
+    if claim_type == "cross_sectional_sort":
+        return (
+            "CROSS_SECTIONAL_SORT: this claim type is normally handled by Penrose's trusted "
+            "deterministic executor, not by generated code. If implementing manually, load the "
+            "declared returns and characteristic Panels from spec.panel_inputs, require the "
+            "returns panel to be survivorship-corrected, call data.xsection.form_factor exactly "
+            "with the declared n_buckets/rebalance/hold, synthesize positions from bucket "
+            "membership, and compute bars_per_year from the rebalance cadence. Do NOT add "
+            "entry/exit rules, timing overlays, proxy characteristics, or unclaimed universe filters."
+        )
+    if claim_type == "event_study":
+        return (
+            "EVENT_STUDY: this claim type is normally handled by Penrose's trusted deterministic "
+            "executor, not by generated code. If implementing manually, load the declared return "
+            "Series and event-calendar table, estimate the baseline for each event using only the "
+            "pre-event estimation window ending strictly before the event date, compute abnormal "
+            "returns over the declared event window, emit one CAR observation per event as net, "
+            "positions=1, and bars_per_year=events_per_year. Do NOT add entry/exit rules, costs, "
+            "capacity, unclaimed windows/baselines, or a trading overlay."
+        )
+    if claim_type == "forecast_skill":
+        return (
+            "FORECAST_SKILL: this claim type is normally handled by Penrose's trusted deterministic "
+            "executor, not by generated code. If implementing manually, compare the declared "
+            "model forecast F_t with the declared benchmark B_t on realized target Y_t, emit "
+            "net=(B_t-Y_t)^2-(F_t-Y_t)^2 with positions=1 and bars_per_year from the emitted "
+            "forecast cadence. Construct implied random_walk/historical_mean benchmarks "
+            "strictly causally from Y through t-1 only. Do NOT add entry/exit rules, costs, "
+            "capacity, target substitution, benchmark substitution, or a trading overlay."
+        )
     if claim_type == "descriptive_statistical":
         return (
             "DESCRIPTIVE_STATISTICAL: compute the stated statistic directly over the requested "

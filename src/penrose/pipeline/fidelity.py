@@ -18,6 +18,7 @@ cannot authorize trusted-module reuse or a strongest positive verdict.
 from __future__ import annotations
 
 import ast
+import math
 import re
 
 from .. import config, llm
@@ -61,6 +62,58 @@ _EVENT_MARKET_STRATEGY_GUIDANCE = (
     "allowed declared pricing family such as normal_bracket, and applies the declared "
     "entry/sizing parameters through the event-market backtest. Defer new "
     "LLM-reconstruction fidelity for arbitrary pricing formulas to the later milestone."
+)
+
+_PREDICTIVE_REGRESSION_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=predictive_regression. This is NOT a trading "
+    "strategy. A deterministic spec/module is faithful only when it tests the declared "
+    "predictor, target, horizon, estimator, and statistic directly, aligns X_t with "
+    "Y_t+h, freezes sign and standardization on the in-sample prefix, and adds no "
+    "entry/exit, cost/capacity, or trading overlay. Hunt for variable substitution, "
+    "wrong horizon, added gates, or any OOS/holdout look-ahead."
+)
+
+_FACTOR_SPANNING_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=factor_spanning. This is NOT a trading "
+    "strategy. A deterministic spec/module is faithful only when it tests the declared "
+    "candidate factor against the declared benchmark set, fits F_t = alpha + beta'B_t "
+    "on the in-sample prefix only, freezes betas, emits the benchmark-hedged residual "
+    "alpha series, and adds no entry/exit, cost/capacity, unclaimed controls, or "
+    "trading overlay. Hunt for candidate substitution, benchmark-set substitution, "
+    "added controls, or any OOS/holdout refit/look-ahead."
+)
+
+_CROSS_SECTIONAL_SORT_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=cross_sectional_sort. This is NOT a generic "
+    "trading strategy. A deterministic spec/module is faithful only when it tests the "
+    "declared characteristic-sorted top-minus-bottom spread, uses the declared bucket "
+    "count and rebalance/hold cadence, ranks characteristics known at or before each "
+    "rebalance, and adds no separate entry/exit, timing overlay, substituted "
+    "characteristic, or unclaimed universe screen. Hunt for characteristic substitution, "
+    "bucket/cadence substitution, added gates, or any OOS/holdout look-ahead."
+)
+
+_EVENT_STUDY_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=event_study. This is NOT a trading "
+    "strategy. A deterministic spec/module is faithful only when it loads the "
+    "declared return series and event calendar, estimates the declared baseline "
+    "using only rows strictly before each event, computes abnormal returns over "
+    "the declared event window, emits one CAR observation per event, and adds no "
+    "entry/exit, cost/capacity, or trading overlay. Hunt for event-calendar "
+    "substitution, event-window substitution, baseline substitution, or any "
+    "post-event/OOS/holdout look-ahead."
+)
+
+_FORECAST_SKILL_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=forecast_skill. This is NOT a trading "
+    "strategy. A deterministic spec/module is faithful only when it tests the "
+    "declared model forecast against the declared explicit or implied benchmark "
+    "on the declared realized target, emits the squared-loss differential "
+    "(B_t-Y_t)^2 - (F_t-Y_t)^2, constructs implied random_walk/historical_mean "
+    "benchmarks strictly causally through t-1, and adds no entry/exit, "
+    "cost/capacity, target substitution, benchmark substitution, or trading "
+    "overlay. Hunt for model, target, or benchmark substitution and any "
+    "OOS/holdout look-ahead."
 )
 
 _USER_TMPL = """CLAIM (verbatim): {statement}
@@ -124,6 +177,16 @@ def assess(claim, module_code: str, spec: dict | None = None,
         system += _PROVIDED_SERIES_STATISTIC_GUIDANCE
     elif claim_type == "event_market_strategy":
         system += _EVENT_MARKET_STRATEGY_GUIDANCE
+    elif claim_type == "predictive_regression":
+        system += _PREDICTIVE_REGRESSION_GUIDANCE
+    elif claim_type == "factor_spanning":
+        system += _FACTOR_SPANNING_GUIDANCE
+    elif claim_type == "cross_sectional_sort":
+        system += _CROSS_SECTIONAL_SORT_GUIDANCE
+    elif claim_type == "event_study":
+        system += _EVENT_STUDY_GUIDANCE
+    elif claim_type == "forecast_skill":
+        system += _FORECAST_SKILL_GUIDANCE
     try:
         parsed, response = llm.call_json(
             role,
@@ -145,7 +208,12 @@ def assess(claim, module_code: str, spec: dict | None = None,
             "independent_verifier": bool(getattr(response, "independent_verifier", False)),
         }
         result = _provided_series_statistic_backstop(result, claim_type, spec)
-        return _event_market_strategy_backstop(result, claim_type, spec)
+        result = _event_market_strategy_backstop(result, claim_type, spec)
+        result = _predictive_regression_backstop(result, claim_type, spec, claim)
+        result = _factor_spanning_backstop(result, claim_type, spec, claim)
+        result = _cross_sectional_sort_backstop(result, claim_type, spec, claim)
+        result = _event_study_backstop(result, claim_type, spec, claim)
+        return _forecast_skill_backstop(result, claim_type, spec, claim)
     except Exception as e:  # noqa: BLE001 — inconclusive is contained, never promoted to faithful
         return {"faithful": False, "verified": False, "confidence": 0.0, "divergences": [],
                 "note": f"fidelity check errored: {e}", "independent_verifier": False}
@@ -297,6 +365,770 @@ def _event_market_strategy_backstop(result: dict, claim_type: str,
         "event_market_strategy fidelity block overridden structurally: deterministic "
         "normal_bracket pricing over a declared bracket table; arbitrary pricing-formula "
         "fidelity is deferred"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _is_deterministic_regression_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "predictive_regression":
+        return False
+    if spec.get("_llm_mode") != "deterministic-template":
+        return False
+    inputs = spec.get("inputs")
+    if not isinstance(inputs, list) or len([x for x in inputs if str(x or "").strip()]) < 2:
+        return False
+    predictor = str(spec.get("predictor") or inputs[0] or "").strip()
+    target = str(spec.get("target") or inputs[1] or "").strip()
+    if not predictor or not target or predictor == target:
+        return False
+    horizon = spec.get("horizon")
+    if horizon in (None, ""):
+        return False
+    estimator = str(spec.get("estimator") or "").lower()
+    if estimator and not any(k in estimator for k in ("ols", "covariance", "single_predictor")):
+        return False
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return True
+
+
+_HORIZON_WORDS = {
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "twelve": 12,
+}
+
+
+def _regression_claim_text(claim, spec: dict | None) -> str:
+    parts = []
+    seen = set()
+    for attr in ("statement", "mechanism", "horizon", "claimed_metric_quote", "source_span"):
+        try:
+            value = str(getattr(claim, attr, "") or "").strip()
+            key = value.lower()
+            if value and key not in seen:
+                parts.append(value)
+                seen.add(key)
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(spec, dict):
+        for key in ("claim_statement", "claim_mechanism", "claim_source_span", "claim_translation"):
+            value = str(spec.get(key) or "").strip()
+            seen_key = value.lower()
+            if value and seen_key not in seen:
+                parts.append(value)
+                seen.add(seen_key)
+    return " ".join(str(p) for p in parts if p).lower()
+
+
+def _contains_var(text_norm: str, name: str) -> bool:
+    var = _norm_var(name)
+    if not var:
+        return False
+    if re.search(rf"(?:^|_){re.escape(var)}(?:_|$)", text_norm):
+        return True
+    tokens = [t for t in var.split("_") if len(t) > 1]
+    return bool(tokens) and all(re.search(rf"(?:^|_){re.escape(t)}(?:_|$)", text_norm) for t in tokens)
+
+
+def _ordered_regression_pair_verified(text: str, predictor: str, target: str) -> bool:
+    text_norm = _norm_var(text)
+    predictor_norm = _norm_var(predictor)
+    target_norm = _norm_var(target)
+    if not (
+        predictor_norm
+        and target_norm
+        and predictor_norm != target_norm
+        and _contains_var(text_norm, predictor)
+        and _contains_var(text_norm, target)
+    ):
+        return False
+    direct = re.search(
+        rf"(?:^|_){re.escape(predictor_norm)}(?:_|$).{{0,80}}"
+        rf"(?:predict|predicts|forecast|forecasts|lead|leads).{{0,80}}"
+        rf"(?:^|_){re.escape(target_norm)}(?:_|$)",
+        text_norm,
+    )
+    regression = re.search(
+        rf"(?:regression|regress|coefficient|beta).{{0,80}}"
+        rf"(?:^|_){re.escape(target_norm)}(?:_|$).{{0,50}}"
+        rf"(?:on|against).{{0,30}}"
+        rf"(?:^|_){re.escape(predictor_norm)}(?:_|$)",
+        text_norm,
+    )
+    target_on_predictor = re.search(
+        rf"(?:^|_){re.escape(target_norm)}(?:_|$).{{0,50}}"
+        rf"(?:on|against).{{0,30}}"
+        rf"(?:^|_){re.escape(predictor_norm)}(?:_|$)",
+        text_norm,
+    )
+    return bool(direct or regression or target_on_predictor)
+
+
+def _series_ref_name(value) -> str:
+    if isinstance(value, dict):
+        if value.get("kind") == "derived_series":
+            transform = str(value.get("transform") or "").strip()
+            base = str(value.get("base_series") or "").strip()
+            if transform == "realized_vol":
+                return f"realized_vol({base},{value.get('window') or ''})"
+            if transform:
+                return f"{transform}({base})"
+            return base
+        return str(
+            value.get("series")
+            or value.get("id")
+            or value.get("name")
+            or value.get("key")
+            or ""
+        ).strip()
+    return str(value or "").strip()
+
+
+def _binding_score_ok(prov: dict) -> bool:
+    kind = str(prov.get("kind") or "").lower()
+    if kind == "literal":
+        return bool(prov.get("full_coverage") is True)
+    if kind in {"derived", "derived_series"}:
+        base = prov.get("base_resolution") or {}
+        return (
+            bool(base.get("full_coverage") is True)
+            and not (base.get("unmatched_name_tokens") or [])
+            and
+            float(base.get("score", 0.0) or 0.0) >= 0.5
+            and len(base.get("matched_tokens") or []) >= 1
+        )
+    return (
+        bool(prov.get("full_coverage") is True)
+        and not (prov.get("unmatched_name_tokens") or [])
+        and
+        float(prov.get("score", 0.0) or 0.0) >= 0.5
+        and len(prov.get("matched_tokens") or []) >= 1
+    )
+
+
+def _binding_evidence_tokens(prov: dict) -> list[str]:
+    if str(prov.get("kind") or "").lower() in {"derived", "derived_series"}:
+        prov = prov.get("base_resolution") or {}
+    out: list[str] = []
+    for item in prov.get("matched_tokens") or []:
+        token = str(item or "")
+        out.append((token.split("~")[-1] or token).lower())
+    return [t for t in out if len(t) >= 3]
+
+
+def _binding_matches_spec_value(prov: dict, value) -> bool:
+    kind = str(prov.get("kind") or "").lower()
+    if kind in {"derived", "derived_series"}:
+        if not isinstance(value, dict) or value.get("kind") != "derived_series":
+            return False
+        return (
+            str(prov.get("transform") or "") == str(value.get("transform") or "")
+            and str(prov.get("base_series") or "") == str(value.get("base_series") or "")
+            and int(prov.get("window") or value.get("window") or 1)
+            == int(value.get("window") or prov.get("window") or 1)
+        )
+    return str(prov.get("series") or "").strip() == _series_ref_name(value)
+
+
+def _contains_any_token(text_norm: str, tokens: list[str]) -> bool:
+    return any(re.search(rf"(?:^|_){re.escape(_norm_var(tok))}(?:_|$)", text_norm) for tok in tokens)
+
+
+def _derived_phrase_verified(text: str, prov: dict) -> bool:
+    transform = str(prov.get("transform") or "").lower()
+    if transform == "realized_vol":
+        return bool(re.search(r"\b(?:realized\s+vol(?:atility)?|rv)\b", text, flags=re.IGNORECASE))
+    if transform == "log_returns":
+        return bool(re.search(r"\blog\s+returns?\b", text, flags=re.IGNORECASE))
+    if transform == "returns":
+        return bool(re.search(r"\breturns?\b", text, flags=re.IGNORECASE))
+    return False
+
+
+# BIND-1: a partial bind is a WRONG bind when the bound series names a MEASUREMENT (funding) that differs
+# from the measurement the claim names (volume). A paraphrase bind (c2: "CPI repricing" ->
+# kx_cpi_inflation_probability_daily) shares no such measurement conflict, so it is NOT rejected. Full-
+# coverage bindings never conflict. This separates the two cases that score/coverage alone cannot.
+_MEASUREMENT_TOKENS = frozenset({
+    "volume", "funding", "price", "returns", "return", "rate", "oi", "spread",
+    "basis", "spot", "perp", "open", "close", "high", "low",
+})
+
+
+def _measurement_tokens(text: str) -> set:
+    return {t for t in re.split(r"[^a-z0-9]+", str(text or "").lower()) if t} & _MEASUREMENT_TOKENS
+
+
+def _binding_measurement_conflict(text: str, prov: dict) -> bool:
+    """True when the bound series names a measurement the claim does NOT, and the claim names a DIFFERENT
+    measurement — the volume->funding mis-bind signature. Full-coverage / no-measurement-token binds pass."""
+    if str(prov.get("kind") or "").lower() in {"derived", "derived_series"}:
+        prov = prov.get("base_resolution") or {}
+    if prov.get("full_coverage"):
+        return False
+    series_measures = _measurement_tokens(prov.get("series"))
+    if not series_measures:
+        return False  # bound series carries no measurement token -> no measurement conflict possible
+    claim_only = _measurement_tokens(text) - series_measures
+    return bool(claim_only)  # claim names a measurement the bound series lacks -> conflict
+
+
+def _ordered_binding_provenance_verified(text: str, predictor_prov: dict, target_prov: dict) -> bool:
+    if not (_binding_score_ok(predictor_prov) and _binding_score_ok(target_prov)):
+        return False
+    # BIND-1: reject a partial bind whose series names a DIFFERENT measurement than the claim (volume vs
+    # funding). Paraphrase binds with no measurement conflict are allowed.
+    if _binding_measurement_conflict(text, predictor_prov) or _binding_measurement_conflict(text, target_prov):
+        return False
+    m = re.search(r"\b(?:predicts?|forecasts?|forecasting|leads?|explains?)\b", text, flags=re.IGNORECASE)
+    if not m:
+        return False
+    before = text[:m.start()]
+    after = text[m.end():]
+    before_norm = _norm_var(before)
+    after_norm = _norm_var(after)
+    predictor_tokens = _binding_evidence_tokens(predictor_prov)
+    target_tokens = _binding_evidence_tokens(target_prov)
+    if not predictor_tokens or not target_tokens:
+        return False
+    if not _contains_any_token(before_norm, predictor_tokens):
+        return False
+    if not _contains_any_token(after_norm, target_tokens):
+        return False
+    if str(target_prov.get("kind") or "").lower() in {"derived", "derived_series"}:
+        return _derived_phrase_verified(after, target_prov)
+    return True
+
+
+def _horizon_to_int(value) -> int | None:
+    if isinstance(value, dict):
+        value = value.get("periods") or value.get("days") or value.get("h") or value.get("value")
+    if isinstance(value, int):
+        return max(1, value)
+    if isinstance(value, float) and math.isfinite(value):
+        return max(1, int(value))
+    text = str(value or "").lower()
+    m = re.search(r"\b(\d+)\s*(?:d|day|days|period|periods|month|months|quarter|quarters|year|years)?\b", text)
+    if m:
+        return max(1, int(m.group(1)))
+    for word, num in _HORIZON_WORDS.items():
+        if re.search(rf"\b{word}\b", text):
+            return num
+    return None
+
+
+def _claim_horizons(text: str) -> set[int]:
+    out: set[int] = set()
+    for m in re.finditer(
+        r"\b(\d+)\s*[- ]?(?:d|day|days|period|periods|month|months|quarter|quarters|year|years)"
+        r"(?:\s*[- ]?ahead|\s+forward|\s+future)?\b",
+        text,
+    ):
+        out.add(max(1, int(m.group(1))))
+    for word, num in _HORIZON_WORDS.items():
+        if re.search(
+            rf"\b{word}\s*[- ]?(?:d|day|days|period|periods|month|months|quarter|quarters|year|years)"
+            rf"(?:\s*[- ]?ahead|\s+forward|\s+future)?\b",
+            text,
+        ):
+            out.add(num)
+    if re.search(r"\bnext[- ](?:day|period)\b|\bone[- ](?:day|period)\b", text):
+        out.add(1)
+    return out
+
+
+def _predictive_regression_correspondence_verified(claim, spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    inputs = spec.get("inputs") or []
+    predictor = spec.get("predictor") or (inputs[0] if inputs else "") or ""
+    target = spec.get("target") or (inputs[1] if len(inputs) > 1 else "") or ""
+    text = _regression_claim_text(claim, spec)
+    provenance = spec.get("binding_provenance") or {}
+    if provenance:
+        predictor_prov = provenance.get("predictor") or {}
+        target_prov = provenance.get("target") or {}
+        if not (
+            isinstance(predictor_prov, dict)
+            and isinstance(target_prov, dict)
+            and _binding_matches_spec_value(predictor_prov, predictor)
+            and _binding_matches_spec_value(target_prov, target)
+            and _ordered_binding_provenance_verified(text, predictor_prov, target_prov)
+        ):
+            return False
+    elif not _ordered_regression_pair_verified(text, _series_ref_name(predictor), _series_ref_name(target)):
+        return False
+    spec_horizon = _horizon_to_int(spec.get("horizon"))
+    declared_horizons = _claim_horizons(text)
+    return bool(spec_horizon and declared_horizons and spec_horizon in declared_horizons)
+
+
+def _predictive_regression_backstop(result: dict, claim_type: str,
+                                    spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "predictive_regression" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_regression_spec(spec):
+        return result
+    if not _predictive_regression_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["predictive_regression_fidelity_override"] = "deterministic_template_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "predictive_regression fidelity block overridden structurally: deterministic "
+        "template with declared predictor, target, horizon, and no trading overlay"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _factor_spanning_canonical_benchmarks(benchmark_set: str) -> list:
+    try:
+        from .factor_spanning import _BENCHMARK_SET_DEFAULTS
+        return list(_BENCHMARK_SET_DEFAULTS.get(benchmark_set, []))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _is_deterministic_factor_spanning_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "factor_spanning":
+        return False
+    if spec.get("_llm_mode") != "deterministic-template":
+        return False
+    inputs = spec.get("inputs")
+    if not isinstance(inputs, list):
+        return False
+    candidate = _series_ref_name(spec.get("candidate_factor") or (inputs[0] if inputs else ""))
+    benchmarks = spec.get("benchmark_factors") or inputs[1:]
+    if isinstance(benchmarks, str):
+        benchmarks = [benchmarks]
+    benchmark_names = [_series_ref_name(x) for x in benchmarks if _series_ref_name(x)]
+    if not candidate or len(benchmark_names) < 1 or candidate in benchmark_names:
+        return False
+    benchmark_set = str(spec.get("benchmark_set") or "").lower()
+    if benchmark_set:
+        if benchmark_set not in {"capm", "ff3", "ff5", "carhart"}:
+            return False
+        # FS-1: benchmark_factors must match the declared set's canonical cardinality. A spec that
+        # declares "ff3" but hedges only [mkt] (dropping SMB/HML) would let a truly-spanned factor's
+        # size premium leak in as fake alpha and still certify faithful; an over-hedge (extra controls)
+        # would false-kill by over-hedging. Require the count to match the declared set.
+        canonical = _factor_spanning_canonical_benchmarks(benchmark_set)
+        if canonical and len(benchmark_names) != len(canonical):
+            return False
+    estimator = str(spec.get("estimator") or "").lower()
+    if estimator and not all(k in estimator for k in ("ols", "is")):
+        return False
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return True
+
+
+def _factor_spanning_correspondence_verified(claim, spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    inputs = spec.get("inputs") or []
+    candidate = spec.get("candidate_factor") or (inputs[0] if inputs else "") or ""
+    benchmarks = spec.get("benchmark_factors") or inputs[1:]
+    if isinstance(benchmarks, str):
+        benchmarks = [benchmarks]
+    text = _regression_claim_text(claim, spec)
+    text_norm = _norm_var(text)
+    if not re.search(r"\b(alpha|intercept|spanning|spanned|controlling|controls?)\b", text):
+        return False
+    benchmark_set = str(spec.get("benchmark_set") or "").lower()
+    if benchmark_set:
+        benchmark_patterns = {
+            "capm": r"(?:^|_)capm(?:_|$)|(?:^|_)mkt(?:_|$)|(?:^|_)market(?:_|$)",
+            "ff3": r"(?:^|_)ff3(?:_|$)|fama_french_3|three_factor|(?:^|_)smb(?:_|$)|(?:^|_)hml(?:_|$)",
+            "ff5": r"(?:^|_)ff5(?:_|$)|fama_french_5|five_factor|(?:^|_)rmw(?:_|$)|(?:^|_)cma(?:_|$)",
+            "carhart": r"(?:^|_)carhart(?:_|$)",
+        }
+        if not re.search(benchmark_patterns.get(benchmark_set, r"$^"), text_norm):
+            return False
+        # FS-1: the hedged benchmark_factors must match the declared set's cardinality (no dropped/added).
+        canonical = _factor_spanning_canonical_benchmarks(benchmark_set)
+        bench_names = [_series_ref_name(b) for b in benchmarks if _series_ref_name(b)]
+        if canonical and len(bench_names) != len(canonical):
+            return False
+    provenance = spec.get("binding_provenance") or {}
+    candidate_prov = provenance.get("candidate_factor") if isinstance(provenance, dict) else {}
+    candidate_prov = candidate_prov if isinstance(candidate_prov, dict) else {}
+    if candidate_prov:
+        return (
+            str(candidate_prov.get("kind") or "").lower() != "unresolved"
+            and _binding_matches_spec_value(candidate_prov, candidate)
+            and _binding_score_ok(candidate_prov)
+        )
+    return _contains_var(text_norm, _series_ref_name(candidate)) and all(
+        _series_ref_name(b) != _series_ref_name(candidate) for b in benchmarks
+    )
+
+
+def _factor_spanning_backstop(result: dict, claim_type: str,
+                              spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "factor_spanning" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_factor_spanning_spec(spec):
+        return result
+    if not _factor_spanning_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["factor_spanning_fidelity_override"] = "deterministic_template_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "factor_spanning fidelity block overridden structurally: deterministic template "
+        "with declared candidate, benchmark set, IS-frozen betas, and no trading overlay"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _is_deterministic_cross_sectional_sort_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "cross_sectional_sort":
+        return False
+    if spec.get("_llm_mode") != "deterministic-template":
+        return False
+    panel_inputs = spec.get("panel_inputs")
+    if not isinstance(panel_inputs, dict):
+        return False
+    if not panel_inputs.get("returns") or not panel_inputs.get("characteristic"):
+        return False
+    if not str(spec.get("characteristic") or "").strip():
+        return False
+    try:
+        if int(spec.get("n_buckets") or 0) < 2:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if not str(spec.get("rebalance") or "").strip() or not str(spec.get("hold") or "").strip():
+        return False
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return True
+
+
+def _cross_sectional_sort_correspondence_verified(claim, spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    text = _regression_claim_text(claim, spec)
+    text_norm = _norm_var(text)
+    characteristic = str(spec.get("characteristic") or "").strip()
+    if not characteristic or not _contains_var(text_norm, characteristic):
+        return False
+    try:
+        n_buckets = int(spec.get("n_buckets") or 0)
+    except (TypeError, ValueError):
+        return False
+    # CS-1: reject bucket-count / cadence SUBSTITUTION. If the claim EXPLICITLY names a bucket scheme or a
+    # rebalance cadence, the spec must match it — a "quartiles, annual" claim reconstructed at deciles/monthly
+    # is a substitution the structural backstop must not certify. Silence in the claim never triggers a
+    # rejection (the extractor's default is acceptable when the claim omits the detail).
+    from .spec_gen import _claimed_bucket_count, _claimed_rebalance
+    claimed_buckets = _claimed_bucket_count(text)
+    if claimed_buckets is not None and claimed_buckets != n_buckets:
+        return False
+    claimed_cadence = _claimed_rebalance(text)
+    spec_cadence = str(spec.get("rebalance") or "").strip().upper()
+    if claimed_cadence is not None and spec_cadence and claimed_cadence != spec_cadence:
+        return False
+    if not re.search(r"\bsort|sorted|sorting|rank|ranked|ranking\b", text):
+        return False
+    if not re.search(r"\btop|bottom|spread|high[- ]?minus[- ]?low|long[- ]short\b", text):
+        return False
+    return True
+
+
+def _cross_sectional_sort_backstop(result: dict, claim_type: str,
+                                   spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "cross_sectional_sort" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_cross_sectional_sort_spec(spec):
+        return result
+    if not _cross_sectional_sort_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["cross_sectional_sort_fidelity_override"] = "deterministic_template_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "cross_sectional_sort fidelity block overridden structurally: deterministic template "
+        "with declared characteristic, bucket count, rebalance cadence, and no trading overlay"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _event_calendar_declared(value) -> bool:
+    if isinstance(value, dict):
+        raw = (
+            value.get("path")
+            or value.get("table")
+            or value.get("table_path")
+            or value.get("calendar_path")
+            or value.get("event_calendar_path")
+        )
+    else:
+        raw = value
+    return bool(str(raw or "").strip())
+
+
+def _event_study_window(spec: dict | None) -> tuple[int, int] | None:
+    if not isinstance(spec, dict):
+        return None
+    value = spec.get("window") or spec.get("event_window")
+    if not isinstance(value, (list, tuple)) or len(value) < 2:
+        return None
+    try:
+        start, end = int(value[0]), int(value[1])
+    except (TypeError, ValueError):
+        return None
+    return (start, end) if start <= end else None
+
+
+def _is_deterministic_event_study_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "event_study":
+        return False
+    if spec.get("_llm_mode") != "deterministic-template":
+        return False
+    return_series = _series_ref_name(spec.get("return_series") or ((spec.get("inputs") or [""])[0]))
+    if not return_series:
+        return False
+    if not _event_calendar_declared(spec.get("event_calendar")):
+        return False
+    if _event_study_window(spec) is None:
+        return False
+    baseline = str(spec.get("baseline") or "mean_adjusted").strip().lower()
+    if baseline not in {"mean_adjusted", "market_model"}:
+        return False
+    if baseline == "market_model" and not _series_ref_name(spec.get("market_series")):
+        return False
+    try:
+        if int(spec.get("estimation_window") or 0) < 5:
+            return False
+    except (TypeError, ValueError):
+        return False
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return True
+
+
+def _event_study_correspondence_verified(claim, spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    text = _regression_claim_text(claim, spec)
+    if not re.search(r"\b(?:abnormal\s+returns?|cumulative\s+abnormal\s+returns?|car)\b", text):
+        return False
+    if not re.search(r"\b(?:event|announcement|earnings|fomc|listing|addition|halving)\b", text):
+        return False
+    from .spec_gen import _claimed_baseline, _claimed_event_window
+    claimed_window = _claimed_event_window(text)
+    spec_window = _event_study_window(spec)
+    if claimed_window is not None and spec_window != claimed_window:
+        return False
+    claimed_baseline = _claimed_baseline(text)
+    spec_baseline = str(spec.get("baseline") or "mean_adjusted").strip().lower()
+    if claimed_baseline is not None and spec_baseline != claimed_baseline:
+        return False
+    provenance = spec.get("binding_provenance") or {}
+    ret_prov = provenance.get("return_series") if isinstance(provenance, dict) else {}
+    ret_prov = ret_prov if isinstance(ret_prov, dict) else {}
+    return_series = spec.get("return_series") or ((spec.get("inputs") or [""])[0])
+    if ret_prov:
+        return (
+            str(ret_prov.get("kind") or "").lower() != "unresolved"
+            and _binding_matches_spec_value(ret_prov, return_series)
+            and _binding_score_ok(ret_prov)
+        )
+    return bool(_series_ref_name(return_series))
+
+
+def _event_study_backstop(result: dict, claim_type: str,
+                          spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "event_study" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_event_study_spec(spec):
+        return result
+    if not _event_study_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["event_study_fidelity_override"] = "deterministic_template_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "event_study fidelity block overridden structurally: deterministic template "
+        "with declared calendar, window, strictly-pre-event baseline, and no trading overlay"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
+def _forecast_benchmark_method(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("method") or value.get("family") or value.get("benchmark") or value.get("kind")
+    text = str(value or "").strip().lower().replace("-", "_")
+    if text in {"random_walk", "rw", "naive", "persistence", "last_value"}:
+        return "random_walk"
+    if text in {"historical_mean", "expanding_mean", "mean", "expanding_historical_mean"}:
+        return "historical_mean"
+    return ""
+
+
+def _forecast_benchmark_ref(spec: dict | None):
+    if not isinstance(spec, dict):
+        return ""
+    return spec.get("benchmark") or spec.get("benchmark_forecast") or spec.get("benchmark_series") or ""
+
+
+def _is_deterministic_forecast_skill_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "forecast_skill":
+        return False
+    if spec.get("_llm_mode") != "deterministic-template":
+        return False
+    inputs = spec.get("inputs")
+    if not isinstance(inputs, list):
+        return False
+    model = _series_ref_name(spec.get("model_forecast") or (inputs[0] if inputs else ""))
+    target = _series_ref_name(spec.get("target") or (inputs[1] if len(inputs) > 1 else ""))
+    if not model or not target or model == target:
+        return False
+    benchmark = _forecast_benchmark_ref(spec)
+    benchmark_series = _series_ref_name(benchmark)
+    benchmark_method = _forecast_benchmark_method(benchmark)
+    if benchmark_series:
+        if benchmark_series in {model, target}:
+            return False
+    elif benchmark_method not in {"random_walk", "historical_mean"}:
+        return False
+    if str(spec.get("loss") or "squared_error").lower() not in {"squared_error", "mse", "msfe"}:
+        return False
+    if _provided_series_has_added_gate_field(spec):
+        return False
+    return True
+
+
+def _forecast_skill_correspondence_verified(claim, spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    text = _regression_claim_text(claim, spec)
+    text_norm = _norm_var(text)
+    if not re.search(r"\b(?:forecast|forecasts|forecasting|predicts?|prediction)\b", text):
+        return False
+    if not re.search(
+        r"\b(?:msfe|mspe|rmse|diebold[- ]mariano|clark[- ]west|out[- ]of[- ]sample\s+r|oos\s+r|benchmark|random[- ]walk|naive)\b",
+        text,
+    ):
+        return False
+    inputs = spec.get("inputs") or []
+    model = spec.get("model_forecast") or (inputs[0] if inputs else "")
+    target = spec.get("target") or (inputs[1] if len(inputs) > 1 else "")
+    benchmark = _forecast_benchmark_ref(spec)
+    benchmark_series = _series_ref_name(benchmark)
+    benchmark_method = _forecast_benchmark_method(benchmark)
+
+    provenance = spec.get("binding_provenance") or {}
+    if isinstance(provenance, dict) and provenance:
+        model_prov = provenance.get("model_forecast") or {}
+        target_prov = provenance.get("target") or {}
+        benchmark_prov = provenance.get("benchmark") or {}
+        if not (
+            isinstance(model_prov, dict)
+            and isinstance(target_prov, dict)
+            and str(model_prov.get("kind") or "").lower() != "unresolved"
+            and str(target_prov.get("kind") or "").lower() != "unresolved"
+            and _binding_matches_spec_value(model_prov, model)
+            and _binding_matches_spec_value(target_prov, target)
+            and _binding_score_ok(model_prov)
+            and _binding_score_ok(target_prov)
+        ):
+            return False
+        if benchmark_series:
+            if not (
+                isinstance(benchmark_prov, dict)
+                and str(benchmark_prov.get("kind") or "").lower() != "unresolved"
+                and _binding_matches_spec_value(benchmark_prov, benchmark_series)
+                and _binding_score_ok(benchmark_prov)
+            ):
+                return False
+        elif benchmark_method:
+            if benchmark_method == "random_walk" and not re.search(r"\b(random[- ]walk|naive|persistence)\b", text):
+                return False
+            if benchmark_method == "historical_mean" and not re.search(r"\bhistorical\s+mean\b|\bexpanding\s+mean\b", text):
+                return False
+        else:
+            return False
+    else:
+        if not (_contains_var(text_norm, _series_ref_name(model)) and _contains_var(text_norm, _series_ref_name(target))):
+            return False
+        if benchmark_series and not _contains_var(text_norm, benchmark_series):
+            return False
+        if benchmark_method == "random_walk" and not re.search(r"\b(random[- ]walk|naive|persistence)\b", text):
+            return False
+        if benchmark_method == "historical_mean" and not re.search(r"\bhistorical\s+mean\b|\bexpanding\s+mean\b", text):
+            return False
+
+    # FS-forecast CS-1 analogue: reject explicit target/benchmark substitution.
+    from .spec_gen import _forecast_benchmark_method as _claimed_forecast_benchmark_method
+    claimed_method = _claimed_forecast_benchmark_method(text)
+    if claimed_method and benchmark_method and claimed_method != benchmark_method:
+        return False
+    if benchmark_series and benchmark_series in {_series_ref_name(model), _series_ref_name(target)}:
+        return False
+    return True
+
+
+def _forecast_skill_backstop(result: dict, claim_type: str,
+                             spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "forecast_skill" or result.get("faithful") is not False:
+        return result
+    if not _is_deterministic_forecast_skill_spec(spec):
+        return result
+    if not _forecast_skill_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["forecast_skill_fidelity_override"] = "deterministic_template_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "forecast_skill fidelity block overridden structurally: deterministic template "
+        "with declared model forecast, target, benchmark, loss differential, and no trading overlay"
     )
     out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
     return out

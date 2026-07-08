@@ -3,6 +3,66 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.7.0] — 2026-07-08
+
+The theme: **the referee grows from a strategy backtester into a research platform.** Five new
+non-strategy claim-type executors join the engine — each testing a different shape of empirical-finance
+claim through the same falsification stack (deflation, single-use holdout, placebo/power calibration) —
+plus the data layer and honesty surfaces that support them. Every new claim type ships with its own
+ground-truth calibration and must prove it before landing: a planted null it rejects, a planted-real it
+survives, and an in-sample-only case it kills. Green bar: eval 124/124, pytest 464 passed.
+
+### Added
+- **Prose→series binding layer (for `predictive_regression`).** A deterministic (no-LLM) resolver binds a
+  claim's *prose* predictor/target descriptions to catalog series or derived quantities — fuzzy
+  prefix-token matching (with full-name→ticker synonyms), a derived-series library (`realized_vol`,
+  `returns`), and forward-windowed targets — recording binding provenance the fidelity check verifies. A
+  measurement-conflict gate blocks a wrong bind (e.g. "volume" → a funding series) from auto-certifying.
+ 
+- **Honest routing for uncertain bindings (`needs_review`).** A predictive-regression claim whose data
+  binding cannot be *confirmed* now routes to `needs_review` — a non-verdict routing state, never
+  certifiable — with an operator-readable *what / why / action* explanation, instead of mislabeling as
+  `cannot_replicate`. The auto-implementation loop guard gains the same explanation. Implements #62
+  (increment 1).
+- **Data Acquisition Standard** (`docs/DATA_ACQUISITION_STANDARD.md`). The sourcing/quality bar above the
+  wire contracts: a required-fields contract, the no-silent-proxy and no-look-ahead (incl. point-in-time /
+  vintage) invariants, quality gates (granularity, staleness, survivorship, point-in-time, per-series
+  fingerprints), capability-first vendor guidance, and demo-vs-production data tiers a verdict discloses.
+- **Cross-sectional-sort claim type.** Characteristic-sorted top-minus-bottom spread claims now route to a
+  trusted deterministic `cross_sectional_sort` executor over declared `Panel` tables — the first `Panel`
+  consumer, via a reusable bundle→Panel loader (`data/panel_load.py`) that requires survivorship-corrected
+  returns panels and routes a missing table to `needs_data`. The executor reuses `data.xsection.form_factor`
+  (no-lookahead ranking), synthesizes bucket-membership positions for P7, charges declared
+  characteristic/bucket breadth through deflation, and caps survivors as paper portfolios.
+- **Event-study claim type.** Event-response / CAR claims now route to a trusted deterministic
+  `event_study` executor over a declared return `Series` plus a new `EventCalendar` table loader. For each
+  event it fits the mean-adjusted or market-model baseline on a fixed estimation window ending strictly
+  before the event, emits per-event CAR as the P7 net series, annualizes by events/year, charges declared
+  windows/baselines through deflation, and caps survivors as paper event-response evidence rather than
+  tradeable strategies.
+- **Forecast-skill claim type.** Model-vs-benchmark forecast-accuracy claims now route to a trusted
+  deterministic `forecast_skill` executor over plain `Series` inputs: model forecast `F`, realized target
+  `Y`, and optional explicit benchmark forecast `B`. When `B` is declared-implied, the executor constructs
+  only strictly causal `random_walk` or `historical_mean` benchmarks from `Y` through `t-1`, emits the
+  squared-loss differential `(B_t-Y_t)^2 - (F_t-Y_t)^2` into P7, charges declared model/benchmark breadth
+  through deflation, and caps survivors as forecasting evidence rather than tradeable strategies.
+- **Factor-spanning claim type.** Factor alpha claims now route to a trusted deterministic
+  `factor_spanning` executor over plain `Series` inputs. It fits candidate factor returns on the
+  declared benchmark factors in-sample only, freezes betas, emits the benchmark-hedged residual
+  alpha series into P7, charges declared benchmark/candidate breadth through deflation, and adds
+  FF3/FF5 Ken French default series keys through the generic adapter.
+- **Predictive-regression claim type.** Regression/forecast claims now route to a trusted deterministic
+  `predictive_regression` executor over two `Series` inputs. It aligns `X_t` with `Y_{t+h}`, freezes sign
+  and z-score moments on the in-sample prefix, emits the standard P7 net/positions/bars_per_year triple,
+  charges declared search breadth through existing deflation, and carries a survivor caveat that the
+  confirmed relationship is not a tradeable strategy.
+
+### Changed
+- **Holdout burn-state relocated to `.holdout/`.** Per-claim single-use-holdout locks move out of the repo
+  root into `.holdout/{burned,locks/}` (a one-shot idempotent migration relocates existing locks and
+  strips a legacy leaked value). The burn check consults the new location then falls back to the legacy
+  root pattern, so a previously-burned holdout stays burned forever.
+
 ## [0.6.0] — 2026-07-07
 
 A release on one theme: the referee **learns across runs, becomes observable, and grows operable and

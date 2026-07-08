@@ -27,7 +27,22 @@ SPEC_SYSTEM = (
     "You are a research-engine module spec generator. Given a falsifiable claim "
     "extracted from a paper, you produce a ModuleSpec — a precise, implementable "
     "description of how to test the exact claim. If claim_type is "
-    "descriptive_statistical, specify the statistic to compute and its uncertainty; "
+    "predictive_regression, specify the exact predictor, target, horizon, estimator, "
+    "declared statistic, and search grid; do NOT translate it into a trading strategy. "
+    "If claim_type is factor_spanning, specify the declared candidate factor, benchmark "
+    "factor set, alpha/intercept statistic, and declared search grid; do NOT translate "
+    "it into a trading strategy. "
+    "If claim_type is cross_sectional_sort, specify the declared returns panel, "
+    "characteristic panel, characteristic, bucket count, rebalance cadence, hold, and "
+    "declared search grid; do NOT translate it into a trading overlay. "
+    "If claim_type is event_study, specify the declared return series, event calendar, "
+    "event window, estimation window, baseline model, optional market series, and "
+    "declared search grid; do NOT translate it into a trading strategy. "
+    "If claim_type is forecast_skill, specify the declared model forecast series, "
+    "realized target series, explicit benchmark forecast series OR declared implied "
+    "benchmark (random_walk/historical_mean), squared-loss differential, and declared "
+    "search grid; do NOT translate it into a trading strategy. "
+    "If claim_type is descriptive_statistical, specify the statistic to compute and its uncertainty; "
     "do NOT translate it into a trading strategy. If claim_type is trading_strategy, "
     "act as a translator, not a co-author: preserve the claim's signal exactly, do "
     "not add unclaimed gates or kill conditions, and choose one explicit conventional "
@@ -150,6 +165,192 @@ Output JSON with this exact shape:
 }}
 """
 
+PREDICTIVE_REGRESSION_SPEC_USER_TMPL = """Generate a ModuleSpec for this predictive-regression claim.
+The implementation must test the declared predictor -> target -> horizon relationship directly. Do not
+invent entry rules, positions, PnL, costs, capacity, or a trading strategy.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "predictive_regression",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "predictive_regression",
+  "claim_translation": str (the exact predictor -> target -> horizon relationship to test),
+  "inputs": [str, str] (predictor series first, target series second),
+  "predictor": str (same as inputs[0]),
+  "target": str (same as inputs[1]),
+  "horizon": int or str (declared h-ahead target horizon),
+  "estimator": str (for v1, single-predictor OLS / covariance-sign test),
+  "statistic": str (declared sign, coefficient, t-statistic, R2, MSFE, or equivalent),
+  "param_grid": dict (declared search grid; include coins/specs/horizons if the claim declares a search),
+  "signal_logic": str ("predictive_regression: align X_t with Y_t+h; no trading overlay"),
+  "kill_criterion": str (concrete: OOS/holdout predictive direction or deflated statistic fails),
+  "expected_data_needs": str (window, frequency, granularity),
+  "unknowns": [str] (assumptions the operator must verify; data that may not exist; etc.),
+  "implementation_notes": str (no look-ahead: emit non-overlapping h-sampled rows; fit sign and z-score moments on IS rows whose target timestamps remain in-sample)
+}}
+"""
+
+FACTOR_SPANNING_SPEC_USER_TMPL = """Generate a ModuleSpec for this factor-spanning claim.
+The implementation must test whether the declared candidate factor earns alpha after controlling
+for the declared benchmark factor set. Do not invent entry rules, positions, PnL, costs, capacity,
+or a trading strategy.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "factor_spanning",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "factor_spanning",
+  "claim_translation": str (candidate factor F regressed on the declared benchmark factors),
+  "inputs": [str, ...] (candidate factor first, then benchmark Series),
+  "candidate_factor": str (same as inputs[0]),
+  "benchmark_set": "capm|ff3|ff5|carhart",
+  "benchmark_factors": [str, ...] (same as inputs[1:]),
+  "estimator": "multivariate_ols_is_frozen_betas",
+  "statistic": "alpha_t_stat",
+  "param_grid": dict (declared benchmark sets/candidates tried for deflation),
+  "signal_logic": str ("factor_spanning: fit F on benchmarks in-sample only; emit residual alpha series; no trading overlay"),
+  "kill_criterion": str (concrete: OOS/holdout residual alpha or deflated statistic fails),
+  "expected_data_needs": str (candidate and benchmark factor return Series on a common DatetimeIndex),
+  "unknowns": [str] (candidate/benchmark bindings an operator must verify),
+  "implementation_notes": str (freeze betas on the in-sample prefix only; never refit on OOS/holdout)
+}}
+"""
+
+CROSS_SECTIONAL_SORT_SPEC_USER_TMPL = """Generate a ModuleSpec for this cross-sectional-sort claim.
+The implementation must test the declared characteristic sort directly: sort entities by the
+characteristic known at the rebalance date and test the top-minus-bottom spread. Do not invent
+entry rules, timing overlays, costs, capacity, or a separate trading strategy.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "cross_sectional_sort",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "cross_sectional_sort",
+  "claim_translation": str (characteristic-sorted top-minus-bottom spread to test),
+  "inputs": [] (Series inputs are not used for this claim type),
+  "panel_inputs": {{"returns": str or object, "characteristic": str or object}},
+  "characteristic": str (declared characteristic C),
+  "n_buckets": int (e.g. 10 for deciles, 5 for quintiles),
+  "rebalance": str (declared cadence, e.g. "ME"),
+  "hold": str (declared holding window, e.g. "1M"),
+  "statistic": str (declared mean spread/t-stat/Sharpe or equivalent),
+  "param_grid": dict (declared bucket counts / characteristics tried for deflation),
+  "signal_logic": str ("cross_sectional_sort: form_factor(returns_panel, characteristic_panel, ...); no trading overlay"),
+  "kill_criterion": str (concrete: OOS/holdout spread or deflated statistic fails),
+  "expected_data_needs": str (point-in-time characteristic Panel plus survivorship-corrected returns Panel),
+  "unknowns": [str] (unconfirmed characteristic/universe/panel bindings),
+  "implementation_notes": str (ranking uses only characteristics known at/before rebalance; returns panel must retain delisted entities)
+}}
+"""
+
+EVENT_STUDY_SPEC_USER_TMPL = """Generate a ModuleSpec for this event-study claim.
+The implementation must test cumulative abnormal returns around the declared event dates directly.
+Do not invent entry rules, positions, PnL, costs, capacity, or a trading strategy.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "event_study",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "event_study",
+  "claim_translation": str (average CAR around the declared event calendar to test),
+  "inputs": [str, ...] (return Series first; market Series second only for market_model baseline),
+  "return_series": str (same as inputs[0]),
+  "event_calendar": str or object (declared table/path with date_col),
+  "window": [int, int] (event-window offsets in trading rows, e.g. [0, 5]),
+  "estimation_window": int (pre-event bars used for the baseline),
+  "baseline": "mean_adjusted|market_model",
+  "market_series": str (required only when baseline is market_model),
+  "statistic": "average_car",
+  "param_grid": dict (declared windows/baselines tried for deflation),
+  "signal_logic": str ("event_study: estimate baseline strictly before each event; emit per-event CAR; no trading overlay"),
+  "kill_criterion": str (concrete: OOS/holdout average CAR or deflated statistic fails),
+  "expected_data_needs": str (return Series plus declared event calendar table with one date column),
+  "unknowns": [str] (unconfirmed event calendar/return-series bindings),
+  "implementation_notes": str (no look-ahead: baseline estimation window ends strictly before event date)
+}}
+"""
+
+FORECAST_SKILL_SPEC_USER_TMPL = """Generate a ModuleSpec for this forecast-skill claim.
+The implementation must test whether the declared model forecast beats the declared
+benchmark forecast on the declared realized target out-of-sample. Do not invent
+entry rules, positions, PnL, costs, capacity, or a trading strategy.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "forecast_skill",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "forecast_skill",
+  "claim_translation": str (model forecast F compared with benchmark B on realized target Y),
+  "inputs": [str, str, ...] (model forecast first, target second, explicit benchmark third only when declared),
+  "model_forecast": str (same as inputs[0]),
+  "target": str (same as inputs[1]),
+  "benchmark": str or object (explicit Series OR {{"kind": "implied", "method": "random_walk|historical_mean"}}),
+  "loss": "squared_error",
+  "statistic": "loss_differential_mean",
+  "param_grid": dict (declared models/benchmarks/specs tried for deflation),
+  "signal_logic": str ("forecast_skill: emit (B_t-Y_t)^2 - (F_t-Y_t)^2; no trading overlay"),
+  "kill_criterion": str (concrete: OOS/holdout loss differential or deflated statistic fails),
+  "expected_data_needs": str (forecast and target Series on a common DatetimeIndex),
+  "unknowns": [str] (unconfirmed forecast/target/benchmark bindings),
+  "implementation_notes": str (constructed benchmarks must be strictly causal: random_walk=Y.shift(1), historical_mean=expanding_mean(Y).shift(1))
+}}
+"""
+
 
 def classify_claim_type(claim: Claim, source: IngestedSource | None = None) -> str:
     return fidelity_memory.classify_claim_type(claim, source)
@@ -189,6 +390,16 @@ def generate_spec(claim: Claim, source: IngestedSource,
         # can neither invent gates (over-specification, EXP-1) nor fall back to an empty
         # stub (under-specification, EXP-1b). See _provided_series_stat_spec.
         spec = _provided_series_stat_spec(claim, source)
+    elif claim_type == "predictive_regression":
+        spec = _predictive_regression_spec(claim, source)
+    elif claim_type == "factor_spanning":
+        spec = _factor_spanning_spec(claim, source)
+    elif claim_type == "cross_sectional_sort":
+        spec = _cross_sectional_sort_spec(claim, source)
+    elif claim_type == "event_study":
+        spec = _event_study_spec(claim, source)
+    elif claim_type == "forecast_skill":
+        spec = _forecast_skill_spec(claim, source)
     elif not use_llm:
         spec = _stub_spec(claim, source)
     else:
@@ -231,6 +442,11 @@ def _base_prompt(claim: Claim, source: IngestedSource, claim_type: str,
     tmpl = {
         "descriptive_statistical": DESCRIPTIVE_SPEC_USER_TMPL,
         "structural_proposition": STRUCTURAL_SPEC_USER_TMPL,
+        "predictive_regression": PREDICTIVE_REGRESSION_SPEC_USER_TMPL,
+        "factor_spanning": FACTOR_SPANNING_SPEC_USER_TMPL,
+        "cross_sectional_sort": CROSS_SECTIONAL_SORT_SPEC_USER_TMPL,
+        "event_study": EVENT_STUDY_SPEC_USER_TMPL,
+        "forecast_skill": FORECAST_SKILL_SPEC_USER_TMPL,
     }.get(claim_type, TRADING_SPEC_USER_TMPL)
     user = tmpl.format(
         statement=claim.statement[:600],
@@ -319,6 +535,320 @@ _SERIES_DECISION_EXCLUSION_CUES = (
     "illustrative",
 )
 
+_SERIES_RESOLVER_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "by",
+    "daily",
+    "for",
+    "from",
+    "in",
+    "index",
+    "of",
+    "on",
+    "signal",
+    "the",
+    "to",
+    "with",
+}
+
+_SINGLE_TOKEN_SERIES_GENERIC = {
+    "abs",
+    "change",
+    "delta",
+    "funding",
+    "native",
+    "perp",
+    "price",
+    "prices",
+    "prob",
+    "probability",
+    "ret",
+    "return",
+    "returns",
+    "rv",
+    "signal",
+    "spot",
+    "vol",
+    "volume",
+}
+
+_RELATION_VERBS_RE = re.compile(
+    r"\b(?:predicts?|forecasts?|forecasting|leads?|explains?)\b",
+    flags=re.IGNORECASE,
+)
+_RELATION_TRAILING_CUES_RE = re.compile(
+    r"\b(?:in[- ]sample|out[- ]of[- ]sample|oos|is|with|regression|beta|coefficient|"
+    r"t[- ]?stat(?:istic)?|p\s*=|r\s*(?:\^2|2)|msfe|sharpe|information ratio)\b.*$",
+    flags=re.IGNORECASE,
+)
+_HORIZON_PREFIX_RE = re.compile(
+    r"^\s*(?:next\s+)?(?:\d+\s*[- ]?)?"
+    r"(?:d|day|days|period|periods|week|weeks|month|months|quarter|quarters|year|years)?"
+    r"\s*(?:ahead|forward|future)?\s*",
+    flags=re.IGNORECASE,
+)
+
+
+# Full crypto asset names as written in claims -> the ticker the catalog uses. Applied only as an
+# ADDITIVE expansion (the full word is kept too), so a claim saying "Chainlink"/"Bitcoin" can bind to
+# link_/btc_ series whose ticker is not a prefix of the full name. Deterministic; no model.
+_ASSET_SYNONYMS = {
+    "bitcoin": "btc", "ethereum": "eth", "solana": "sol", "ripple": "xrp",
+    "dogecoin": "doge", "cardano": "ada", "chainlink": "link", "binance": "bnb",
+    "polkadot": "dot", "avalanche": "avax", "litecoin": "ltc", "polygon": "matic",
+}
+
+
+def _series_resolver_tokens(text: str) -> list[str]:
+    out: list[str] = []
+    for tok in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        if not tok or tok in _SERIES_RESOLVER_STOPWORDS:
+            continue
+        out.append(tok)
+        syn = _ASSET_SYNONYMS.get(tok)
+        if syn and syn not in out:
+            out.append(syn)
+    return out
+
+
+def _prefix_token_match(a: str, b: str) -> bool:
+    return len(a) >= 3 and len(b) >= 3 and (a.startswith(b) or b.startswith(a))
+
+
+def _single_content_token_binding_allowed(name_tokens: list[str], score: float) -> bool:
+    if len(name_tokens) != 1 or score != 1.0:
+        return False
+    token = name_tokens[0]
+    return len(token) >= 3 and token not in _SINGLE_TOKEN_SERIES_GENERIC
+
+
+def resolve_series_from_prose(description: str, catalog_names: list[str]) -> dict | None:
+    """Resolve prose to a catalog series by deterministic prefix-token coverage."""
+    desc_tokens = _series_resolver_tokens(description)
+    if not desc_tokens:
+        return None
+    best: tuple[float, int, str, list[tuple[str, str]], list[str]] | None = None
+    for raw_name in sorted(str(n) for n in catalog_names if str(n or "").strip()):
+        name_tokens = _series_resolver_tokens(raw_name)
+        if not name_tokens:
+            continue
+        matches: list[tuple[str, str]] = []
+        used_desc: set[int] = set()
+        for name_tok in name_tokens:
+            for idx, desc_tok in enumerate(desc_tokens):
+                if idx in used_desc:
+                    continue
+                if _prefix_token_match(name_tok, desc_tok):
+                    used_desc.add(idx)
+                    matches.append((name_tok, desc_tok))
+                    break
+        score = len(matches) / float(len(name_tokens))
+        matched_name = {name_tok for name_tok, _ in matches}
+        unmatched_name = [tok for tok in name_tokens if tok not in matched_name]
+        candidate = (score, len({d for _, d in matches}), raw_name, matches, unmatched_name)
+        if best is None or candidate > best:
+            best = candidate
+    if best is None:
+        return None
+    score, matched_desc_count, series, matches, unmatched_name = best
+    name_tokens = _series_resolver_tokens(series)
+    if score < 0.5 or (
+        matched_desc_count < 2
+        and not _single_content_token_binding_allowed(name_tokens, score)
+    ):
+        return None
+    matched_tokens = [
+        name_tok if name_tok == desc_tok else f"{name_tok}~{desc_tok}"
+        for name_tok, desc_tok in matches
+    ]
+    full_coverage = not unmatched_name
+    return {
+        "series": series,
+        "score": float(score),
+        "matched_tokens": matched_tokens,
+        "full_coverage": full_coverage,
+        "unmatched_name_tokens": unmatched_name,
+        "why": (
+            f"matched {series} by prefix-token coverage "
+            f"({len(matches)}/{len(name_tokens)}): "
+            + ", ".join(matched_tokens)
+            + ("" if full_coverage else "; unmatched name tokens: " + ", ".join(unmatched_name))
+        ),
+    }
+
+
+def _resolve_signal_alias_from_prose(description: str, catalog_names: list[str]) -> dict | None:
+    """Resolve terse '<entity> signal' prose to a unique abs-prob-change catalog signal."""
+    raw = str(description or "").lower()
+    if "signal" not in raw:
+        return None
+    desc_tokens = _series_resolver_tokens(description)
+    if not desc_tokens:
+        return None
+    candidates = []
+    for name in sorted(str(n) for n in catalog_names if str(n or "").strip()):
+        name_tokens = _series_resolver_tokens(name)
+        if not {"abs", "prob", "change"}.issubset(set(name_tokens)):
+            continue
+        entity_hits = [
+            tok for tok in desc_tokens
+            if any(_prefix_token_match(tok, name_tok) for name_tok in name_tokens)
+        ]
+        if entity_hits:
+            candidates.append((name, entity_hits[0]))
+    if len(candidates) != 1:
+        return None
+    series, entity = candidates[0]
+    matched_tokens = [entity, "abs~signal", "prob~signal", "change~signal"]
+    return {
+        "series": series,
+        "score": 1.0,
+        "matched_tokens": matched_tokens,
+        "full_coverage": True,
+        "unmatched_name_tokens": [],
+        "why": (
+            f"matched unique abs_prob_change catalog signal {series} from terse "
+            f"signal phrase: " + ", ".join(matched_tokens)
+        ),
+    }
+
+
+def _resolve_spot_alias_from_prose(description: str, catalog_names: list[str]) -> dict | None:
+    """Resolve terse asset prose such as 'Solana' to a unique '<asset>_spot_daily' series."""
+    desc_tokens = _series_resolver_tokens(description)
+    if not desc_tokens:
+        return None
+    candidates = []
+    for name in sorted(str(n) for n in catalog_names if str(n or "").strip()):
+        name_tokens = _series_resolver_tokens(name)
+        if "spot" not in name_tokens:
+            continue
+        entity_hits = [
+            tok for tok in desc_tokens
+            if any(
+                name_tok != "spot" and _prefix_token_match(tok, name_tok)
+                for name_tok in name_tokens
+            )
+        ]
+        if entity_hits:
+            candidates.append((name, entity_hits[0]))
+    if not candidates:
+        return None
+    # Disambiguate multiple spot variants for the SAME asset (e.g. sol_spot_daily / sol_okx_spot_daily /
+    # price.sol_usd_spot_daily). Bail only when candidates span DIFFERENT asset tickers (genuinely
+    # ambiguous); otherwise prefer the canonical bare "<ticker>_spot_daily" (no dotted namespace, no
+    # exchange qualifier, shortest).
+    def _spot_ticker(name: str) -> str | None:
+        toks = [t for t in _series_resolver_tokens(name)
+                if t not in ("spot", "daily", "usd", "price")]
+        return toks[0] if toks else None
+    tickers = {_spot_ticker(n) for n, _ in candidates}
+    tickers.discard(None)
+    if len(tickers) != 1:
+        return None
+    def _canonical_rank(item: tuple[str, str]) -> tuple[int, int]:
+        name = item[0]
+        canonical = ("." not in name) and name.endswith("_spot_daily")
+        return (0 if canonical else 1, len(name))
+    series, entity = min(candidates, key=_canonical_rank)
+    name_entity = next(
+        (tok for tok in _series_resolver_tokens(series) if tok != "spot"),
+        entity,
+    )
+    matched_tokens = [
+        name_entity if name_entity == entity else f"{name_entity}~{entity}",
+        "spot~asset",
+    ]
+    return {
+        "series": series,
+        "score": 1.0,
+        "matched_tokens": matched_tokens,
+        "full_coverage": True,
+        "unmatched_name_tokens": [],
+        "why": (
+            f"matched unique spot catalog series {series} from asset phrase: "
+            + ", ".join(matched_tokens)
+        ),
+    }
+
+
+def _horizon_to_int_for_spec(value: int | str) -> int:
+    if isinstance(value, int):
+        return max(1, value)
+    m = re.search(r"\d+", str(value or ""))
+    return max(1, int(m.group(0))) if m else 1
+
+
+def _trim_series_phrase(text: str) -> str:
+    # Keep commas: a series is often named in an appositive clause ("the inflation channel, measured by
+    # CPI repricing on KXCPI contracts") whose identifying tokens sit AFTER the comma. Truncating at the
+    # comma dropped them and left an unresolvable head. The resolver scores by token coverage (extra words
+    # are harmless) and BIND-1's measurement-conflict gate guards against a wrong bind, so keeping the full
+    # clause up to sentence-ending punctuation is safe and recovers paraphrase predictors.
+    phrase = re.split(r"[.;:()\[\]\n]", str(text or ""), maxsplit=1)[0]
+    phrase = _RELATION_TRAILING_CUES_RE.sub("", phrase)
+    phrase = re.sub(
+        r"\b(?:for|over|at)\s+(?:the\s+)?(?:next\s+)?\d+\s*[- ]?"
+        r"(?:d|day|days|period|periods|week|weeks|month|months|quarter|quarters|year|years)"
+        r"(?:\s+(?:horizon|ahead|forward|future))?\b",
+        "",
+        phrase,
+        flags=re.IGNORECASE,
+    )
+    phrase = _HORIZON_PREFIX_RE.sub("", phrase)
+    return " ".join(phrase.split()).strip(" -")
+
+
+def _derived_base_phrase(description: str, match: re.Match) -> str:
+    before = _trim_series_phrase(description[:match.start()])
+    after = _trim_series_phrase(description[match.end():])
+    m = re.match(r"^\s*(?:of|for|on|in)\s+(.+)$", after, flags=re.IGNORECASE)
+    if m:
+        return _trim_series_phrase(m.group(1))
+    if before:
+        return before
+    return after
+
+
+def resolve_derived_series(description: str, catalog_names: list[str],
+                           horizon: int | str) -> dict | None:
+    """Resolve prose describing a deterministic derived series."""
+    text = str(description or "")
+    horizon_int = _horizon_to_int_for_spec(horizon)
+    for transform, pattern in (
+        ("realized_vol", r"\b(?:realized\s+vol(?:atility)?|rv)\b"),
+        ("log_returns", r"\blog\s+returns?\b"),
+        ("returns", r"\breturns?\b"),
+    ):
+        m = re.search(pattern, text, flags=re.IGNORECASE)
+        if not m:
+            continue
+        base_phrase = _derived_base_phrase(text, m)
+        base = (
+            resolve_series_from_prose(base_phrase, catalog_names)
+            or _resolve_spot_alias_from_prose(base_phrase, catalog_names)
+        )
+        if base is None:
+            continue
+        out = {
+            "kind": "derived_series",
+            "transform": transform,
+            "base_series": base["series"],
+            "why": f"{transform} derived from {base['series']}; {base['why']}",
+            "base_resolution": base,
+            "full_coverage": bool(base.get("full_coverage")),
+            "unmatched_name_tokens": list(base.get("unmatched_name_tokens") or []),
+        }
+        if transform == "realized_vol":
+            out["window"] = horizon_int
+            out["horizon_encoded"] = True
+        return out
+    return None
+
 
 def _series_text_units(text: str) -> list[str]:
     """Text units for the decision-exclusion scan. Split on BLANK-line paragraph
@@ -365,6 +895,45 @@ def _declared_series_from_text(claim: Claim, source: IngestedSource | None = Non
             if n and re.search(rf"(?<![A-Za-z0-9_]){re.escape(n)}(?![A-Za-z0-9_])", unit)
         )
     return sorted(matched)
+
+
+def _literal_series_in_text(text: str, catalog_names: list[str]) -> str:
+    for name in sorted(catalog_names):
+        if name and re.search(rf"(?<![A-Za-z0-9_]){re.escape(name)}(?![A-Za-z0-9_])", text):
+            return name
+    return ""
+
+
+def _predictive_relation_phrases(claim: Claim, source: IngestedSource | None = None) -> tuple[str, str, str]:
+    texts = [
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ]
+    combined = " ".join(t for t in texts if t)
+    for raw in texts + [combined]:
+        if not raw:
+            continue
+        m = _RELATION_VERBS_RE.search(raw)
+        if not m:
+            continue
+        left = raw[:m.start()]
+        right = raw[m.end():]
+        left_units = re.split(r"[.;:\n]", left)
+        predictor = _trim_series_phrase(left_units[-1] if left_units else left)
+        target = _trim_series_phrase(right)
+        if predictor and target:
+            return predictor, target, raw
+    return "", "", combined
+
+
+def _catalog_names() -> list[str]:
+    try:
+        catalog = load_catalog_loader(config.DATA_DIR)
+        return list(catalog.available()) if hasattr(catalog, "available") else []
+    except Exception:  # noqa: BLE001
+        return []
 
 
 def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
@@ -421,6 +990,1190 @@ def _provided_series_stat_spec(claim: Claim, source: IngestedSource) -> dict:
             "Deterministically generated (no LLM) for a provided-series-statistics claim: this "
             "claim type is a mechanical translation, not a creative one -- preserve the stated "
             "decision rule exactly."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _predictive_horizon_from_text(claim: Claim) -> int | str:
+    text = " ".join([
+        getattr(claim, "horizon", "") or "",
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(claim, "source_span", "") or "",
+    ]).lower()
+    for pat in (
+        r"\b(\d+)\s*(?:d|day|days|period|periods)[- ]ahead\b",
+        r"\bh\s*=\s*(\d+)\b",
+        r"\b(\d+)\s*(?:d|day|days)\s+horizon\b",
+    ):
+        m = re.search(pat, text)
+        if m:
+            return int(m.group(1))
+    return (getattr(claim, "horizon", "") or "1").strip() or 1
+
+
+def _declared_statistic_from_text(claim: Claim) -> str:
+    text = " ".join([
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "source_span", "") or "",
+    ])
+    cues = []
+    for pat, label in (
+        (r"\bt\s*[-=]\s*-?\d+(?:\.\d+)?\b|\bt[- ]stat(?:istic)?\b", "t_statistic"),
+        (r"\br\s*(?:\^2|2)\b|\br-squared\b", "r2"),
+        (r"\bmsfe\b", "msfe"),
+        (r"\bcoefficient\b|\bbeta\b", "coefficient"),
+        (r"\bsign\b|negative|positive", "directional_sign"),
+    ):
+        if re.search(pat, text, flags=re.IGNORECASE):
+            cues.append(label)
+    return ", ".join(cues) if cues else "directional predictive relationship"
+
+
+def _predictive_declared_search_grid(claim: Claim) -> dict:
+    text = " ".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(claim, "source_span", "") or "",
+    ]).lower()
+    widths = []
+    for pat in (
+        r"\b(\d+)\s*[- ]?(?:coin|coins|asset|assets|market|markets)\b",
+        r"\b(\d+)\s*[- ]?(?:spec|specification|specifications|model|models)\b",
+        r"\b(?:search|grid|tested across|across)\s+(\d+)\b",
+    ):
+        for m in re.finditer(pat, text):
+            try:
+                widths.append(int(m.group(1)))
+            except ValueError:
+                pass
+    total = 1
+    for width in widths:
+        if 1 < width <= 10000:
+            total *= width
+    if total <= 1:
+        return {}
+    return {"declared_regression_search": list(range(min(total, 10000)))}
+
+
+def _factor_spanning_text(claim: Claim, source: IngestedSource | None = None) -> str:
+    return "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+
+
+def _factor_benchmark_set_from_text(text: str) -> str:
+    low = str(text or "").lower()
+    if re.search(r"\bff\s*5\b|\bfama[- ]french\s+5\b|\bfive[- ]factor\b|\brmw\b|\bcma\b", low):
+        return "ff5"
+    if re.search(r"\bcarhart\b", low):
+        return "carhart"
+    if re.search(r"\bff\s*3\b|\bfama[- ]french\s+3\b|\bthree[- ]factor\b|\bsmb\b|\bhml\b", low):
+        return "ff3"
+    if re.search(r"\bcapm\b|\bmarket\s+factor\b|\bmkt[- ]rf\b", low):
+        return "capm"
+    return "ff3"
+
+
+def _factor_benchmark_series(benchmark_set: str) -> list[str]:
+    return {
+        "capm": ["us_equity_ff3_mkt_rf"],
+        "ff3": ["us_equity_ff3_mkt_rf", "us_equity_ff3_smb", "us_equity_ff3_hml"],
+        "ff5": [
+            "us_equity_ff5_mkt_rf",
+            "us_equity_ff5_smb",
+            "us_equity_ff5_hml",
+            "us_equity_ff5_rmw",
+            "us_equity_ff5_cma",
+        ],
+        "carhart": [
+            "us_equity_ff3_mkt_rf",
+            "us_equity_ff3_smb",
+            "us_equity_ff3_hml",
+            "us_equity_momentum_wml",
+        ],
+    }.get(benchmark_set, [])
+
+
+def _factor_candidate_phrase(claim: Claim, source: IngestedSource | None = None) -> str:
+    texts = [
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ]
+    combined = " ".join(t for t in texts if t)
+    patterns = (
+        r"(?P<candidate>.+?)\s+(?:earns?|has|delivers?|shows?)\s+(?:a\s+)?(?:positive\s+)?alpha\b",
+        r"(?:alpha|intercept)\s+(?:of|for)\s+(?P<candidate>.+?)\s+(?:after|controlling|net\b)",
+        r"regress(?:ing|ion)?\s+(?P<candidate>.+?)\s+on\s+.+?\bfactors?\b",
+    )
+    for raw in texts + [combined]:
+        if not raw:
+            continue
+        for pat in patterns:
+            m = re.search(pat, raw, flags=re.IGNORECASE)
+            if m:
+                return _trim_series_phrase(m.group("candidate"))
+    return _trim_series_phrase(combined)
+
+
+def _factor_declared_statistic_from_text(claim: Claim) -> str:
+    text = _factor_spanning_text(claim)
+    cues = []
+    for pat, label in (
+        (r"\bt\s*[-=]\s*-?\d+(?:\.\d+)?\b|\bt[- ]stat(?:istic)?\b", "alpha_t_stat"),
+        (r"\bintercept\b", "intercept"),
+        (r"\balpha\b", "alpha"),
+        (r"\br\s*(?:\^2|2)\b|\br-squared\b", "r2"),
+    ):
+        if re.search(pat, text, flags=re.IGNORECASE):
+            cues.append(label)
+    return ", ".join(cues) if cues else "alpha_t_stat"
+
+
+def _factor_declared_search_grid(claim: Claim, benchmark_set: str) -> dict:
+    text = _factor_spanning_text(claim).lower()
+    grid: dict[str, list] = {}
+    candidate_counts = []
+    for pat in (
+        r"\b(\d+)\s*[- ]?(?:candidate\s+)?factors?\b",
+        r"\b(\d+)\s*[- ]?(?:anomal(?:y|ies)|signals?)\b",
+        r"\b(?:search|grid|tested across|across)\s+(\d+)\b",
+    ):
+        for m in re.finditer(pat, text):
+            try:
+                candidate_counts.append(int(m.group(1)))
+            except ValueError:
+                pass
+    if candidate_counts:
+        n = max(1, min(max(candidate_counts), 10000))
+        if n > 1:
+            grid["candidate_factors"] = list(range(n))
+    declared_sets = []
+    for name, pat in (
+        ("capm", r"\bcapm\b"),
+        ("ff3", r"\bff\s*3\b|\bfama[- ]french\s+3\b|\bthree[- ]factor\b"),
+        ("ff5", r"\bff\s*5\b|\bfama[- ]french\s+5\b|\bfive[- ]factor\b"),
+        ("carhart", r"\bcarhart\b"),
+    ):
+        if re.search(pat, text):
+            declared_sets.append(name)
+    if not declared_sets:
+        declared_sets = [benchmark_set]
+    if len(declared_sets) > 1:
+        grid["benchmark_sets"] = declared_sets
+    return grid
+
+
+def _factor_spanning_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for factor-spanning claims."""
+    full_text = _factor_spanning_text(claim, source)
+    catalog_names = _catalog_names()
+    benchmark_set = _factor_benchmark_set_from_text(full_text)
+    benchmark_factors = _factor_benchmark_series(benchmark_set)
+    candidate_phrase = _factor_candidate_phrase(claim, source)
+    binding_provenance: dict[str, dict] = {}
+    benchmark_set_prov = {
+        "kind": "benchmark_set",
+        "benchmark_set": benchmark_set,
+        "series": list(benchmark_factors),
+        "description": benchmark_set,
+        "score": 1.0,
+        "confirmed": True,
+        "why": f"declared benchmark family resolved to {benchmark_set}",
+    }
+    binding_provenance["benchmark_set"] = benchmark_set_prov
+    for name in benchmark_factors:
+        binding_provenance[name] = {
+            "kind": "default_benchmark",
+            "series": name,
+            "score": 1.0,
+            "confirmed": True,
+            "why": f"default {benchmark_set} benchmark factor",
+        }
+
+    benchmark_set_names = set(benchmark_factors)
+    candidate = _literal_series_in_text(candidate_phrase, catalog_names)
+    if candidate in benchmark_set_names:
+        candidate = ""
+    if candidate:
+        binding_provenance["candidate_factor"] = {
+            "kind": "literal",
+            "series": candidate,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(candidate),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": candidate_phrase,
+            "why": f"literal catalog series {candidate} appeared in candidate phrase",
+        }
+    else:
+        candidate_resolution = (
+            resolve_series_from_prose(candidate_phrase, catalog_names)
+            or resolve_series_from_prose(full_text, catalog_names)
+        )
+        if candidate_resolution and candidate_resolution.get("series") not in benchmark_set_names:
+            candidate = candidate_resolution["series"]
+            binding_provenance["candidate_factor"] = {
+                "kind": "prose",
+                "description": candidate_phrase,
+                **candidate_resolution,
+            }
+    if not candidate:
+        binding_provenance["candidate_factor"] = {
+            "kind": "unresolved",
+            "description": candidate_phrase,
+            "confirmed": False,
+            "why": "candidate factor prose did not resolve to a catalog series",
+        }
+
+    inputs = ([candidate] if candidate else []) + benchmark_factors
+    statistic = _factor_declared_statistic_from_text(claim)
+    param_grid = _factor_declared_search_grid(claim, benchmark_set)
+    unknowns = []
+    if not candidate:
+        unknowns.append(
+            "candidate factor series was not resolved from literal/prose bindings; "
+            "operator must confirm candidate_factor"
+        )
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "factor_spanning",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "factor_spanning",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            f"Deterministic factor-spanning test: regress candidate factor F on the declared "
+            f"{benchmark_set.upper()} benchmark factors using the in-sample prefix only, freeze "
+            "the beta vector, and test whether the benchmark-hedged residual alpha survives "
+            "OOS and holdout through the normal P7/P8 stack."
+        ),
+        "inputs": inputs,
+        "candidate_factor": candidate,
+        "benchmark_set": benchmark_set,
+        "benchmark_factors": benchmark_factors,
+        "binding_provenance": binding_provenance,
+        "estimator": "multivariate_ols_is_frozen_betas",
+        "statistic": statistic,
+        "param_grid": param_grid,
+        "signal_logic": (
+            "factor_spanning: fit F_t = alpha + beta'B_t on IS only; emit "
+            "F_t - beta_IS'B_t as net residual alpha; no trading overlay"
+        ),
+        "kill_criterion": (
+            "OOS/holdout residual alpha fails, 3-fold sign stability fails, or the deflated "
+            "alpha statistic fails the verdict band"
+        ),
+        "expected_data_needs": "candidate and benchmark factor return Series on a common DatetimeIndex",
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Use plain Series only. "
+            "Freeze all benchmark betas on the in-sample prefix and never refit on OOS "
+            "or holdout rows. bars_per_year is the emitted factor-return observation rate."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _cross_sectional_text(claim: Claim, source: IngestedSource | None = None) -> str:
+    return "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+
+
+def _cross_sectional_characteristic_from_text(text: str) -> str:
+    patterns = (
+        r"\bsort(?:ed|s|ing)?\s+(?:stocks?|assets?|firms?|entities|securities)?\s*(?:by|on)\s+(?P<c>[^.;,()]+)",
+        r"\brank(?:ed|s|ing)?\s+(?:stocks?|assets?|firms?|entities|securities)?\s*(?:by|on)\s+(?P<c>[^.;,()]+)",
+        r"\b(?P<c>book[- ]to[- ]market|momentum|size|market\s+cap(?:italization)?|quality|profitability|investment|accruals?|asset\s+growth|leverage)\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            phrase = _trim_series_phrase(m.group("c"))
+            phrase = re.split(
+                r"\b(?:into|to\s+form|earns?|earn|has|shows?|delivers?|produces?|with)\b",
+                phrase,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            return phrase.strip(" -")
+    return ""
+
+
+def _safe_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", str(text or "").lower()).strip("_") or "characteristic"
+
+
+_BUCKET_WORDS = [
+    (r"\bdecile(?:s)?\b|\btop\s+10%\b|\bbottom\s+10%\b", 10),
+    (r"\bvigintile(?:s)?\b|\btop\s+5%\b|\bbottom\s+5%\b", 20),
+    (r"\boctile(?:s)?\b", 8),
+    (r"\bsextile(?:s)?\b", 6),
+    (r"\bquintile(?:s)?\b|\btop\s+20%\b|\bbottom\s+20%\b", 5),
+    (r"\bquartile(?:s)?\b|\btop\s+25%\b|\bbottom\s+25%\b", 4),
+    (r"\btercile(?:s)?\b|\btertile(?:s)?\b|\btop\s+third\b|\bbottom\s+third\b", 3),
+]
+
+
+def _claimed_bucket_count(text: str) -> int | None:
+    """The bucket scheme the claim EXPLICITLY names, or None if it names none (so silence never triggers a
+    substitution rejection in the fidelity correspondence check)."""
+    low = str(text or "").lower()
+    for pat, n in _BUCKET_WORDS:
+        if re.search(pat, low):
+            return n
+    m = re.search(r"\b(\d+)\s+(?:bucket|portfolio|group|fractile)s?\b", low)
+    if m:
+        try:
+            return max(2, int(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
+def _claimed_rebalance(text: str) -> str | None:
+    """The rebalance cadence the claim EXPLICITLY names, or None if silent."""
+    low = str(text or "").lower()
+    if re.search(r"\bmonthly\b|\beach\s+month\b", low):
+        return "ME"
+    if re.search(r"\bquarterly\b|\beach\s+quarter\b", low):
+        return "QE"
+    if re.search(r"\bannually\b|\byearly\b|\beach\s+year\b|\bannual\s+rebalanc", low):
+        return "YE"
+    if re.search(r"\bweekly\b|\beach\s+week\b", low):
+        return "W"
+    if re.search(r"\bdaily\b|\beach\s+day\b", low):
+        return "D"
+    return None
+
+
+def _cross_sectional_n_buckets(text: str) -> int:
+    return _claimed_bucket_count(text) or 10
+
+
+def _cross_sectional_rebalance(text: str) -> str:
+    return _claimed_rebalance(text) or "ME"
+
+
+def _cross_sectional_declared_search_grid(claim: Claim, n_buckets: int) -> dict:
+    text = _cross_sectional_text(claim).lower()
+    grid: dict[str, list] = {}
+    bucket_counts = []
+    if re.search(r"\bdecile", text):
+        bucket_counts.append(10)
+    if re.search(r"\bquintile", text):
+        bucket_counts.append(5)
+    for m in re.finditer(r"\b(\d+)\s+(?:bucket|portfolio|group|fractile)s?\b", text):
+        try:
+            bucket_counts.append(max(2, int(m.group(1))))
+        except ValueError:
+            pass
+    bucket_counts = sorted(set(bucket_counts))
+    if len(bucket_counts) > 1:
+        grid["n_buckets"] = bucket_counts
+    elif bucket_counts and bucket_counts[0] != n_buckets:
+        grid["n_buckets"] = [n_buckets, bucket_counts[0]]
+
+    characteristic_counts = []
+    for pat in (
+        r"\b(\d+)\s*(?:candidate\s+)?characteristics?\b",
+        r"\b(\d+)\s*(?:anomal(?:y|ies)|signals?)\b",
+        r"\b(?:search|grid|tested across|across)\s+(\d+)\b",
+    ):
+        for m in re.finditer(pat, text):
+            try:
+                characteristic_counts.append(int(m.group(1)))
+            except ValueError:
+                pass
+    if characteristic_counts:
+        n = max(1, min(max(characteristic_counts), 10000))
+        if n > 1:
+            grid["characteristics"] = list(range(n))
+    return grid
+
+
+def _cross_sectional_sort_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for cross-sectional sort claims."""
+    full_text = _cross_sectional_text(claim, source)
+    characteristic = _cross_sectional_characteristic_from_text(full_text)
+    n_buckets = _cross_sectional_n_buckets(full_text)
+    rebalance = _cross_sectional_rebalance(full_text)
+    hold = "1M" if rebalance in {"ME", "M"} else "1Q" if rebalance in {"QE", "Q"} else "1Y" if rebalance in {"YE", "Y"} else rebalance
+    returns_table = "returns_panel"
+    characteristic_key = _safe_key(characteristic) if characteristic else "characteristic"
+    characteristic_table = f"{characteristic_key}_panel"
+    binding_provenance = {
+        "returns_panel": {
+            "kind": "declared_panel",
+            "panel": returns_table,
+            "confirmed": False,
+            "why": "returns panel table must be supplied by the operator/catalog",
+        },
+        "characteristic": {
+            "kind": "prose" if characteristic else "unresolved",
+            "description": characteristic or "unresolved characteristic",
+            "characteristic": characteristic,
+            "confirmed": bool(characteristic),
+            "why": (
+                "characteristic phrase extracted from the structural sort claim"
+                if characteristic else
+                "characteristic prose did not resolve"
+            ),
+        },
+        "characteristic_panel": {
+            "kind": "declared_panel",
+            "panel": characteristic_table,
+            "confirmed": False,
+            "why": "point-in-time characteristic panel table must be supplied by the operator/catalog",
+        },
+    }
+    unknowns = [
+        "returns and characteristic panel tables must be confirmed; returns must declare survivorship=corrected"
+    ]
+    if not characteristic:
+        unknowns.append("characteristic was not resolved from the sort claim")
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "cross_sectional_sort",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "cross_sectional_sort",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic cross-sectional sort test: sort the declared entity universe by "
+            f"{characteristic or 'the declared characteristic'} at each {rebalance} rebalance, "
+            f"form the top-minus-bottom {n_buckets}-bucket spread using only characteristics "
+            "known as of the rebalance date, and send that spread through P7/P8."
+        ),
+        "inputs": [],
+        "panel_inputs": {
+            "returns": {"table": returns_table, "survivorship": "corrected"},
+            "characteristic": {"table": characteristic_table},
+        },
+        "characteristic": characteristic,
+        "n_buckets": n_buckets,
+        "rebalance": rebalance,
+        "hold": hold,
+        "binding_provenance": binding_provenance,
+        "estimator": "characteristic_sorted_top_minus_bottom",
+        "statistic": "mean_spread",
+        "param_grid": _cross_sectional_declared_search_grid(claim, n_buckets),
+        "signal_logic": (
+            "cross_sectional_sort: form_factor(returns_panel, characteristic_panel, "
+            "n_buckets, rebalance, hold); no trading overlay"
+        ),
+        "kill_criterion": (
+            "OOS/holdout top-minus-bottom spread fails, 3-fold sign stability fails, "
+            "or the deflated spread statistic fails the verdict band"
+        ),
+        "expected_data_needs": (
+            "survivorship-corrected returns Panel and point-in-time characteristic Panel "
+            "with dates x entity columns"
+        ),
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Reuse data.xsection.form_factor; "
+            "it ranks using sig.loc[:rebalance] only. The returns panel must retain delisted "
+            "entities during their live windows."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _event_study_text(claim: Claim, source: IngestedSource | None = None) -> str:
+    return "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+
+
+def _claimed_event_window(text: str) -> tuple[int, int] | None:
+    """Return the event window explicitly named by the claim, or None if silent."""
+    low = str(text or "").lower()
+    for pat in (
+        r"\[\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\]\s*(?:day|days)?\s*window",
+        r"window\s*\[\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\]",
+        r"\bevent\s+window\s*(?:of|=|:)?\s*\[\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\]",
+    ):
+        m = re.search(pat, low)
+        if m:
+            start, end = int(m.group(1)), int(m.group(2))
+            if start <= end:
+                return start, end
+    m = re.search(r"\b(?:over|during)\s+(?:the\s+)?(\d+)\s*(?:day|trading[- ]day)s?\s+after\b", low)
+    if m:
+        return 0, max(0, int(m.group(1)) - 1)
+    return None
+
+
+def _claimed_baseline(text: str) -> str | None:
+    """Return the baseline explicitly named by the claim, or None if silent."""
+    low = str(text or "").lower()
+    if re.search(r"\bmarket[- ]model\b|\bmarket\s+adjusted\b|\bcapm[- ]adjusted\b", low):
+        return "market_model"
+    if re.search(r"\bmean[- ]adjusted\b|\bconstant[- ]mean\b|\bhistorical\s+mean\b", low):
+        return "mean_adjusted"
+    return None
+
+
+def _event_estimation_window(text: str) -> int:
+    low = str(text or "").lower()
+    for pat in (
+        r"\bestimation\s+window\s*(?:of|=|:)?\s*(\d+)",
+        r"\b(\d+)\s*(?:day|trading[- ]day)s?\s+estimation\s+window\b",
+        r"\busing\s+(\d+)\s*(?:pre[- ]event|prior)\s*(?:day|trading[- ]day)s?\b",
+    ):
+        m = re.search(pat, low)
+        if m:
+            return max(5, int(m.group(1)))
+    return 60
+
+
+def _event_return_phrase(claim: Claim, source: IngestedSource | None = None) -> str:
+    texts = [
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ]
+    for raw in texts:
+        if not raw:
+            continue
+        m = re.search(
+            r"\babnormal\s+returns?\s+(?:of|for|on)\s+(?P<asset>[^.;,()\[\]]+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return _trim_series_phrase(m.group("asset"))
+    return _trim_series_phrase(" ".join(t for t in texts if t))
+
+
+def _event_calendar_phrase(text: str) -> str:
+    patterns = (
+        r"\b(?P<event>earnings\s+announcements?|fomc\s+announcements?|index\s+additions?|halvings?|listings?)\b",
+        r"\b(?:around|following|after)\s+(?P<event>[^.;,()\[\]]+?)\s+(?:events?|announcements?)\b",
+        r"\b(?P<event>[^.;,()\[\]]+?)\s+(?:event\s+calendar|events?|announcements?)\b",
+    )
+    for pat in patterns:
+        m = re.search(pat, text, flags=re.IGNORECASE)
+        if m:
+            return _trim_series_phrase(m.group("event"))
+    return "event_calendar"
+
+
+def _event_declared_search_grid(claim: Claim, window: tuple[int, int], baseline: str) -> dict:
+    text = _event_study_text(claim).lower()
+    grid: dict[str, list] = {}
+    windows = []
+    for m in re.finditer(r"\[\s*([+-]?\d+)\s*,\s*([+-]?\d+)\s*\]", text):
+        start, end = int(m.group(1)), int(m.group(2))
+        if start <= end:
+            windows.append([start, end])
+    windows = [w for i, w in enumerate(windows) if w not in windows[:i]]
+    if len(windows) > 1:
+        grid["windows"] = windows
+    baselines = []
+    if re.search(r"\bmean[- ]adjusted\b|\bconstant[- ]mean\b|\bhistorical\s+mean\b", text):
+        baselines.append("mean_adjusted")
+    if re.search(r"\bmarket[- ]model\b|\bmarket\s+adjusted\b|\bcapm[- ]adjusted\b", text):
+        baselines.append("market_model")
+    baselines = [b for i, b in enumerate(baselines) if b not in baselines[:i]]
+    if len(baselines) > 1:
+        grid["baselines"] = baselines
+    event_counts = []
+    for pat in (
+        r"\b(\d+)\s*(?:event\s+)?windows?\b",
+        r"\b(\d+)\s*baselines?\b",
+        r"\b(?:search|grid|tested across|across)\s+(\d+)\b",
+    ):
+        for m in re.finditer(pat, text):
+            event_counts.append(max(1, min(int(m.group(1)), 10000)))
+    if event_counts and max(event_counts) > 1:
+        grid["declared_event_study_specs"] = list(range(max(event_counts)))
+    if not grid and (list(window) != [0, 5] or baseline != "mean_adjusted"):
+        return {}
+    return grid
+
+
+def _event_study_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for event-study claims."""
+    full_text = _event_study_text(claim, source)
+    catalog_names = _catalog_names()
+    return_phrase = _event_return_phrase(claim, source)
+    binding_provenance: dict[str, dict] = {}
+    return_series = _literal_series_in_text(return_phrase, catalog_names)
+    if return_series:
+        binding_provenance["return_series"] = {
+            "kind": "literal",
+            "series": return_series,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(return_series),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": return_phrase,
+            "why": f"literal catalog series {return_series} appeared in return-series phrase",
+        }
+    else:
+        resolution = (
+            resolve_series_from_prose(return_phrase, catalog_names)
+            or resolve_series_from_prose(full_text, catalog_names)
+        )
+        if resolution:
+            return_series = resolution["series"]
+            binding_provenance["return_series"] = {
+                "kind": "prose",
+                "description": return_phrase,
+                **resolution,
+            }
+    if not return_series:
+        binding_provenance["return_series"] = {
+            "kind": "unresolved",
+            "description": return_phrase,
+            "confirmed": False,
+            "why": "return-series prose did not resolve to a catalog series",
+        }
+
+    window = _claimed_event_window(full_text) or (0, 5)
+    baseline = _claimed_baseline(full_text) or "mean_adjusted"
+    estimation_window = _event_estimation_window(full_text)
+    calendar_phrase = _event_calendar_phrase(full_text)
+    calendar_table = f"{_safe_key(calendar_phrase)}_event_calendar"
+    binding_provenance["event_calendar"] = {
+        "kind": "declared_table",
+        "table": calendar_table,
+        "description": calendar_phrase,
+        "confirmed": False,
+        "why": "event calendar table must be supplied by the operator/catalog",
+    }
+    inputs = [return_series] if return_series else []
+    market_series = ""
+    if baseline == "market_model":
+        market_series = _literal_series_in_text(full_text, catalog_names)
+        if market_series and market_series == return_series:
+            market_series = ""
+        if market_series:
+            inputs.append(market_series)
+    unknowns = ["event calendar table must be confirmed and supplied with a date column"]
+    if not return_series:
+        unknowns.append("return series was not resolved from literal/prose bindings")
+    if baseline == "market_model" and not market_series:
+        unknowns.append("market_model baseline requires a market_series binding")
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "event_study",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "event_study",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic event-study test: estimate the declared baseline strictly "
+            "before each event, compute abnormal returns over the declared event window, "
+            "emit one CAR observation per event, and test average CAR through P7/P8."
+        ),
+        "inputs": inputs,
+        "return_series": return_series,
+        "event_calendar": {"table": calendar_table, "date_col": "date"},
+        "window": list(window),
+        "estimation_window": int(estimation_window),
+        "baseline": baseline,
+        "market_series": market_series,
+        "binding_provenance": binding_provenance,
+        "statistic": "average_car",
+        "param_grid": _event_declared_search_grid(claim, window, baseline),
+        "signal_logic": (
+            "event_study: fit mean_adjusted or market_model baseline on rows strictly "
+            "before event date; emit CAR_e over window; no trading overlay"
+        ),
+        "kill_criterion": (
+            "OOS/holdout average CAR fails, 3-fold sign stability fails, or the deflated "
+            "CAR statistic fails the verdict band"
+        ),
+        "expected_data_needs": "return Series plus declared event-calendar table with a date column",
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Baseline estimation uses "
+            "only the fixed pre-event window ending strictly before the event date. "
+            "bars_per_year is events per year, not 252 calendar bars."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _forecast_skill_text(claim: Claim, source: IngestedSource | None = None) -> str:
+    return "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+
+
+def _forecast_skill_phrases(claim: Claim, source: IngestedSource | None = None) -> tuple[str, str, str, str]:
+    texts = [
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ]
+    combined = " ".join(t for t in texts if t)
+    model_phrase = ""
+    target_phrase = ""
+    benchmark_phrase = ""
+    for raw in texts + [combined]:
+        if not raw:
+            continue
+        m = re.search(
+            r"(?P<model>[^.;:\n]+?)\s+(?:forecasts?|predicts?|prediction\s+of)\s+"
+            r"(?P<target>[^.;:\n]+?)\s+(?:better\s+than|beats?|outperforms?|relative\s+to|against)\s+"
+            r"(?P<bench>[^.;:\n]+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return (
+                _trim_series_phrase(m.group("model")),
+                _trim_series_phrase(m.group("target")),
+                _trim_series_phrase(m.group("bench")),
+                raw,
+            )
+        m = re.search(
+            r"(?P<model>[^.;:\n]+?)\s+(?:beats?|outperforms?)\s+(?:the\s+)?"
+            r"(?P<bench>random[- ]walk|benchmark|naive|historical\s+mean)[^.;:\n]*?"
+            r"(?:forecast(?:s|ing)?|for|on|of)\s+(?P<target>[^.;:\n]+)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            return (
+                _trim_series_phrase(m.group("model")),
+                _trim_series_phrase(m.group("target")),
+                _trim_series_phrase(m.group("bench")),
+                raw,
+            )
+        if not target_phrase:
+            m = re.search(
+                r"(?:forecast(?:s|ing)?|predict(?:s|ing)?)\s+(?P<target>[^.;:\n]+?)\s+"
+                r"(?:out[- ]of[- ]sample|oos|with|using|by)\b",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                target_phrase = _trim_series_phrase(m.group("target"))
+    if not model_phrase:
+        model_phrase = _trim_series_phrase(combined)
+    if not target_phrase:
+        target_phrase = _trim_series_phrase(combined)
+    return model_phrase, target_phrase, benchmark_phrase or combined, combined
+
+
+def _forecast_benchmark_method(text: str) -> str:
+    low = str(text or "").lower()
+    if re.search(r"\bhistorical\s+mean\b|\bexpanding\s+mean\b", low):
+        return "historical_mean"
+    if re.search(r"\brandom[- ]walk\b|\bnaive\b|\bpersistence\b|\blast\s+value\b", low):
+        return "random_walk"
+    return ""
+
+
+def _forecast_declared_statistic_from_text(claim: Claim) -> str:
+    text = _forecast_skill_text(claim)
+    cues = []
+    for pat, label in (
+        (r"\bdiebold[- ]mariano\b", "diebold_mariano"),
+        (r"\bclark[- ]west\b", "clark_west"),
+        (r"\bmsfe\b", "msfe"),
+        (r"\bmspe\b", "mspe"),
+        (r"\brmse\b", "rmse"),
+        (r"\bout[- ]of[- ]sample\s+r\s*(?:\^2|2)\b|\boos\s+r\s*(?:\^2|2)\b", "oos_r2"),
+    ):
+        if re.search(pat, text, flags=re.IGNORECASE):
+            cues.append(label)
+    return ", ".join(cues) if cues else "loss_differential_mean"
+
+
+def _forecast_declared_search_grid(claim: Claim, benchmark_method: str, explicit_benchmark: str) -> dict:
+    text = _forecast_skill_text(claim).lower()
+    grid: dict[str, list] = {}
+    counts = []
+    for pat in (
+        r"\b(\d+)\s*[- ]?(?:forecasting\s+)?models?\b",
+        r"\b(\d+)\s*[- ]?(?:spec|specification|specifications)\b",
+        r"\b(?:search|grid|tested across|across)\s+(\d+)\b",
+    ):
+        for m in re.finditer(pat, text):
+            counts.append(max(1, min(int(m.group(1)), 10000)))
+    if counts and max(counts) > 1:
+        grid["declared_forecast_models"] = list(range(max(counts)))
+    benchmarks = []
+    if explicit_benchmark:
+        benchmarks.append(explicit_benchmark)
+    if benchmark_method:
+        benchmarks.append(benchmark_method)
+    if re.search(r"\brandom[- ]walk\b|\bnaive\b|\bpersistence\b", text) and "random_walk" not in benchmarks:
+        benchmarks.append("random_walk")
+    if re.search(r"\bhistorical\s+mean\b|\bexpanding\s+mean\b", text) and "historical_mean" not in benchmarks:
+        benchmarks.append("historical_mean")
+    if len(benchmarks) > 1:
+        grid["benchmarks"] = benchmarks
+    return grid
+
+
+def _forecast_skill_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for forecast-skill claims."""
+    full_text = _forecast_skill_text(claim, source)
+    catalog_names = _catalog_names()
+    model_phrase, target_phrase, benchmark_phrase, relation_text = _forecast_skill_phrases(claim, source)
+    binding_provenance: dict[str, dict] = {}
+
+    model_forecast = _literal_series_in_text(model_phrase, catalog_names)
+    if model_forecast:
+        binding_provenance["model_forecast"] = {
+            "kind": "literal",
+            "series": model_forecast,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(model_forecast),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": model_phrase,
+            "why": f"literal catalog series {model_forecast} appeared in model-forecast phrase",
+        }
+    else:
+        model_resolution = (
+            resolve_series_from_prose(model_phrase, catalog_names)
+            or _resolve_signal_alias_from_prose(model_phrase, catalog_names)
+            or resolve_series_from_prose(relation_text, catalog_names)
+            or _resolve_signal_alias_from_prose(relation_text, catalog_names)
+        )
+        if model_resolution:
+            model_forecast = model_resolution["series"]
+            binding_provenance["model_forecast"] = {
+                "kind": "prose",
+                "description": model_phrase,
+                **model_resolution,
+            }
+    if not model_forecast:
+        binding_provenance["model_forecast"] = {
+            "kind": "unresolved",
+            "description": model_phrase,
+            "confirmed": False,
+            "why": "model-forecast prose did not resolve to a catalog series",
+        }
+
+    target = _literal_series_in_text(target_phrase, catalog_names)
+    if target:
+        binding_provenance["target"] = {
+            "kind": "literal",
+            "series": target,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(target),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": target_phrase,
+            "why": f"literal catalog series {target} appeared in target phrase",
+        }
+    else:
+        target_resolution = (
+            resolve_series_from_prose(target_phrase, catalog_names)
+            or resolve_series_from_prose(relation_text, catalog_names)
+            or resolve_series_from_prose(full_text, catalog_names)
+        )
+        if target_resolution:
+            target = target_resolution["series"]
+            binding_provenance["target"] = {
+                "kind": "prose",
+                "description": target_phrase,
+                **target_resolution,
+            }
+    if not target:
+        binding_provenance["target"] = {
+            "kind": "unresolved",
+            "description": target_phrase,
+            "confirmed": False,
+            "why": "target prose did not resolve to a catalog series",
+        }
+
+    benchmark_method = _forecast_benchmark_method(benchmark_phrase or full_text)
+    explicit_benchmark = ""
+    benchmark = {}
+    if not benchmark_method:
+        benchmark_resolution = resolve_series_from_prose(benchmark_phrase, catalog_names)
+        if benchmark_resolution and benchmark_resolution.get("series") not in {model_forecast, target}:
+            explicit_benchmark = benchmark_resolution["series"]
+            binding_provenance["benchmark"] = {
+                "kind": "prose",
+                "description": benchmark_phrase,
+                **benchmark_resolution,
+            }
+    if explicit_benchmark:
+        benchmark = explicit_benchmark
+    elif benchmark_method:
+        benchmark = {"kind": "implied", "method": benchmark_method}
+        binding_provenance["benchmark"] = {
+            "kind": "implied",
+            "method": benchmark_method,
+            "confirmed": True,
+            "why": f"declared implied benchmark resolved to {benchmark_method}",
+        }
+    else:
+        binding_provenance["benchmark"] = {
+            "kind": "unresolved",
+            "description": benchmark_phrase,
+            "confirmed": False,
+            "why": "benchmark must be an explicit series or a declared implied random_walk/historical_mean",
+        }
+
+    inputs = []
+    if model_forecast:
+        inputs.append(model_forecast)
+    if target:
+        inputs.append(target)
+    if explicit_benchmark:
+        inputs.append(explicit_benchmark)
+    unknowns = []
+    if not model_forecast or not target:
+        unknowns.append(
+            "model forecast and target series were not both resolved from literal/prose bindings"
+        )
+    if not benchmark:
+        unknowns.append(
+            "benchmark forecast was not resolved; declare an explicit benchmark series or "
+            "an implied random_walk/historical_mean benchmark"
+        )
+    statistic = _forecast_declared_statistic_from_text(claim)
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "forecast_skill",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "forecast_skill",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic forecast-skill test: compare the declared model forecast F_t "
+            "with the declared benchmark forecast B_t on the declared realized target Y_t, "
+            "emit the squared-loss differential (B_t-Y_t)^2 - (F_t-Y_t)^2, and test "
+            "whether positive forecast skill survives OOS and holdout through P7/P8."
+        ),
+        "inputs": inputs,
+        "model_forecast": model_forecast,
+        "target": target,
+        "benchmark": benchmark,
+        "binding_provenance": binding_provenance,
+        "loss": "squared_error",
+        "statistic": statistic,
+        "param_grid": _forecast_declared_search_grid(claim, benchmark_method, explicit_benchmark),
+        "signal_logic": (
+            "forecast_skill: emit (B_t - Y_t)^2 - (F_t - Y_t)^2 as the loss "
+            "differential; positive means model beats benchmark; no trading overlay"
+        ),
+        "kill_criterion": (
+            "OOS/holdout loss differential fails, 3-fold sign stability fails, or the "
+            "deflated Diebold-Mariano-style statistic fails the verdict band"
+        ),
+        "expected_data_needs": (
+            "model forecast and realized target Series on a common DatetimeIndex; explicit "
+            "benchmark Series only when the claim declares one"
+        ),
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Constructed benchmarks are "
+            "strictly causal: random_walk uses Y.shift(1), historical_mean uses "
+            "expanding_mean(Y).shift(1). v1 uses the DM loss differential; Clark-West for "
+            "nested forecasts is a future refinement."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _predictive_regression_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for predictive-regression claims.
+
+    The template binds claim prose to catalog series only through deterministic,
+    recorded literal/prose/derived-series proposals. The operator can review
+    predictor/target ordering before the trusted deterministic executor runs; no
+    trading overlay or LLM-generated code is introduced.
+    """
+    horizon = _predictive_horizon_from_text(claim)
+    catalog_names = _catalog_names()
+    predictor_phrase, target_phrase, relation_text = _predictive_relation_phrases(claim, source)
+    full_text = "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+    binding_provenance: dict[str, dict] = {}
+
+    predictor = _literal_series_in_text(predictor_phrase, catalog_names)
+    if predictor:
+        binding_provenance["predictor"] = {
+            "kind": "literal",
+            "series": predictor,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(predictor),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": predictor_phrase,
+            "why": f"literal catalog series {predictor} appeared in predictor phrase",
+        }
+    else:
+        predictor_resolution = (
+            resolve_series_from_prose(predictor_phrase, catalog_names)
+            or _resolve_signal_alias_from_prose(predictor_phrase, catalog_names)
+            or resolve_series_from_prose(relation_text, catalog_names)
+            or _resolve_signal_alias_from_prose(relation_text, catalog_names)
+            or resolve_series_from_prose(full_text, catalog_names)
+            or _resolve_signal_alias_from_prose(full_text, catalog_names)
+        )
+        if predictor_resolution:
+            predictor = predictor_resolution["series"]
+            binding_provenance["predictor"] = {
+                "kind": "prose",
+                "description": predictor_phrase,
+                **predictor_resolution,
+            }
+    if not predictor:
+        binding_provenance["predictor"] = {
+            "kind": "unresolved",
+            "description": predictor_phrase,
+            "confirmed": False,
+            "why": "predictor prose did not resolve to a catalog series",
+        }
+
+    target = _literal_series_in_text(target_phrase, catalog_names)
+    if target:
+        binding_provenance["target"] = {
+            "kind": "literal",
+            "series": target,
+            "score": 1.0,
+            "matched_tokens": _series_resolver_tokens(target),
+            "full_coverage": True,
+            "unmatched_name_tokens": [],
+            "description": target_phrase,
+            "why": f"literal catalog series {target} appeared in target phrase",
+        }
+    else:
+        target_resolution = (
+            resolve_derived_series(target_phrase, catalog_names, horizon)
+            or resolve_derived_series(relation_text, catalog_names, horizon)
+            or resolve_derived_series(full_text, catalog_names, horizon)
+        )
+        if target_resolution:
+            target = target_resolution
+            binding_provenance["target"] = {
+                **target_resolution,
+                "kind": "derived",
+                "description": target_phrase,
+            }
+        else:
+            prose_target = (
+                resolve_series_from_prose(target_phrase, catalog_names)
+                or resolve_series_from_prose(relation_text, catalog_names)
+            )
+            if prose_target:
+                target = prose_target["series"]
+                binding_provenance["target"] = {
+                    "kind": "prose",
+                    "description": target_phrase,
+                    **prose_target,
+                }
+    if not target:
+        binding_provenance["target"] = {
+            "kind": "unresolved",
+            "description": target_phrase,
+            "confirmed": False,
+            "why": "target prose did not resolve to a catalog series",
+        }
+
+    inputs = []
+    if predictor:
+        inputs.append(predictor)
+    if target:
+        inputs.append(target)
+    statistic = _declared_statistic_from_text(claim)
+    param_grid = _predictive_declared_search_grid(claim)
+    unknowns = []
+    if not predictor or not target:
+        unknowns.append(
+            "predictor and target series were not both resolved from literal/prose bindings; "
+            "operator must confirm inputs[0]=predictor and inputs[1]=target"
+        )
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "predictive_regression",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "predictive_regression",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic predictive-regression test: align the declared predictor X_t "
+            f"with declared target Y_t+h at horizon {horizon}, fit the relationship sign "
+            "and standardization moments on the in-sample prefix only, and test whether "
+            "the predictive direction survives OOS and holdout through the normal P7/P8 stack."
+        ),
+        "inputs": inputs[:2],
+        "predictor": predictor,
+        "target": target,
+        "binding_provenance": binding_provenance,
+        "horizon": horizon,
+        "estimator": "single_predictor_ols_covariance_sign",
+        "statistic": statistic,
+        "param_grid": param_grid,
+        "signal_logic": (
+            "predictive_regression: emit s*zscore_IS(X_t)*zscore_IS(Y_t+h), with "
+            "positions=s*zscore_IS(X_t); no trading overlay"
+        ),
+        "kill_criterion": (
+            "OOS/holdout predictive direction fails, 3-fold sign stability fails, or "
+            "the deflated predictive-return statistic fails the verdict band"
+        ),
+        "expected_data_needs": "predictor and target Series on a common DatetimeIndex",
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Emit non-overlapping "
+            "h-sampled observations at aligned positions 0, h, 2h, ...; freeze sign "
+            "and z-score moments on in-sample rows whose target timestamps remain "
+            "in-sample. bars_per_year is the emitted observation rate, with no second "
+            "division by horizon."
         ),
         "_llm_mode": "deterministic-template",
     }

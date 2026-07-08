@@ -48,6 +48,7 @@ MODULES = ROOT / "modules"
 # operator-curated and machine-generated corpora can't be confused. (ROADMAP: partition by provenance.)
 AUTO_MODULES = MODULES / "_auto"
 DATA_CACHE = ROOT / ".data_cache"
+HOLDOUT_DIR = ROOT / ".holdout"
 LLM_CACHE_DIR = ROOT / ".llm_cache"
 DECISIONS_LOG = ROOT / "decisions.jsonl"               # decisions log (atoms also go to brain)
 PRINCIPLES_LOG = ROOT / "principles.jsonl"
@@ -76,6 +77,8 @@ def ensure_output_dirs() -> None:
         REPORTS / "charts",
         LIVE_JSON.parent,
         LLM_CACHE_DIR,
+        HOLDOUT_DIR,
+        HOLDOUT_DIR / "locks",
         ARCHIVES,
     ):
         path.mkdir(parents=True, exist_ok=True)

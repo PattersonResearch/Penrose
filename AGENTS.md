@@ -39,9 +39,10 @@ The minimum:
 
 ```bash
 pip install -e .                              # editable install; Penrose runs scripts from the clone
-python scripts/eval_suite.py                  # invariant suite — must print 106/106 passed
+python scripts/eval_suite.py                  # invariant suite — must print 124/124 passed
 python -m pytest -q                           # unit tests — must stay green
 python scripts/calibration_placebo.py         # placebo: no no-edge signal may be certified
+python scripts/calibration_power_mining.py 40 # mined-noise power calibration — must print PASS
 ```
 
 `make` targets wrap the common flows (`make help`). The core (`eval`, `calib-*`, `connections`) runs
@@ -69,9 +70,27 @@ unset.
 ## Building data adapters
 
 Penrose reads data through provenance-carrying contracts in `src/penrose/data/`: `Series` (daily scalar
-time series), `Panel` (dates × entity columns, for cross-sectional claims), and `EventMarketPanel`
-(per-event bracket markets, for prediction-market/bracket claims). Vendor adapters live in
+time series), `Panel` (dates × entity columns, for cross-sectional claims), `EventCalendar` (sorted,
+de-duplicated event timestamps, for event-study claims), and `EventMarketPanel` (per-event bracket
+markets, for prediction-market/bracket claims). Vendor adapters live in
 `src/penrose/data/vendors/` and `src/penrose/data/*.py` (stooq, polygon, tiingo, fred, sec_edgar, …).
+The `predictive_regression` claim type consumes two existing `Series` inputs (predictor + target) through
+`src/penrose/pipeline/predictive_regression.py`; do not add a new data shape or trading overlay for it.
+The `factor_spanning` claim type also consumes only existing `Series` inputs (candidate factor +
+benchmark factors) through `src/penrose/pipeline/factor_spanning.py`; do not add a Panel shape or trading
+overlay for it.
+The `cross_sectional_sort` claim type consumes declared returns + characteristic `Panel` tables through
+`src/penrose/data/panel_load.py` and `src/penrose/pipeline/cross_sectional_sort.py`; reuse
+`data.xsection.form_factor`, require survivorship-corrected returns panels, and do not add a trading
+overlay.
+The `event_study` claim type consumes a return `Series` plus a declared event-calendar table through
+`src/penrose/data/event_calendar_load.py` and `src/penrose/pipeline/event_study.py`; estimate the
+baseline strictly before each event, emit per-event CAR, annualize by events/year, and do not add a
+trading overlay.
+The `forecast_skill` claim type consumes plain `Series` inputs (model forecast + realized target +
+optional explicit benchmark forecast) through `src/penrose/pipeline/forecast_skill.py`; if the benchmark
+is declared-implied, construct only `random_walk=Y.shift(1)` or `historical_mean=expanding_mean(Y).shift(1)`,
+emit the per-period squared-loss differential, and do not add a trading overlay.
 
 When you add or extend an adapter:
 
@@ -81,6 +100,10 @@ When you add or extend an adapter:
 - **No lookahead, checked at the boundary.** Only data known at/before the decision time may enter a row;
   frequency is checked so intraday can't be silently treated as daily. A settlement/outcome field must
   not leak information available only after close.
+  Predictive-regression modules must align `X_t` with `Y_{t+h}` and freeze sign/z-score moments on the
+  in-sample prefix only.
+  Forecast-skill constructed benchmarks must be strictly causal: benchmark value at `t` may use only
+  realized targets before `t`.
 - **Deterministic + seeded.** No wall-clock dependence, no unseeded RNG, stable ordering.
 - **Fail gracefully.** Missing keys, empty pulls, and degenerate inputs produce a clear message, never a
   traceback (invariant #5).

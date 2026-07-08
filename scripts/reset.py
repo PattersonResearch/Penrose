@@ -20,9 +20,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 FLAT = ["runs.jsonl", "decisions.jsonl", "review_queue.jsonl", "data_requests.jsonl",
-        "processed_papers.json", "backtest_ledger.tsv", ".holdout_burned",
+        "processed_papers.json", "backtest_ledger.tsv",
         "dashboard/live.json", "dashboard/progress.json"]
-DIRS = ["reports", "archives/papers", "run_archive"]   # archive contents of these (incl. reports/charts + analysis_index)
+DIRS = ["reports", "archives/papers", "run_archive", ".holdout"]   # archive contents of these (incl. reports/charts + analysis_index)
 
 
 def main() -> None:

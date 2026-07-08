@@ -12,7 +12,7 @@ others can adopt, audit, and extend, plus a growing, shared **corpus of invalida
 new claim cheaper to judge than the last. Penrose is the referee layer; it does not generate alpha and
 makes no profitability claims, and that will not change.
 
-## Where v0.6.0 stands
+## Where v0.7.0 stands
 
 The falsification pipeline, the power-aware verdict taxonomy (now tested against a frozen
 realistic-edge floor and enforced by a Monte-Carlo control), the anti-mining deflation and

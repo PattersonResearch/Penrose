@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "worked_example_process_conditional.py"
@@ -13,6 +14,11 @@ worked = importlib.util.module_from_spec(spec)
 assert spec.loader is not None
 sys.modules[spec.name] = worked
 spec.loader.exec_module(worked)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_holdout_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("PENROSE_HOLDOUT_LOCK", str(tmp_path / "worked-example-holdout.lock"))
 
 
 def test_series_identical():

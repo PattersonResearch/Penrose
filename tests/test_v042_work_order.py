@@ -196,12 +196,14 @@ def test_w5_output_dirs_created_on_startup(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "REPORTS", tmp_path / "reports")
     monkeypatch.setattr(config, "LIVE_JSON", tmp_path / "dashboard" / "live.json")
     monkeypatch.setattr(config, "LLM_CACHE_DIR", tmp_path / ".llm_cache")
+    monkeypatch.setattr(config, "HOLDOUT_DIR", tmp_path / ".holdout")
     monkeypatch.setattr(config, "ARCHIVES", tmp_path / "archives")
     config.ensure_output_dirs()
     assert (tmp_path / "reports").is_dir()
     assert (tmp_path / "reports" / "charts").is_dir()
     assert (tmp_path / "dashboard").is_dir()
     assert (tmp_path / ".llm_cache").is_dir()
+    assert (tmp_path / ".holdout" / "locks").is_dir()
 
 
 def test_w6_hyphen_underscore_strategy_aliases_dedupe(tmp_path, monkeypatch, capsys):

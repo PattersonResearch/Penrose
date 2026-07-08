@@ -71,18 +71,30 @@ def test_missing_series_drops_phantom_tokens():
 
 
 def test_holdout_is_single_use():
+    from penrose import config
     from penrose.pipeline import p7_backtest as p7
     import pandas as pd, numpy as np
-    idx = pd.date_range("2023-01-01", periods=200, freq="5D", tz="UTC")
-    net = pd.Series(np.random.default_rng(1).normal(0.01, 0.05, 200), index=idx)
-    lock = p7._claim_holdout_lock("unit-test")
-    if lock.exists():
-        lock.unlink()
-    first = p7.final_holdout_eval("unit-test", net, 73.0)
-    second = p7.final_holdout_eval("unit-test", net, 73.0)
-    assert "holdout_sharpe" in first, "first holdout call should evaluate"
-    assert second.get("refused"), "second holdout call must refuse (single-use, S4)"
-    lock.unlink()  # cleanup so the real run can use its own holdout
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as d:
+        old_root = config.ROOT
+        old_holdout_dir = config.HOLDOUT_DIR
+        config.ROOT = Path(d)
+        config.HOLDOUT_DIR = Path(d) / ".holdout"
+        try:
+            idx = pd.date_range("2023-01-01", periods=200, freq="5D", tz="UTC")
+            net = pd.Series(np.random.default_rng(1).normal(0.01, 0.05, 200), index=idx)
+            lock = p7._claim_holdout_lock("unit-test")
+            if lock.exists():
+                lock.unlink()
+            first = p7.final_holdout_eval("unit-test", net, 73.0)
+            second = p7.final_holdout_eval("unit-test", net, 73.0)
+            assert "holdout_sharpe" in first, "first holdout call should evaluate"
+            assert second.get("refused"), "second holdout call must refuse (single-use, S4)"
+            assert lock.exists()
+        finally:
+            config.ROOT = old_root
+            config.HOLDOUT_DIR = old_holdout_dir
     print("ok: locked holdout is single-use (refuses the second peek)")
 
 
