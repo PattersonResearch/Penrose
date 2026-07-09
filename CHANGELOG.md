@@ -3,6 +3,59 @@
 All notable changes to Penrose are documented here. This project follows a 0.x pre-1.0 line:
 interfaces may change, and each minor release is a coherent batch of audited work.
 
+## [0.8.0] — 2026-07-09
+
+The theme: **the research platform closes the loop and starts to run itself.** Penrose now generates its own
+candidate alpha grounded in what has already died, sources its own data on demand, catches results that are
+too good to be true, and can pool invalidations across users — while every new capability stays behind the
+same falsification firewall.
+
+### Added
+- **Implausibility gate.** A real tradeable edge does not have a Sharpe of ~18. A degenerate/leaky net series
+  (near-zero volatility, look-ahead, or a modeling artifact) is highly *significant*, so the significance and
+  tail gates never caught it — a corpus rerun found a funding-carry reconstruction reaching `watch` at an
+  annualized Sharpe of 17.8. Such a result now routes to `needs_review` (never a survivor, never asserting a
+  kill): an implausible result means the *test* is broken, not the claim falsified.
+- **`formulaic_signal` claim type — the 10th executor.** A deterministic, `eval`-free DSL for signal→return
+  claims (`returns`, `rolling_sum/mean/std`, `sign`, `lag`, `delta`, `zscore`, arithmetic) with structural
+  one-bar look-ahead safety and explicit funding cash-flow. The signal math lives in one audited place instead
+  of being re-derived (often unfaithfully) by an LLM per run.
+- **Candidate-alpha synthesis closes the loop.** The synthesizer now emits its candidate signals *as the
+  `formulaic_signal` DSL*, validated by the parser + a static arity check, so an admitted candidate is a
+  runnable spec the pipeline backtests. A synthesized thesis, grounded in the corpus of invalidations, now
+  runs end-to-end through the full falsification stack to a verdict.
+- **Auto-source-and-archive data layer (opt-in).** On a catalog miss, resolve a series to a source (explicit
+  hint or heuristic FRED/Tiingo/CoinGecko), fetch it, archive it locally, and register it — pull once, never
+  re-query. Default-off keeps reproducibility-strict and offline runs byte-identical; no silent proxies.
+- **Hierarchical composite strategy families.** A strategy can declare a structured `family_identity`
+  `{components, method, driver}`; the distiller clusters at multiple granularities so a sparse composite still
+  contributes to coarser principles — without lowering the support bar.
+- **Corpus commons client (opt-in).** `penrose share` exports *kills only* (a dead strategy leaks no alpha) as
+  portable records carrying a **reproducibility receipt** (spec + engine version + data footprint + per-series
+  Merkle roots + verdict + gate outputs, hashed and optionally signed); `penrose commons-pull` validates,
+  dedups, and ingests them as *advisory* priors — never verdicts. The receipt proves origin, integrity, and
+  data-binding, not data genuineness (stated honestly).
+- **Audit event log (run observability).** Every run now writes an append-only, hash-chained event stream
+  (`reports/audit/<run_id>.jsonl`): a reproduction envelope (engine version, config fingerprint, resolved
+  data sources + windows, seeds, platform) followed by per-stage and per-gate events, each linked by a
+  SHA-256 chain that *excludes* wall-clock so it stays reproducible across reruns while still detecting any
+  edit. `penrose audit` verifies the chain and summarizes stage timings, gate-fire counts, and drop-off.
+  Observability only — it fails open and never feeds back into verdict logic.
+
+### Fixed
+- **Chen–Zimmermann literature numbers reconciled to the current taxonomy.** `make cz-referee` now reports
+  *both* scope endpoints in one reproducible run, and `make cz-data` (`scripts/fetch_cz_data.py`) builds the
+  panel so the experiment runs from a fresh clone. Under 0.8.0's power-aware evaluation, per-anomaly-alone
+  survival is **28/212 (~13%)** and whole-corpus-deflated survival is **6/212 (~3%)**; the previously
+  reported ~48% per-anomaly figure reflected an earlier taxonomy and is corrected across the README, papers,
+  and docs. The finding is unchanged: the assumed search family, not the point estimate, dominates the
+  conclusion.
+
+### Notes
+- Harness-integrity discipline is now documented (a gate ledger classifying every gate general-vs-incident;
+  narrow guards fail *soft*). Every claim type still ships its own ground-truth calibration; the whole batch
+  was adversarially audited before landing. Green bar: eval 132/132, pytest 514 passed, placebo + power calibrated.
+
 ## [0.7.0] — 2026-07-08
 
 The theme: **the referee grows from a strategy backtester into a research platform.** Five new

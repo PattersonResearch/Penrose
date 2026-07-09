@@ -13,7 +13,13 @@ paper's original result), so a meaningful fraction survives in-sample; deflation
 power-aware labels are what separate the durable from the data-mined.
 
 Data: penrose-data/literature/chen_zimmermann/ls_panel.parquet (1188 months x 212 anomalies, signed
-to the published direction). Fetched via the openassetpricing package (dl_port('op')).
+to the published direction). Fetched via the openassetpricing package — run `make cz-data` (or
+`python scripts/fetch_cz_data.py`) once to download+build it, then `make cz-referee`.
+
+This script reports BOTH endpoints of the scope-dependence result in one run, so the whole "the
+denominator you assume dominates the conclusion" finding is reproducible:
+  * per-anomaly-alone  — each anomaly is its own family (denominator 1, no cross-deflation)
+  * deflated-by-212    — all anomalies share one family (the full-search multiple-testing correction)
 
 Run:  python scripts/cz_referee.py [N_top]   (N_top: limit to the N longest-history anomalies)
 """
@@ -41,36 +47,31 @@ from penrose.brain import Claim                       # noqa: E402
 PANEL = Path.home() / "Development/penrose-data/literature/chen_zimmermann/ls_panel.parquet"
 BARS_PER_YEAR = 12.0                                 # monthly returns
 FAMILY = "cz_literature::equity_xs"
+SURVIVING = ("research-supported", "watch")
 
 
-def main() -> None:
-    if not PANEL.exists():
-        print(f"missing {PANEL} — run the openassetpricing download first"); sys.exit(1)
-    panel = pd.read_parquet(PANEL) / 100.0           # % -> fraction
-    n_top = int(sys.argv[1]) if len(sys.argv) > 1 else panel.shape[1]
-    # order by history length so we referee the best-powered anomalies first
-    counts = panel.notna().sum().sort_values(ascending=False)
-    names = list(counts.index[:n_top])
-    print(f"[cz-referee] {len(names)} published anomalies; deflating across the full search; monthly.\n")
-
-    # pre-pass: log all anomalies into ONE family so DSR deflates by the full search size (212).
-    tmp = Path("/tmp/_cz_ledger.tsv"); old = P7.LEDGER; P7.LEDGER = tmp
+def _run_pass(names, panel, family_of, *, populate: bool):
+    """Evaluate every anomaly under a family assignment. When `populate`, all trials are logged into
+    their families first so DSR deflates by the realized family size; otherwise each singleton family
+    has denominator 1 (no cross-deflation). Uses an isolated temp ledger, restored on exit."""
+    tmp = Path(_tf.gettempdir()) / f"_cz_ledger_{'deflated' if populate else 'alone'}.tsv"
+    old = P7.LEDGER; P7.LEDGER = tmp
     if tmp.exists(): tmp.unlink()
     try:
-        for nm in names:
-            net = panel[nm].dropna()
-            if len(net) < 30:
-                continue
-            P7.run_backtest(nm, net, pd.Series(1.0, index=net.index), BARS_PER_YEAR,
-                            cost_frac=0.0, family=FAMILY, log=True)
-        # eval-pass: each anomaly judged vs the best-of-212 deflation null + power-aware label.
+        if populate:
+            for nm in names:
+                net = panel[nm].dropna()
+                if len(net) < 30:
+                    continue
+                P7.run_backtest(nm, net, pd.Series(1.0, index=net.index), BARS_PER_YEAR,
+                                cost_frac=0.0, family=family_of(nm), log=True)
         rows = []
         for nm in names:
             net = panel[nm].dropna()
             if len(net) < 30:
                 rows.append((nm, "insufficient_data", None, None, None, len(net))); continue
             bt = P7.run_backtest(nm, net, pd.Series(1.0, index=net.index), BARS_PER_YEAR,
-                                 cost_frac=0.0, family=FAMILY, log=False)
+                                 cost_frac=0.0, family=family_of(nm), log=False)
             dec = stages.p8_verdict(_claim(nm), bt, {}, synthetic=False)
             if dec.verdict == "watch" and (bt.get("dsr") or 0) >= config.DSR_DECISION["watch_band"][1]:
                 ho = P7.final_holdout_eval(nm, net, BARS_PER_YEAR, force=True)
@@ -79,19 +80,42 @@ def main() -> None:
                          dec.metrics.get("mde_ic"), len(net)))
     finally:
         P7.LEDGER = old; tmp.unlink(missing_ok=True)
+    return rows
 
+
+def _report(label, rows):
     tally = Counter(r[1] for r in rows)
-    surv = [r for r in rows if r[1] in ("research-supported", "watch")]
-    print("=== VERDICT TALLY over published anomalies (deflated by the full 212-anomaly search) ===")
+    surv = [r for r in rows if r[1] in SURVIVING]
+    print(f"=== VERDICT TALLY — {label} ===")
     for v, c in tally.most_common():
-        print(f"  {v:18s} {c:4d}  ({100*c/len(rows):.0f}%)")
-    print(f"\nSURVIVORS (watch / research-supported): {len(surv)}/{len(rows)} = {100*len(surv)/len(rows):.0f}%")
-    print("Top survivors by OOS Sharpe:")
-    for nm, v, dsr, osh, mde, n in sorted(surv, key=lambda r: -(r[3] or -9))[:12]:
+        print(f"  {v:18s} {c:4d}  ({100 * c / len(rows):.0f}%)")
+    print(f"SURVIVORS (watch / research-supported): {len(surv)}/{len(rows)} = {100 * len(surv) / len(rows):.0f}%\n")
+    return len(surv), len(rows)
+
+
+def main() -> None:
+    if not PANEL.exists():
+        print(f"missing {PANEL}\nrun `make cz-data` (or python scripts/fetch_cz_data.py) to download+build it first")
+        sys.exit(1)
+    panel = pd.read_parquet(PANEL) / 100.0           # % -> fraction
+    n_top = int(sys.argv[1]) if len(sys.argv) > 1 else panel.shape[1]
+    counts = panel.notna().sum().sort_values(ascending=False)   # best-powered first
+    names = list(counts.index[:n_top])
+    print(f"[cz-referee] {len(names)} published anomalies; monthly; reporting both scope endpoints.\n")
+
+    alone = _run_pass(names, panel, lambda nm: f"cz_alone::{nm}", populate=False)
+    deflated = _run_pass(names, panel, lambda nm: FAMILY, populate=True)
+
+    a_surv, a_tot = _report("per-anomaly-alone (no cross-deflation)", alone)
+    d_surv, d_tot = _report("deflated by the full 212-anomaly search", deflated)
+
+    print(f"SCOPE DEPENDENCE: survival ranges from {a_surv}/{a_tot} ({100 * a_surv / a_tot:.0f}%) judged alone "
+          f"to {d_surv}/{d_tot} ({100 * d_surv / d_tot:.0f}%) deflated by the full search.")
+    print("Same identical return series; only the assumed research family changes. The denominator you")
+    print("assume dominates the conclusion — which is the point. Top survivors (deflated) by OOS Sharpe:")
+    for nm, v, dsr, osh, mde, n in sorted((r for r in deflated if r[1] in SURVIVING),
+                                          key=lambda r: -(r[3] or -9))[:12]:
         print(f"  {nm:26s} {v:16s} dsr={dsr} oos_sharpe={osh} n_months={n}")
-    print("\nReading: this is the factor-zoo replication under proper deflation. A low survival rate is")
-    print("the EXPECTED, publishable result — most published anomalies do not survive multiple-testing")
-    print("correction + out-of-sample + post-publication decay. The survivors are the durable core.")
 
 
 def _claim(nm: str) -> Claim:

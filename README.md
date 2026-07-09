@@ -9,7 +9,7 @@ strategy, stress-tests its evidence the way a skeptical reviewer would, and tell
 real or just an artifact of how it was found. It never tells you what to trade; it tells you what not to
 believe._
 
-[![Version](https://img.shields.io/badge/version-0.7.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
+[![Version](https://img.shields.io/badge/version-0.8.0-7c5cff.svg)](https://github.com/PattersonResearch/Penrose/releases)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-7c5cff.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-2ee6ff.svg)](pyproject.toml)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-3fb950.svg)](CONTRIBUTING.md)
@@ -78,10 +78,11 @@ A single corrected statistic doesn't catch all the ways a backtest lies. Penrose
 
 <img src="docs/assets/system-diagram.svg" width="100%" alt="How a claim moves through Penrose: ingestion and grounded extraction, screening, routing to one of several claim-type executors (a sandboxed strategy reconstruction, or a trusted deterministic executor for regression / factor-spanning / cross-sectional-sort / event-study / forecast-skill claims), the shared robustness and power gates, a power-aware verdict, and the corpus of invalidations that feeds back as a prior on new claims."/>
 
-<sub><i>The diagram shows the original strategy-backtest path. As of 0.7.0, six claim-type executors —
-predictive regression, factor spanning, cross-sectional sort, event study, forecast skill, and the
-event-market adapter — route through the same robustness gates and verdict stack; an updated diagram is
-tracked for 0.7.1.</i></sub>
+<sub><i>The diagram shows the original strategy-backtest path. As of 0.8.0, ten claim-type executors —
+predictive regression, factor spanning, cross-sectional sort, event study, forecast skill, the formulaic-signal
+DSL, the event-market adapter, and the strategy/provided-series/descriptive types — route through the same
+robustness gates and verdict stack, now including an implausibility gate that flags physically-impossible
+results; an updated diagram is tracked as a follow-up.</i></sub>
 
 ```
 claim -> sandboxed reconstruction -> robustness stack -> power-aware verdict -> corpus
@@ -169,7 +170,7 @@ provider and each result records whether it was independent.
   produced on real data: **14/16 killed per-factor, 0/16 survive deflation across the full search** —
   including positive-Sharpe factors a naive backtester certifies, which Penrose kills as regime-fragile.
 - **Referee the published literature.** Across all 212 Chen-Zimmermann anomalies, survival is a *range*:
-  **~48% per-anomaly down to ~3%** once deflated by the whole 212-anomaly search. That the number *depends
+  **~13% per-anomaly down to ~3%** once deflated by the whole 212-anomaly search. That the number *depends
   on deflation scope* is itself the finding.
 - **Post-publication decay.** Decay is universal (**~52%**, reproducing McLean-Pontiff). Penrose doesn't
   beat it, but its survivors retain **~4× the post-publication return** of its kills — the verdict sorts

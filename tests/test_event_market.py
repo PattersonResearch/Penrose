@@ -9,7 +9,7 @@ import pytest
 from penrose.data.event_market import EVENT_MARKET_COLUMNS, EventMarketPanel
 from penrose.data.event_market_load import EventMarketDataUnavailable, load_event_market
 from penrose.pipeline import event_market
-from penrose.pipeline.event_market_backtest import run_event_market_backtest
+from penrose.pipeline.event_market_backtest import run_event_market_backtest, run_weather_tail_fade_backtest
 
 
 def _panel_frame() -> pd.DataFrame:
@@ -283,6 +283,82 @@ def test_event_market_module_noedge_returns_no_positive_net(tmp_path):
     assert float(out["net"].sum()) <= 0.0
 
 
+def _weather_tail_rows() -> pd.DataFrame:
+    return pd.DataFrame({
+        "ticker": ["KXW-CHI-1", "KXW-NYC-1", "KXW-BOS-1"],
+        "city": ["CHI", "NYC", "BOS"],
+        "close_date": ["2024-07-01", "2024-07-02", "2024-07-02"],
+        "p_close": [0.25, 0.20, 0.20],
+        "outcome": [0, 0, 1],
+        "volume": [100.0, 100.0, 100.0],
+        "open_interest": [50.0, 100.0, 100.0],
+        "is_tail": [True, True, True],
+        "underlying_time": ["2024-07-01", "2024-07-02", "2024-07-02"],
+    })
+
+
+def test_weather_tail_raw_table_loads_through_event_market_contract(tmp_path):
+    table = tmp_path / "weather.csv"
+    _weather_tail_rows().to_csv(table, index=False)
+
+    panel = load_event_market({
+        "claim_type": "event_market_strategy",
+        "event_market": {"path": str(table), "name": "weather"},
+    }, tmp_path)
+
+    assert isinstance(panel, EventMarketPanel)
+    assert list(panel.data.columns) == EVENT_MARKET_COLUMNS
+    assert panel.data.loc[0, "event_id"] == "KXW-CHI-1"
+    assert panel.data.loc[0, "underlying"]["city"] == "CHI"
+    assert panel.data.loc[0, "underlying"]["open_interest"] == 50.0
+
+
+def test_weather_tail_fade_reconstructs_fee_capacity_and_pair_cap():
+    panel = EventMarketPanel("weather", _weather_tail_rows(), "unit-test")
+
+    net, positions, bars_per_year, stats = run_weather_tail_fade_backtest(
+        panel,
+        fee_coeff=0.07,
+        capacity_frac=0.10,
+        max_pair_gross=0.01,
+        pair_cities=["NYC", "BOS"],
+        portfolio_notional=1000.0,
+    )
+
+    fee_25 = 0.07 * 0.25 * 0.75
+    expected_day1 = (5.0 * (0.25 - fee_25)) / 1000.0
+    fee_20 = 0.07 * 0.20 * 0.80
+    expected_day2 = (5.0 * (0.20 - fee_20) + 5.0 * (-0.80 - fee_20)) / 1000.0
+    assert np.isclose(float(net.iloc[0]), expected_day1)
+    assert np.isclose(float(net.iloc[1]), expected_day2)
+    assert np.isclose(float(positions.loc[net.index[1], "NYC"]), 0.005)
+    assert np.isclose(float(positions.loc[net.index[1], "BOS"]), 0.005)
+    assert stats["pair_gross_before_cap"] == 20.0
+    assert stats["pair_gross_after_cap"] == 10.0
+    assert bars_per_year > 300
+
+
+def test_weather_tail_module_reports_measured_cost_provenance(tmp_path):
+    table = tmp_path / "weather.csv"
+    _weather_tail_rows().to_csv(table, index=False)
+    claim = type("Claim", (), {"claim_id": "weather-c1", "applicable_strategy_class": "kalshi_weather_tail_fade"})()
+    spec = {
+        "module_id": "unit_weather_tail",
+        "strategy_class": "kalshi_weather_tail_fade",
+        "claim_type": "event_market_strategy",
+        "primitive": "kalshi_weather_tail_fade",
+        "event_market": {"path": str(table), "name": "weather"},
+        "entry": {"capacity_frac": 0.10, "fee_coeff": 0.07, "portfolio_notional": 1000.0},
+    }
+
+    out = event_market.build_module(spec, claim).run(None, claim, 0.0)
+
+    assert out["ok"] is True
+    assert out["cost_provenance"] == "measured"
+    assert out["capacity_provenance"] == "reconstructed_from_volume_open_interest"
+    assert out["event_market"]["primitive"] == "kalshi_weather_tail_fade"
+
+
 def test_event_market_run_missing_table_returns_data_unavailable(tmp_path):
     claim = type("Claim", (), {"claim_id": "em-c1", "applicable_strategy_class": "unit_event_market"})()
     module = event_market.build_module(_event_spec("missing.csv", data_dir=tmp_path), claim)
@@ -389,7 +465,7 @@ def test_event_market_strategy_routing_reaches_deterministic_builder(tmp_path, m
 
     assert calls == [("event_market_strategy", "em-route")]
     assert out["decisions"][0]["claim_id"] == "em-route"
-    assert out["decisions"][0]["verdict"] in {"kill", "underpowered", "watch", "research-supported"}
+    assert out["decisions"][0]["verdict"] in {"kill", "underpowered", "watch", "research-supported", "needs_review"}
 
 
 def test_event_market_fidelity_structural_override_for_declared_normal_model(tmp_path, monkeypatch):

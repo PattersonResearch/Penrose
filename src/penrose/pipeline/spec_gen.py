@@ -42,6 +42,9 @@ SPEC_SYSTEM = (
     "realized target series, explicit benchmark forecast series OR declared implied "
     "benchmark (random_walk/historical_mean), squared-loss differential, and declared "
     "search grid; do NOT translate it into a trading strategy. "
+    "If claim_type is formulaic_signal, preserve the declared DSL signal string exactly, "
+    "declare the traded price series, optional funding_pnl_series, position_map, and "
+    "every required input series; do NOT emit Python code. "
     "If claim_type is descriptive_statistical, specify the statistic to compute and its uncertainty; "
     "do NOT translate it into a trading strategy. If claim_type is trading_strategy, "
     "act as a translator, not a co-author: preserve the claim's signal exactly, do "
@@ -351,9 +354,83 @@ Output JSON with this exact shape:
 }}
 """
 
+FORMULAIC_SIGNAL_SPEC_USER_TMPL = """Generate a ModuleSpec for this formulaic-signal claim.
+The implementation must preserve the declared DSL formula exactly and run it through the
+trusted formulaic_signal executor. Do not emit Python code or invent entry/exit rules.
+
+statement: {statement}
+mechanism:  {mechanism}
+scope:      {scope}
+horizon:    {horizon}
+strategy_class: {strategy_class}
+claim_type: {claim_type}
+
+source_span (verbatim from paper): "{source_span}"
+claimed_metric: "{claimed_metric}"
+
+Output JSON with this exact shape:
+{{
+  "module_id": str (snake_case identifier for the module),
+  "strategy_class": "formulaic_signal",
+  "strategy_family": {{"components": [str], "method": "single"}},
+  "claim_type": "formulaic_signal",
+  "claim_translation": str (formula S_t -> P_t -> one-bar-lagged trade_series return),
+  "inputs": [str, ...] (exactly Names(signal) plus trade_series plus funding_pnl_series if declared),
+  "trade_series": str (price series traded),
+  "signal": str (DSL formula string; preserve exactly),
+  "position_map": "sign|zscore_clip",
+  "funding_pnl_series": str or null,
+  "param_grid": dict (declared formula/grid parameters tried for deflation),
+  "signal_logic": str ("formulaic_signal: parse DSL; P_t=position_map(S_t); net_t=P_(t-1)*ret_t - costs; optional funding cash-flow -P_(t-1)*funding_t"),
+  "kill_criterion": str (concrete: OOS/holdout net return fails, 3-fold sign stability fails, or deflated statistic fails),
+  "expected_data_needs": str (DatetimeIndex Series for each input),
+  "unknowns": [str] (unconfirmed data bindings or formula fields),
+  "implementation_notes": str (no look-ahead: executor applies one-bar delay exactly once; parser allows only the audited operator table)
+}}
+"""
+
 
 def classify_claim_type(claim: Claim, source: IngestedSource | None = None) -> str:
     return fidelity_memory.classify_claim_type(claim, source)
+
+
+def _embedded_formulaic_signal_spec(claim: Claim) -> dict | None:
+    try:
+        raw = (getattr(claim, "data_provenance", {}) or {}).get("formulaic_signal_spec")
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(raw, dict) or raw.get("claim_type") != "formulaic_signal":
+        return None
+    try:
+        from . import formulaic_signal
+
+        signal = str(raw.get("signal") or "").strip()
+        trade_series = str(raw.get("trade_series") or "").strip()
+        formulaic_signal.validate_signal(signal)
+        names = formulaic_signal.referenced_names(signal)
+    except Exception:  # noqa: BLE001
+        return None
+    if not trade_series:
+        return None
+    if not names:
+        return None  # S72-1: a constant-only signal references no series -> not executable; refuse the spec
+    position_map = str(raw.get("position_map") or "sign").strip().lower()
+    if position_map not in {"sign", "zscore_clip"}:
+        return None
+    out = dict(raw)
+    out["claim_type"] = "formulaic_signal"
+    out["signal"] = signal
+    out["trade_series"] = trade_series
+    out["position_map"] = position_map
+    out["inputs"] = sorted(names | {trade_series})
+    out["param_grid"] = dict(out.get("param_grid") or out.get("grid") or {})
+    out["grid"] = dict(out.get("grid") or out["param_grid"])
+    out.setdefault("strategy_class", "formulaic_signal")
+    out.setdefault("claim_statement", claim.statement)
+    out.setdefault("claim_source_span", claim.source_span)
+    out.setdefault("claim_mechanism", claim.mechanism)
+    out.setdefault("_llm_mode", "embedded-formulaic-signal")
+    return out
 
 
 def _catalog_vocab() -> str:
@@ -384,8 +461,11 @@ def generate_spec(claim: Claim, source: IngestedSource,
     specs_dir.mkdir(parents=True, exist_ok=True)
     out_path = specs_dir / f"{claim.claim_id}.yaml"
 
-    claim_type = classify_claim_type(claim, source)
-    if claim_type == "provided_series_statistic":
+    embedded_formulaic = _embedded_formulaic_signal_spec(claim)
+    claim_type = "formulaic_signal" if embedded_formulaic is not None else classify_claim_type(claim, source)
+    if embedded_formulaic is not None:
+        spec = embedded_formulaic
+    elif claim_type == "provided_series_statistic":
         # 6g: a mechanical translation, not a creative one -- never touches the LLM, so it
         # can neither invent gates (over-specification, EXP-1) nor fall back to an empty
         # stub (under-specification, EXP-1b). See _provided_series_stat_spec.
@@ -400,6 +480,8 @@ def generate_spec(claim: Claim, source: IngestedSource,
         spec = _event_study_spec(claim, source)
     elif claim_type == "forecast_skill":
         spec = _forecast_skill_spec(claim, source)
+    elif claim_type == "formulaic_signal":
+        spec = _formulaic_signal_spec(claim, source)
     elif not use_llm:
         spec = _stub_spec(claim, source)
     else:
@@ -447,6 +529,7 @@ def _base_prompt(claim: Claim, source: IngestedSource, claim_type: str,
         "cross_sectional_sort": CROSS_SECTIONAL_SORT_SPEC_USER_TMPL,
         "event_study": EVENT_STUDY_SPEC_USER_TMPL,
         "forecast_skill": FORECAST_SKILL_SPEC_USER_TMPL,
+        "formulaic_signal": FORMULAIC_SIGNAL_SPEC_USER_TMPL,
     }.get(claim_type, TRADING_SPEC_USER_TMPL)
     user = tmpl.format(
         statement=claim.statement[:600],
@@ -2014,6 +2097,117 @@ def _forecast_skill_spec(claim: Claim, source: IngestedSource) -> dict:
             "strictly causal: random_walk uses Y.shift(1), historical_mean uses "
             "expanding_mean(Y).shift(1). v1 uses the DM loss differential; Clark-West for "
             "nested forecasts is a future refinement."
+        ),
+        "_llm_mode": "deterministic-template",
+    }
+
+
+def _formulaic_text(claim: Claim, source: IngestedSource | None = None) -> str:
+    return "\n".join([
+        getattr(claim, "statement", "") or "",
+        getattr(claim, "mechanism", "") or "",
+        getattr(claim, "source_span", "") or "",
+        getattr(claim, "claimed_metric_quote", "") or "",
+        getattr(source, "text", "") if source is not None else "",
+    ])
+
+
+def _formulaic_clean_value(value: str) -> str:
+    text = str(value or "").strip().strip(",").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"', "`"}:
+        return text[1:-1].strip()
+    return text
+
+
+def _formulaic_field(text: str, field: str) -> str:
+    pat = rf"\b{re.escape(field)}\s*[:=]\s*(?P<value>[^\n;]+)"
+    m = re.search(pat, text, flags=re.IGNORECASE)
+    return _formulaic_clean_value(m.group("value")) if m else ""
+
+
+def _formulaic_signal_expr(text: str) -> str:
+    m = re.search(
+        r"\bsignal\s*(?:formula|dsl)?\s*[:=]\s*(?P<value>[^\n;]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _formulaic_clean_value(m.group("value")) if m else ""
+
+
+def _formulaic_position_map(text: str) -> str:
+    raw = _formulaic_field(text, "position_map").lower().replace("-", "_")
+    if raw.startswith("zscore_clip"):
+        return "zscore_clip"
+    return "sign"
+
+
+def _formulaic_spec(claim: Claim, source: IngestedSource) -> dict:
+    """Deterministic ModuleSpec for explicitly declared formulaic-signal claims."""
+    full_text = _formulaic_text(claim, source)
+    signal = _formulaic_signal_expr(full_text)
+    trade_series = _formulaic_field(full_text, "trade_series")
+    funding_pnl_series = _formulaic_field(full_text, "funding_pnl_series")
+    position_map = _formulaic_position_map(full_text)
+    formula_names: set[str] = set()
+    unknowns: list[str] = []
+    try:
+        from . import formulaic_signal
+
+        formula_names = formulaic_signal.referenced_names(signal)
+    except Exception as exc:  # noqa: BLE001
+        unknowns.append(f"signal formula did not parse under formulaic_signal DSL: {exc}")
+    inputs = {str(x or "").strip() for x in formula_names if str(x or "").strip()}
+    if trade_series:
+        inputs.add(trade_series)
+    else:
+        unknowns.append("trade_series was not declared")
+    if funding_pnl_series:
+        inputs.add(funding_pnl_series)
+    return {
+        "module_id": f"auto_{claim.claim_id}",
+        "version": 0,
+        "status": "spec-only",
+        "strategy_class": "formulaic_signal",
+        "strategy_family": declared_strategy_family(claim, source),
+        "claim_type": "formulaic_signal",
+        "source": source.source_id,
+        "claim_statement": claim.statement,
+        "claim_source_span": claim.source_span,
+        "claim_mechanism": claim.mechanism,
+        "claim_translation": (
+            "Deterministic formulaic signal test: parse the declared DSL formula into S_t, "
+            "map to P_t, apply one-bar-lagged exposure to trade_series returns, subtract "
+            "turnover costs, and include optional funding cash-flow in the executor."
+        ),
+        "inputs": sorted(inputs),
+        "trade_series": trade_series,
+        "signal": signal,
+        "position_map": position_map,
+        "funding_pnl_series": funding_pnl_series or None,
+        "binding_provenance": {
+            "signal_names": sorted(formula_names),
+            "trade_series": {"series": trade_series, "confirmed": bool(trade_series)},
+            "funding_pnl_series": {
+                "series": funding_pnl_series or None,
+                "confirmed": bool(funding_pnl_series),
+            },
+        },
+        "param_grid": {},
+        "signal_logic": (
+            "formulaic_signal: parse DSL; P_t=position_map(S_t); "
+            "net_t=P_(t-1)*ret_t - turnover_costs; if funding_pnl_series is declared, "
+            "net_t += -P_(t-1)*funding_t"
+        ),
+        "kill_criterion": (
+            "OOS/holdout net return fails, 3-fold sign stability fails, or the deflated "
+            "net-return statistic fails the verdict band"
+        ),
+        "expected_data_needs": "DatetimeIndex Series for every input, with trade_series as prices",
+        "unknowns": unknowns,
+        "implementation_notes": (
+            "Deterministic trusted module; no Docker/impl_gen. Parser whitelist is ast "
+            "Expression/BinOp/UnaryOp/Call/Name/Constant with the audited operator table. "
+            "No look-ahead: executor applies the one-bar position delay exactly once."
         ),
         "_llm_mode": "deterministic-template",
     }

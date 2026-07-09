@@ -32,9 +32,11 @@ from pathlib import Path
 
 import pandas as pd
 
+from .. import __version__
 from .. import config
 from .. import regime as regime_lib
 from .. import worker_control
+from ..audit import AuditLog, config_fingerprint, platform_tuple
 from ..brain import BrainReader, Claim, source_is_unanchored, validate_source_type
 from ..data import client as dataclient
 from ..report import write_report
@@ -46,7 +48,7 @@ from . import stages, p7_backtest
 from . import (
     p1_ingest, extract, spec_gen, impl_gen, relevance, charts, fidelity, sandbox,
     fidelity_memory, provided_series, event_market, predictive_regression, factor_spanning,
-    cross_sectional_sort, event_study, forecast_skill, robustness,
+    cross_sectional_sort, event_study, forecast_skill, formulaic_signal, robustness,
 )
 from .human_review import human_review_explanation
 
@@ -107,6 +109,151 @@ def _emit_trace(claim, dec, rec, run_log) -> None:
         _append_jsonl(_effective_traces_path(), project_trace_record(claim, dec, rec, run_log))
     except Exception:  # noqa: BLE001 — observability must never change control flow
         pass
+
+
+def _audit_warn(exc: BaseException) -> None:
+    print(f"[penrose] audit emission failed: {exc}", file=sys.stderr)
+
+
+def _audit_call(fn, *args, **kwargs) -> None:
+    try:
+        fn(*args, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - audit must never change verdict control flow
+        _audit_warn(exc)
+
+
+def _audit_seeds() -> dict:
+    return {
+        "bootstrap": (getattr(config, "BOOTSTRAP", {}) or {}).get("seed"),
+        "permutation": (getattr(config, "PERMUTATION", {}) or {}).get("seed"),
+        "regime_fragility": (getattr(config, "REGIME_FRAGILITY", {}) or {}).get("seed"),
+        "cpcv": (getattr(config, "CPCV", {}) or {}).get("seed"),
+    }
+
+
+def _audit_reproducibility_class(source_type: str) -> str:
+    if source_type in {"generated_hypothesis", "synthesized_hypothesis", "confirmation"}:
+        return "OPEN"
+    return "GATED" if getattr(config, "DATA_DIR", None) else "OPEN"
+
+
+def _audit_data_sources(run_log: dict) -> dict:
+    return {
+        "source_id": run_log.get("source_id"),
+        "source_title": run_log.get("source_title"),
+        "paper_path": run_log.get("paper_path"),
+        "content_sha256": (run_log.get("idempotency") or {}).get("content_sha256"),
+        "provenance": run_log.get("provenance"),
+    }
+
+
+def _audit_gate_events(audit_log: AuditLog, dec, rec: dict) -> None:
+    metrics = getattr(dec, "metrics", {}) or {}
+    p7 = ((rec or {}).get("stages") or {}).get("P7") or {}
+    gates = []
+    if metrics.get("dsr") is not None or metrics.get("psr") is not None:
+        gates.append(("deflation", {
+            "psr": metrics.get("psr"),
+            "dsr": metrics.get("dsr"),
+            "n_trials": metrics.get("n_trials"),
+            "verdict": getattr(dec, "verdict", None),
+            "kill_reason": getattr(dec, "kill_reason", None),
+        }))
+    if metrics.get("holdout") is not None:
+        gates.append(("holdout", {
+            "holdout": metrics.get("holdout"),
+            "verdict": getattr(dec, "verdict", None),
+        }))
+    if metrics.get("power_sufficient") is not None or metrics.get("resolution") is not None:
+        gates.append(("power", {
+            "power_sufficient": metrics.get("power_sufficient"),
+            "mde_ic": metrics.get("mde_ic"),
+            "mde_sharpe_ann": metrics.get("mde_sharpe_ann"),
+            "resolution": metrics.get("resolution"),
+            "verdict": getattr(dec, "verdict", None),
+        }))
+    if metrics.get("tail") is not None or metrics.get("tail_asymmetric") is not None:
+        gates.append(("tail", {
+            "tail": metrics.get("tail"),
+            "tail_asymmetric": metrics.get("tail_asymmetric"),
+            "verdict": getattr(dec, "verdict", None),
+        }))
+    if metrics.get("implausible") is not None or p7.get("implausible") is not None:
+        gates.append(("implausibility", {
+            "implausible": metrics.get("implausible", p7.get("implausible")),
+            "verdict": getattr(dec, "verdict", None),
+        }))
+    if metrics.get("fidelity") is not None or metrics.get("fidelity_suspect") is not None:
+        gates.append(("fidelity", {
+            "fidelity": metrics.get("fidelity"),
+            "fidelity_suspect": metrics.get("fidelity_suspect"),
+            "fidelity_unverified": metrics.get("fidelity_unverified"),
+            "verdict": getattr(dec, "verdict", None),
+            "kill_reason": getattr(dec, "kill_reason", None),
+        }))
+    for gate, detail in gates:
+        _audit_call(
+            audit_log.stage,
+            "gate",
+            "gate_outcome",
+            inputs={"claim_id": getattr(dec, "claim_id", None), "gate": gate},
+            outputs=detail,
+            detail={"claim_id": getattr(dec, "claim_id", None), "gate": gate, **detail},
+        )
+
+
+def _emit_audit_run_events(audit_log: AuditLog | None, run_log: dict, decisions: list | None = None) -> None:
+    if audit_log is None:
+        return
+    _audit_call(audit_log.stage, "P1", "enter",
+                inputs={"paper_path": run_log.get("paper_path")},
+                detail={"paper_path": run_log.get("paper_path")})
+    if run_log.get("p1") is not None:
+        _audit_call(audit_log.stage, "P1", "exit",
+                    outputs=run_log.get("p1"), detail=run_log.get("p1"))
+    if run_log.get("relevance") is not None:
+        _audit_call(audit_log.stage, "relevance", "enter",
+                    inputs={"source_id": run_log.get("source_id")},
+                    detail={"source_id": run_log.get("source_id")})
+        _audit_call(audit_log.stage, "relevance", "exit",
+                    outputs=run_log.get("relevance"), detail=run_log.get("relevance"))
+    if run_log.get("p2") is not None:
+        _audit_call(audit_log.stage, "P2", "enter",
+                    inputs={"source_id": run_log.get("source_id")},
+                    detail={"source_id": run_log.get("source_id")})
+        _audit_call(audit_log.stage, "P2", "exit",
+                    outputs=run_log.get("p2"), detail=run_log.get("p2"))
+    decision_by_claim = {
+        getattr(dec, "claim_id", ""): dec for dec in (decisions or [])
+        if getattr(dec, "claim_id", "")
+    }
+    for rec in run_log.get("claims", []) or []:
+        claim_id = rec.get("claim_id")
+        stages_seen = rec.get("stages") or {}
+        if not isinstance(stages_seen, dict):
+            continue
+        for stage, payload in stages_seen.items():
+            _audit_call(audit_log.stage, str(stage), "enter",
+                        inputs={"claim_id": claim_id},
+                        detail={"claim_id": claim_id})
+            _audit_call(audit_log.stage, str(stage), "exit",
+                        outputs=payload,
+                        detail={"claim_id": claim_id, "payload": payload})
+        dec = decision_by_claim.get(claim_id)
+        if dec is not None:
+            _audit_gate_events(audit_log, dec, rec)
+
+
+def _finalize_audit_run(audit_log: AuditLog | None, audit_path: Path | None,
+                        run_log: dict, decisions: list | None = None) -> None:
+    if audit_log is None or audit_path is None:
+        return
+    try:
+        _emit_audit_run_events(audit_log, run_log, decisions)
+        run_log["audit_head_hash"] = audit_log.head_hash()
+        run_log["audit_path"] = str(audit_path)
+    except Exception as exc:  # noqa: BLE001 - audit must never change verdict control flow
+        _audit_warn(exc)
 
 
 def _llm_available() -> bool:
@@ -550,6 +697,8 @@ def _family(claim, module, source=None, spec: dict | None = None) -> str:
         return f"event_study::{_data_domain(claim)}"
     if _authoritative_claim_type(claim, spec, source) == "forecast_skill":
         return f"forecast_skill::{_data_domain(claim)}"
+    if _authoritative_claim_type(claim, spec, source) == "formulaic_signal":
+        return f"formulaic_signal::{_data_domain(claim)}"
     if source_is_unanchored(getattr(claim, "source_type", "external_source")):
         return f"generated::{_data_domain(claim)}"
     cls = (getattr(claim, "applicable_strategy_class", "") or
@@ -586,6 +735,8 @@ def _generation_source_for(claim: Claim, spec: dict | None = None, source=None) 
         return "event_study"
     if _authoritative_claim_type(claim, spec, source) == "forecast_skill":
         return "forecast_skill"
+    if _authoritative_claim_type(claim, spec, source) == "formulaic_signal":
+        return "formulaic_signal"
     if claim.source_type == "confirmation":
         return "confirmation"
     if source_is_unanchored(claim.source_type):
@@ -672,6 +823,7 @@ def _cleanup_run_cohorts(ready_for_backtest: list[dict]) -> None:
         if _generation_source_for(item["claim"], item.get("spec")) in {
             "paper", "provided_series_statistic", "predictive_regression",
             "factor_spanning", "cross_sectional_sort", "event_study", "forecast_skill",
+            "formulaic_signal",
         }
     }
     try:
@@ -681,8 +833,13 @@ def _cleanup_run_cohorts(ready_for_backtest: list[dict]) -> None:
               file=sys.stderr)
 
 
-def _holdout_unreachable_reason(claim: Claim) -> str | None:
-    if getattr(config, "COST_PROVENANCE", "modeled") != "measured":
+def _holdout_unreachable_reason(claim: Claim, bt: dict | None = None) -> str | None:
+    bt = bt or {}
+    measured_costs = (
+        getattr(config, "COST_PROVENANCE", "modeled") == "measured"
+        or str(bt.get("cost_provenance") or "").strip().lower() == "measured"
+    )
+    if not measured_costs:
         return ("holdout not consulted: research-supported unreachable under modeled costs - "
                 "preserved for a measured-cost run")
     if source_is_unanchored(claim.source_type):
@@ -696,7 +853,7 @@ def _maybe_consult_holdout(claim: Claim, bt: dict, mres: dict, dec, synthetic: b
     if not (dec.verdict == "watch"
             and (bt.get("dsr") or 0) >= config.DSR_DECISION["watch_band"][1]):
         return dec, holdout
-    reason = _holdout_unreachable_reason(claim)
+    reason = _holdout_unreachable_reason(claim, bt)
     if reason:
         holdout = {"not_consulted": True, "reason": reason}
         dec.metrics["holdout"] = holdout
@@ -714,7 +871,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                bundle_override=None,
                force: bool = False,
                max_claims: int | None = None,
-               max_claim_workers: int | str | None = None) -> dict:
+               max_claim_workers: int | str | None = None,
+               principal: str = "cli") -> dict:
     """Run one paper end-to-end. Returns the run log (also written to runs.jsonl)."""
     config.ensure_output_dirs()
     source_type = validate_source_type(source_type)
@@ -737,6 +895,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     source_id = source.source_id
     title = source.title or source_id
     run_id = f"{source_id}-{uuid.uuid4().hex}"
+    audit_path = Path(config.AUDIT) / f"{run_id}.jsonl"
+    audit_log = AuditLog(run_id, principal, audit_path)
     run_log["source_id"] = source_id
     run_log["source_title"] = source.title
     run_log["p1"] = {"n_pages": source.n_pages, "n_chars": source.n_chars,
@@ -749,6 +909,15 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         "force": bool(force),
         "superseded_decisions": 0,
     }
+    _audit_call(
+        audit_log.envelope,
+        __version__,
+        config_fingerprint(),
+        _audit_data_sources(run_log),
+        _audit_seeds(),
+        platform_tuple(),
+        _audit_reproducibility_class(source_type),
+    )
     prior = _processed_source_entry(source_id)
     if (
         not force
@@ -759,6 +928,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         print(f"[penrose] {source_id}: {msg}", file=sys.stderr)
         run_log["idempotency"]["skipped"] = True
         run_log["note"] = msg
+        _finalize_audit_run(audit_log, audit_path, run_log, [])
         _append_jsonl(config.ROOT / "runs.jsonl", run_log)
         _record_processed_source(source_id, paper_path, source.text_sha256)
         _progress(None)
@@ -799,6 +969,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
             # re-adjudicate any specific claim, so no prior decision for this source is
             # touched here — superseding on a non-result is exactly the destructive pattern
             # that erased funding_drift_claim's rows. Nothing to mark; nothing removed.
+            _finalize_audit_run(audit_log, audit_path, run_log, [])
             _append_jsonl(config.ROOT / "runs.jsonl", run_log)
             _record_processed_source(source_id, paper_path, source.text_sha256)
             return out
@@ -846,6 +1017,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
         # decision for this source is superseded here — this exact call, on this exact
         # branch, is what erased funding_drift_claim's rows on 2026-07-04. Never call it
         # on a non-result.
+        _finalize_audit_run(audit_log, audit_path, run_log, [])
         _append_jsonl(config.ROOT / "runs.jsonl", run_log)
         _record_processed_source(source_id, paper_path, source.text_sha256)
         _progress(None)
@@ -955,6 +1127,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                 or _cross_sectional_sort_binding_review(claim, spec)
                                 or _event_study_binding_review(claim, spec)
                                 or _forecast_skill_binding_review(claim, spec)
+                                or _formulaic_signal_binding_review(claim, spec)
                             )
                             if binding_review:
                                 explanation = binding_review.get("explanation") or {}
@@ -1063,6 +1236,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                             impl = {"ok": True, "module": module, "module_id": module.__module_id__,
                                     "validation": {"deterministic": "forecast_skill"},
                                     "deterministic_forecast_skill": True}
+                        elif claim_type == "formulaic_signal":
+                            module = formulaic_signal.build_module(spec, claim)
+                            impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                                    "validation": {"deterministic": "formulaic_signal"},
+                                    "deterministic_formulaic_signal": True}
                         elif not config.AUTO_IMPLEMENT_MODULES:
                             impl = {"ok": False, "reason": "auto-impl disabled"}
                         elif not (sandbox.docker_available() and sandbox.ensure_image()):
@@ -1080,6 +1258,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                 or impl.get("deterministic_cross_sectional_sort")
                                 or impl.get("deterministic_event_study")
                                 or impl.get("deterministic_forecast_skill")
+                                or impl.get("deterministic_formulaic_signal")
                             )
                             if not deterministic_module:
                                 with _REGISTRY_LOCK:
@@ -1102,6 +1281,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                     impl.get("deterministic_event_study")),
                                 "deterministic_forecast_skill": bool(
                                     impl.get("deterministic_forecast_skill")),
+                                "deterministic_formulaic_signal": bool(
+                                    impl.get("deterministic_formulaic_signal")),
                                 "spec_path": str(spec.get("_path", "")),
                                 "validation": impl.get("validation", {}),
                                 "note": (
@@ -1115,6 +1296,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                     if impl.get("deterministic_event_study") else
                                     "deterministic forecast-skill executor; backtesting"
                                     if impl.get("deterministic_forecast_skill") else
+                                    "deterministic formulaic-signal executor; backtesting"
+                                    if impl.get("deterministic_formulaic_signal") else
                                     "deterministic event-market executor; backtesting"
                                     if impl.get("deterministic_event_market") else
                                     "deterministic provided-series executor; backtesting"
@@ -1290,6 +1473,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     or _cross_sectional_sort_binding_review(claim, spec)
                     or _event_study_binding_review(claim, spec)
                     or _forecast_skill_binding_review(claim, spec)
+                    or _formulaic_signal_binding_review(claim, spec)
                 )
                 if binding_review:
                     explanation = binding_review.get("explanation") or {}
@@ -1395,6 +1579,11 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 impl = {"ok": True, "module": module, "module_id": module.__module_id__,
                         "validation": {"deterministic": "forecast_skill"},
                         "deterministic_forecast_skill": True}
+            elif claim_type == "formulaic_signal":
+                module = formulaic_signal.build_module(spec, claim)
+                impl = {"ok": True, "module": module, "module_id": module.__module_id__,
+                        "validation": {"deterministic": "formulaic_signal"},
+                        "deterministic_formulaic_signal": True}
             # Auto-implementation REQUIRES the Docker sandbox — model-written code never execs unsandboxed.
             # No Docker -> no auto-implement (the claim stays pending_module for the operator).
             elif not config.AUTO_IMPLEMENT_MODULES:
@@ -1413,6 +1602,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                     or impl.get("deterministic_cross_sectional_sort")
                     or impl.get("deterministic_event_study")
                     or impl.get("deterministic_forecast_skill")
+                    or impl.get("deterministic_formulaic_signal")
                 )
                 if not deterministic_module:
                     _register_known_modules()      # discover the just-written, validated module
@@ -1433,6 +1623,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                            impl.get("deterministic_event_study")),
                                        "deterministic_forecast_skill": bool(
                                            impl.get("deterministic_forecast_skill")),
+                                       "deterministic_formulaic_signal": bool(
+                                           impl.get("deterministic_formulaic_signal")),
                                        "spec_path": str(spec.get("_path", "")),
                                        "validation": impl.get("validation", {}),
                                        "note": (
@@ -1446,6 +1638,8 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                                            if impl.get("deterministic_event_study") else
                                            "deterministic forecast-skill executor; backtesting"
                                            if impl.get("deterministic_forecast_skill") else
+                                           "deterministic formulaic-signal executor; backtesting"
+                                           if impl.get("deterministic_formulaic_signal") else
                                            "deterministic event-market executor; backtesting"
                                            if impl.get("deterministic_event_market") else
                                            "deterministic provided-series executor; backtesting"
@@ -1636,6 +1830,9 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                         local_decisions.append(_engine_error(claim, "P7 backtest", e, rec, local_run_log))
                         continue
                     bt.setdefault("claim_type", _authoritative_claim_type(claim, spec, source))
+                    for _mk in ("event_market", "cost_provenance", "capacity_provenance"):
+                        if _mk in mres:
+                            bt[_mk] = mres[_mk]
                     if claim.source_type == "external_source":
                         sample_end = (claim.sample_period or {}).get("end") if claim.sample_period else None
                         data_end = None
@@ -1908,6 +2105,9 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
                 decisions.append(_engine_error(claim, "P7 backtest", e, rec, run_log))
                 continue
             bt.setdefault("claim_type", _authoritative_claim_type(claim, spec, source))
+            for _mk in ("event_market", "cost_provenance", "capacity_provenance"):
+                if _mk in mres:
+                    bt[_mk] = mres[_mk]
             if claim.source_type == "external_source":
                 sample_end = (claim.sample_period or {}).get("end") if claim.sample_period else None
                 data_end = None
@@ -2102,6 +2302,7 @@ def run_source(paper_path: Path, *, use_llm: bool | None = None,
     _write_live(source.title, source_id, decisions, provenance, principle, synthetic,
                 specs_generated, p2_prov.get("mode", "unknown"), use_llm)
     run_log["idempotency"]["superseded_decisions"] = _supersede_decision_rows(source_id, run_id)
+    _finalize_audit_run(audit_log, audit_path, run_log, decisions)
     _append_jsonl(config.ROOT / "runs.jsonl", run_log)
     _record_processed_source(source_id, paper_path, source.text_sha256)
     _progress(None)
@@ -2555,6 +2756,52 @@ def _forecast_skill_binding_review(claim, spec: dict | None) -> dict | None:
         }
 
 
+def _formulaic_signal_binding_review(claim, spec: dict | None) -> dict | None:
+    """Return a needs_review payload when formulaic-signal bindings are structurally invalid."""
+    del claim
+    if not isinstance(spec, dict) or spec.get("claim_type") != "formulaic_signal":
+        return None
+    try:
+        required = fidelity._formulaic_signal_names(spec)
+        inputs = spec.get("inputs") or []
+        declared = {str(x or "").strip() for x in inputs if str(x or "").strip()}
+        signal = str(spec.get("signal") or "").strip()
+        trade_series = str(spec.get("trade_series") or "").strip()
+        position_map = str(spec.get("position_map") or "sign").strip().lower()
+        confirmed = {
+            "signal_parses": required is not None,
+            "trade_series": bool(trade_series),
+            "position_map": position_map in {"sign", "zscore_clip"},
+            "inputs_exact": bool(required is not None and declared == required),
+        }
+        if all(confirmed.values()):
+            return None
+        detail = {
+            "reason": "invalid formula or unresolved binding",
+            "signal": signal,
+            "trade_series": trade_series,
+            "funding_pnl_series": spec.get("funding_pnl_series"),
+            "position_map": position_map,
+            "declared_inputs": sorted(declared),
+            "required_inputs": sorted(required or []),
+            "confirmed": confirmed,
+        }
+        return {
+            "kind": "formulaic_signal_binding_uncertain",
+            "reason": "formulaic_signal_binding_unresolved",
+            "detail": detail,
+            "explanation": human_review_explanation("formulaic_signal_binding_uncertain", detail),
+        }
+    except Exception as exc:  # noqa: BLE001
+        detail = {"reason": f"binding confirmation failed: {type(exc).__name__}"}
+        return {
+            "kind": "formulaic_signal_binding_uncertain",
+            "reason": "formulaic_signal_binding_check_error",
+            "detail": detail,
+            "explanation": human_review_explanation("formulaic_signal_binding_uncertain", detail),
+        }
+
+
 def _skip(claim, reason, note, rec, run_log):
     """Spec generated, no module yet — awaiting implementation. This is NOT a backtest
     verdict: it is a distinct 'pending_module' state. Logged to the decisions ledger for
@@ -2735,6 +2982,10 @@ def _missing_spec_inputs_from_bundle(spec: dict, bundle) -> list[str] | None:
             if benchmark_name:
                 inputs.append(benchmark_name)
             spec = {**spec, "inputs": inputs}
+        if isinstance(spec, dict) and spec.get("claim_type") == "formulaic_signal":
+            required = fidelity._formulaic_signal_names(spec)
+            if required is not None:
+                spec = {**spec, "inputs": sorted(required)}
         inputs = spec.get("inputs", []) if isinstance(spec, dict) else []
         if inputs is None:
             return []
@@ -2843,6 +3094,19 @@ def _auto_fetch_and_retry_missing_series(
         except Exception:  # noqa: BLE001
             resolved = None
         if resolved is None:
+            # No DEFAULT_SERIES spec. If auto-source is enabled (opt-in), try to resolve +
+            # ARCHIVE the requested series from a real source (fred/tiingo/coingecko) so it
+            # is never re-queried. Fail-open + gated OFF by default -> no change otherwise.
+            if missing not in attempted_series:
+                try:
+                    from ..data import client as _dataclient
+                    if _dataclient.resolve_missing_series(bundle, missing) is not None:
+                        attempted_series.add(missing)
+                        attempted.append(missing)
+                        added.append(missing)
+                        continue
+                except Exception:  # noqa: BLE001 — auto-source is fail-open
+                    pass
             continue
         key, spec = resolved
         if key in attempted_series:

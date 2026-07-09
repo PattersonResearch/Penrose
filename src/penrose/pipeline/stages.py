@@ -486,8 +486,12 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     fidelity_provenance = "self-authored-unanchored" if unanchored else "external-source"
     # `verdict != "kill"` guards against a cap un-killing a claim the tail gate (cap_only=False)
     # just killed; the message-visibility is preserved via reached_research_supported.
+    measured_costs = (
+        getattr(config, "COST_PROVENANCE", "modeled") == "measured"
+        or str(bt.get("cost_provenance") or "").strip().lower() == "measured"
+    )
     if (reached_research_supported and verdict != "kill" and not is_non_trading_deterministic
-            and getattr(config, "COST_PROVENANCE", "modeled") != "measured"):
+            and not measured_costs):
         verdict = "watch"
         reasons.append("costs/capacity are MODELED placeholders — capped at watch until measured (E2)")
     if reached_research_supported and verdict != "kill" and unanchored:
@@ -623,6 +627,28 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
     if resolution and verdict in ("underpowered", "insufficient_data"):
         reasons.append(_resolution_rationale(verdict, resolution, pw))
 
+    # Implausibility gate: a real tradeable edge does not have a Sharpe of ~18. An implausible/degenerate
+    # net series means the TEST is broken (a degenerate near-zero-vol reconstruction, a look-ahead/leak, or a
+    # modeling artifact), so NO verdict from it is trustworthy — route to needs_review (never a survivor,
+    # never asserting a kill). This is what catches the funding-carry Sharpe-18 case.
+    # The gate applies to claim types whose net IS a tradeable-return series. It is EXEMPT for the
+    # non-trading statistic types (provided_series_statistic / descriptive_statistical / structural), whose
+    # "net" is a pre-computed quantity being mean-tested, not a trading edge — a high "Sharpe" there is not
+    # implausible in the tradeable sense (and those are already provenance-capped).
+    _imp_exempt = claim_type in ("provided_series_statistic", "descriptive_statistical",
+                                 "structural_proposition")
+    imp = bt.get("implausible") or {}
+    if (imp.get("triggered") and not _imp_exempt
+            and verdict in ("kill", "watch", "research-supported",
+                            "underpowered", "insufficient_data")):
+        reasons.append(
+            f"needs_review: IMPLAUSIBLE RESULT — annualized Sharpe {imp.get('sharpe')} exceeds the "
+            f"plausibility ceiling {imp.get('ceiling')} ({imp.get('reason')}). A real tradeable edge does "
+            f"not have a Sharpe this high; this signals a degenerate (near-zero-vol) series, a look-ahead/"
+            f"leak, or a modeling artifact — not a certifiable edge. Inspect the reconstruction module and "
+            f"its input data before trusting any verdict from this run.")
+        verdict, kill = "needs_review", None
+
     rationale = "; ".join(reasons) or "passed all gates"
     if declared_regime and verdict != "kill" and regime.get("adheres") is True:
         rationale += (f"; valid within declared regime: {declared_regime.get('scheme')}="
@@ -660,6 +686,9 @@ def p8_verdict(claim: Claim, bt: dict, holdout: dict, synthetic: bool) -> Decisi
                  "capacity_ci": bt.get("capacity_ci"),
                  "cost_sensitivity": bt.get("cost_sensitivity"),
                  "walk_forward": bt.get("walk_forward"),
+                 "event_market": bt.get("event_market"),
+                 "cost_provenance": bt.get("cost_provenance"),
+                 "capacity_provenance": bt.get("capacity_provenance"),
                  "declared_regime": declared_regime,
                  "regime_adherence": regime.get("adherence"),
                  "fidelity_provenance": fidelity_provenance,

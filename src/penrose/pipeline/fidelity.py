@@ -116,6 +116,17 @@ _FORECAST_SKILL_GUIDANCE = (
     "OOS/holdout look-ahead."
 )
 
+_FORMULAIC_SIGNAL_GUIDANCE = (
+    "\nCLAIM TYPE OVERRIDE: claim_type=formulaic_signal. This is a trusted "
+    "deterministic formula executor, not LLM-generated strategy code. A spec is "
+    "structurally faithful when it declares the exact DSL signal string, the traded "
+    "price series, the position_map, optional funding_pnl_series, and an inputs list "
+    "that exactly covers every referenced series. The executor applies the one-bar "
+    "position lag and optional funding cash-flow in one audited place. Hunt for "
+    "series substitution, missing funding_pnl_series, wrong position_map, or a "
+    "formula that changes the claim's signal."
+)
+
 _USER_TMPL = """CLAIM (verbatim): {statement}
 MECHANISM: {mechanism}
 SPEC signal_logic: {signal_logic}
@@ -187,6 +198,8 @@ def assess(claim, module_code: str, spec: dict | None = None,
         system += _EVENT_STUDY_GUIDANCE
     elif claim_type == "forecast_skill":
         system += _FORECAST_SKILL_GUIDANCE
+    elif claim_type == "formulaic_signal":
+        system += _FORMULAIC_SIGNAL_GUIDANCE
     try:
         parsed, response = llm.call_json(
             role,
@@ -213,7 +226,8 @@ def assess(claim, module_code: str, spec: dict | None = None,
         result = _factor_spanning_backstop(result, claim_type, spec, claim)
         result = _cross_sectional_sort_backstop(result, claim_type, spec, claim)
         result = _event_study_backstop(result, claim_type, spec, claim)
-        return _forecast_skill_backstop(result, claim_type, spec, claim)
+        result = _forecast_skill_backstop(result, claim_type, spec, claim)
+        return _formulaic_signal_backstop(result, claim_type, spec, claim)
     except Exception as e:  # noqa: BLE001 — inconclusive is contained, never promoted to faithful
         return {"faithful": False, "verified": False, "confidence": 0.0, "divergences": [],
                 "note": f"fidelity check errored: {e}", "independent_verifier": False}
@@ -325,6 +339,72 @@ def _provided_series_statistic_backstop(result: dict, claim_type: str,
     return out
 
 
+def _formulaic_signal_names(spec: dict | None) -> set[str] | None:
+    if not isinstance(spec, dict):
+        return None
+    try:
+        from . import formulaic_signal
+
+        names = formulaic_signal.referenced_names(str(spec.get("signal") or ""))
+    except Exception:  # noqa: BLE001
+        return None
+    out = {str(x or "").strip() for x in names if str(x or "").strip()}
+    trade = str(spec.get("trade_series") or "").strip()
+    funding = str(spec.get("funding_pnl_series") or "").strip()
+    if trade:
+        out.add(trade)
+    if funding:
+        out.add(funding)
+    return out
+
+
+def _is_deterministic_formulaic_signal_spec(spec: dict | None) -> bool:
+    if not isinstance(spec, dict):
+        return False
+    if spec.get("claim_type") != "formulaic_signal":
+        return False
+    if not str(spec.get("signal") or "").strip():
+        return False
+    if not str(spec.get("trade_series") or "").strip():
+        return False
+    if str(spec.get("position_map") or "sign").strip().lower() not in {"sign", "zscore_clip"}:
+        return False
+    required = _formulaic_signal_names(spec)
+    if not required:
+        return False
+    inputs = spec.get("inputs")
+    if not isinstance(inputs, list):
+        return False
+    declared = {str(x or "").strip() for x in inputs if str(x or "").strip()}
+    return declared == required
+
+
+def _formulaic_signal_correspondence_verified(claim, spec: dict | None) -> bool:
+    del claim
+    return _is_deterministic_formulaic_signal_spec(spec)
+
+
+def _formulaic_signal_backstop(result: dict, claim_type: str,
+                               spec: dict | None = None, claim=None) -> dict:
+    if claim_type != "formulaic_signal" or result.get("faithful") is not False:
+        return result
+    if not _formulaic_signal_correspondence_verified(claim, spec):
+        return result
+    out = dict(result)
+    out["faithful"] = True
+    out["verified"] = (
+        float(out.get("confidence", 0.0) or 0.0) >= config.FIDELITY_KILL_CONFIDENCE
+    )
+    out["formulaic_signal_fidelity_override"] = "deterministic_formula_structural"
+    note = str(out.get("note", "") or "").strip()
+    suffix = (
+        "formulaic_signal fidelity block overridden structurally: DSL parses under "
+        "the audited operator table and inputs exactly match formula/trade/funding series"
+    )
+    out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
+    return out
+
+
 def _is_deterministic_event_market_spec(spec: dict | None) -> bool:
     if not isinstance(spec, dict):
         return False
@@ -333,6 +413,15 @@ def _is_deterministic_event_market_spec(spec: dict | None) -> bool:
     cfg = spec.get("event_market") if isinstance(spec.get("event_market"), dict) else spec
     has_table = any(cfg.get(k) for k in ("path", "table", "table_path",
                                          "event_market_path", "event_market_table"))
+    rule = ""
+    for key in ("primitive", "strategy", "rule", "strategy_rule", "strategy_family"):
+        value = spec.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("family") or value.get("rule")
+        text = str(value or "").strip().lower().replace("-", "_")
+        if text in {"kalshi_weather_tail_fade", "weather_tail_fade", "tail_fade"}:
+            rule = "kalshi_weather_tail_fade"
+            break
     pricing = spec.get("pricing_model") or spec.get("pricing") or spec.get("model") or {}
     if isinstance(pricing, dict):
         family = str(pricing.get("family") or pricing.get("model") or "")
@@ -345,7 +434,7 @@ def _is_deterministic_event_market_spec(spec: dict | None) -> bool:
     # collide with the legit event-market fields min_ev/max_price/kelly_fraction/size_cap/pricing params.)
     if _provided_series_has_added_gate_field(spec):
         return False
-    return has_table and family.strip() == "normal_bracket"
+    return has_table and (family.strip() == "normal_bracket" or rule == "kalshi_weather_tail_fade")
 
 
 def _event_market_strategy_backstop(result: dict, claim_type: str,
@@ -363,8 +452,8 @@ def _event_market_strategy_backstop(result: dict, claim_type: str,
     note = str(out.get("note", "") or "").strip()
     suffix = (
         "event_market_strategy fidelity block overridden structurally: deterministic "
-        "normal_bracket pricing over a declared bracket table; arbitrary pricing-formula "
-        "fidelity is deferred"
+        "audited event-market primitive over a declared bracket table; arbitrary "
+        "pricing-formula fidelity is deferred"
     )
     out["note"] = (f"{note}; {suffix}" if note else suffix)[:240]
     return out

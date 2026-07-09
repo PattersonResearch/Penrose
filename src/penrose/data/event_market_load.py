@@ -17,7 +17,7 @@ from typing import Any
 
 import pandas as pd
 
-from .event_market import EVENT_MARKET_COLUMNS, EventMarketPanel
+from .event_market import EVENT_MARKET_COLUMNS, EventMarketPanel, coerce_event_market_frame
 
 
 class EventMarketDataUnavailable(RuntimeError):
@@ -56,6 +56,7 @@ def load_event_market(spec: dict, data_dir) -> EventMarketPanel:
             f"data_unavailable: event_market_table {path}: {type(exc).__name__}: {exc}"
         ) from None
 
+    raw = coerce_event_market_frame(raw, preserve_extra=_ASOF_COLUMNS)
     missing = [c for c in EVENT_MARKET_COLUMNS if c not in raw.columns]
     if missing:
         raise EventMarketDataUnavailable(
@@ -67,7 +68,10 @@ def load_event_market(spec: dict, data_dir) -> EventMarketPanel:
     df["underlying"] = df["underlying"].map(_parse_underlying)
     name = str(_event_cfg(spec).get("name") or path.stem or "event_market")
     provenance = str(_event_cfg(spec).get("provenance") or f"event_market_table:{path}")
-    return EventMarketPanel(name=name, data=df, provenance=provenance)
+    try:
+        return EventMarketPanel(name=name, data=df, provenance=provenance)
+    except (TypeError, ValueError) as exc:
+        raise EventMarketDataUnavailable(f"data_unavailable: event_market_table invalid: {exc}") from None
 
 
 def _event_cfg(spec: dict | None) -> dict:

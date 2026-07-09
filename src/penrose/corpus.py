@@ -34,14 +34,94 @@ def _read(path: Path) -> list[dict]:
     return out
 
 
+def _identity_slug(value) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", "-", text)
+    text = re.sub(r"[^a-z0-9_-]+", "-", text)
+    return text.strip("-_")
+
+
+def _normalize_family_identity(raw) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    components_raw = raw.get("components")
+    if not isinstance(components_raw, (list, tuple)):
+        return None
+    components = sorted({
+        component for component in (_identity_slug(x) for x in components_raw)
+        if component
+    })
+    if not components:
+        return None
+    return {
+        "components": components,
+        "method": _identity_slug(raw.get("method")) or None,
+        "driver": _identity_slug(raw.get("driver")) or None,
+    }
+
+
+def _family_identity(c: dict) -> dict | None:
+    p = c.get("data_provenance") if isinstance(c.get("data_provenance"), dict) else {}
+    raw_candidates = [
+        p.get("family_identity"),
+        c.get("family_identity"),
+    ]
+    for key in ("claim_spec", "spec"):
+        container = c.get(key)
+        if isinstance(container, dict):
+            raw_candidates.append(container.get("family_identity"))
+    for raw in raw_candidates:
+        normalized = _normalize_family_identity(raw)
+        if normalized is not None:
+            return normalized
+    return None
+
+
+def _identity_components_key(identity: dict) -> str:
+    return "+".join(identity["components"])
+
+
+def _identity_specific_key(identity: dict) -> str:
+    parts = [_identity_components_key(identity)]
+    if identity.get("method"):
+        parts.append(identity["method"])
+    if identity.get("driver"):
+        parts.append(identity["driver"])
+    return "|".join(parts)
+
+
 def _domain(c: dict) -> str:
+    identity = _family_identity(c)
+    if identity is not None:
+        return _identity_specific_key(identity)
     p = c.get("data_provenance") or {}
     return str(p.get("data_domain") or p.get("domain") or "general")
 
 
 def _family(c: dict) -> str:
+    identity = _family_identity(c)
+    if identity is not None:
+        return _identity_specific_key(identity)
     p = c.get("data_provenance") or {}
     return str(p.get("strategy_family") or p.get("family") or _domain(c))
+
+
+def _family_keys(c: dict) -> list[tuple[str, str | None]]:
+    identity = _family_identity(c)
+    if identity is None:
+        return [(_family(c), None)]
+    ordered = []
+    if identity.get("method") or identity.get("driver"):
+        ordered.append((_identity_specific_key(identity), "specific"))
+    ordered.append((_identity_components_key(identity), "components"))
+    ordered.extend((component, "component") for component in identity["components"])
+    seen = set()
+    out = []
+    for key, granularity in ordered:
+        if key and key not in seen:
+            seen.add(key)
+            out.append((key, granularity))
+    return out
 
 
 def _direction(c: dict) -> str:
@@ -111,13 +191,19 @@ def build(concepts: list[dict], *, min_support: int | None = None,
         specific_claims.append(node); nodes.append(node)
         edges += [{"from": r.get("concept_id"), "to": node["node_id"], "type": "recurs_as"}
                   for r in rows]
-    grouped = defaultdict(list)
+    grouped = defaultdict(lambda: {"rows": [], "granularities": set()})
     for c in concepts:
         if _direction(c) == "unknown":
             continue
-        grouped[(_family(c), _direction(c))].append(c)
+        for family, granularity in _family_keys(c):
+            group = grouped[(family, _direction(c))]
+            group["rows"].append(c)
+            if granularity:
+                group["granularities"].add(granularity)
     families = []
-    for (family, direction), rows in sorted(grouped.items()):
+    granularity_rank = {"specific": 0, "components": 1, "component": 2}
+    for (family, direction), group in sorted(grouped.items()):
+        rows = group["rows"]
         rows = sorted(rows, key=lambda x: str(x.get("concept_id")))
         if len(rows) < min_support:
             continue
@@ -128,6 +214,9 @@ def build(concepts: list[dict], *, min_support: int | None = None,
                 "provenance": [r.get("concept_id") for r in rows],
                 "data_provenance": _footprint(rows),
                 "caveat": "Advisory prior only; every new claim is tested independently."}
+        if group["granularities"]:
+            node["granularity"] = sorted(group["granularities"],
+                                         key=lambda x: granularity_rank[x])[0]
         families.append(node); nodes.append(node)
         edges += [{"from": r.get("concept_id"), "to": node["node_id"], "type": "supports"}
                   for r in rows]
@@ -144,7 +233,9 @@ def build(concepts: list[dict], *, min_support: int | None = None,
                 "level": "cross_family_mechanism", "direction": direction,
                 "statement": f"A {direction} mechanism recurs across distinct data families.",
                 "families": sorted(r["family"] for r in rows), "data_domains": sorted(domains),
-                "support_count": sum(r["support_count"] for r in rows),
+                # S6E-1: count DISTINCT supporting kills (union of provenance), not sum(support_count) — a kill
+                # can back both its specific and component family_principle, so summing double-counts it.
+                "support_count": len({pid for r in rows for pid in (r.get("provenance") or [])}),
                 "provenance": [r["node_id"] for r in rows],
                 "data_provenance": _footprint(rows),
                 "caveat": "Candidate synthesis input, not a verdict."}

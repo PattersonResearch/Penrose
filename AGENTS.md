@@ -136,3 +136,6 @@ When you add or extend an adapter:
   green. Verdict-logic changes get the most scrutiny; call them out explicitly.
 - The corpus of invalidations may **inform** a human; it never **gates** a verdict automatically.
 - This is a `0.x` research prototype: interfaces may change. Prefer additive, reversible changes.
+
+## Harness integrity (do not overfit the referee)
+Every new gate must be classified general-vs-incident and recorded in the gate ledger; incident-specific narrow guards must fail *soft* (`needs_review`), never hard-reject a possibly-legitimate input. NEVER weaken a gate to make a case pass.

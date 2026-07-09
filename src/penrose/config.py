@@ -41,6 +41,7 @@ ARCHIVES = ROOT / "archives"
 DREAM_ARCHIVES = ARCHIVES / "dreams"
 INBOX = ROOT / "inbox"
 REPORTS = ROOT / "reports"
+AUDIT = REPORTS / "audit"
 MODULES = ROOT / "modules"
 # Provenance shelf: machine-generated (auto-implemented, UNTRUSTED) modules live HERE, separate
 # from operator-curated trusted modules at MODULES/. The leading underscore makes
@@ -75,6 +76,7 @@ def ensure_output_dirs() -> None:
     for path in (
         REPORTS,
         REPORTS / "charts",
+        AUDIT,
         LIVE_JSON.parent,
         LLM_CACHE_DIR,
         HOLDOUT_DIR,
@@ -190,6 +192,16 @@ VOL_TRADE_COST = {
 # Capacity: linear market-impact, bps of extra slippage per $1M traded (reuses
 # the harness _capacity_usd model). BTC vol (Deribit) is thinner than spot.
 IMPACT_COEF_BPS_PER_1M = 25.0
+
+# Implausibility gate. Penrose's gates test statistical SIGNIFICANCE (is the edge real given the noise) and
+# tails, but a degenerate/leaky net series (near-zero volatility, a look-ahead, or a modeling artifact) is
+# highly significant, so nothing catches it — a funding-carry reconstruction reached `watch` with an
+# annualized Sharpe of ~18. A real tradeable edge does not have a Sharpe that high. An implausibly strong
+# result is a signal that the TEST is broken, not a discovery: it routes to needs_review (never a survivor).
+IMPLAUSIBILITY = {
+    "max_annualized_sharpe": 6.0,   # |annualized Sharpe| above this -> implausible (real edges run ~2-3)
+    "degenerate_std_ratio": 0.02,   # OOS return std < this * |mean| -> a near-constant-sign degenerate series
+}
 
 DSR_DECISION = {
     "kill_below_psr": 0.90,        # PSR/DSR below this on OOS -> kill
@@ -312,6 +324,24 @@ except Exception:
 #                          "field": "close", "stype_in": "continuous",
 #                          "start": "2018-01-01", "end": "2025-12-31"},
 DATABENTO_SERIES: dict = {}
+
+# Auto-source-and-archive (data/auto_source.py). OPT-IN, default OFF so a
+# reproducibility-strict or offline run is byte-for-byte unaffected. When enabled
+# (PENROSE_AUTO_SOURCE=1 — a commercial/self-hosted deployment sets this), a
+# catalog MISS for a requested series is resolved through an existing vendor
+# adapter (FRED / Tiingo / CoinGecko), ARCHIVED locally under
+# <PENROSE_DATA_DIR>/vendor/<name>.parquet, and registered in catalog.yaml, so the
+# same series is never re-queried. Fail-open at every level: a miss, disabled
+# source, or failed fetch leaves today's honest `needs_data` behavior unchanged.
+#   enabled        — master switch (env PENROSE_AUTO_SOURCE)
+#   max_stale_days — reuse an archived parquet whose mtime is within this many days
+#                    WITHOUT re-fetching (the whole point: pull once, reuse)
+#   allow_sources  — only these adapters may be auto-invoked
+AUTO_SOURCE = {
+    "enabled": os.environ.get("PENROSE_AUTO_SOURCE", "0").lower() in ("1", "true", "yes"),
+    "max_stale_days": int(os.environ.get("PENROSE_AUTO_SOURCE_MAX_STALE_DAYS", "7") or 7),
+    "allow_sources": ["fred", "tiingo", "coingecko"],
+}
 
 # Calibration tolerance. The edge /
 # Sharpe bands ARE the reference's own bootstrap CI half-width (see pipeline/v4a.py),

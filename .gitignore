@@ -86,3 +86,7 @@ chat_log/
 
 # generated corpus artifact (rebuilt by corpus.build_files; dashboard reads it)
 dashboard/corpus.json
+.claude/worktrees/
+
+# per-run audit event logs (runtime, hash-chained; never committed)
+reports/audit/

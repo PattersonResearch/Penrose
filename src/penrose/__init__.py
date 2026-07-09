@@ -6,4 +6,4 @@ cheap-kill filters, generates and runs a backtest module, and proposes
 kill/underpowered/watch/research-supported verdicts plus principles — which a human commits
 through the review gate. Backtests propose; humans commit.
 """
-__version__ = "0.7.0"
+__version__ = "0.8.0"

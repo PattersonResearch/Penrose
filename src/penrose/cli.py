@@ -108,6 +108,53 @@ def _cmd_triage(args) -> int:
     return 0
 
 
+def _cmd_audit(args) -> int:
+    from . import views
+    report = views.audit_summary(args.run_id, verify=args.verify)
+    if args.json:
+        print(json.dumps(report, sort_keys=True))
+        return 0
+    if report.get("status") != "ok":
+        print(report.get("message") or "No audit events found.")
+        return 0
+
+    env = report.get("envelope") or {}
+    platform = env.get("platform") if isinstance(env.get("platform"), dict) else {}
+    fp = str(env.get("config_fingerprint") or "")
+    print(f"Audit log ({report.get('run_id')}; events={report.get('n_events')}; input={report.get('path')})")
+    print("")
+    print("Envelope:")
+    print(f"  version: {env.get('version') or '?'}")
+    print(f"  class:   {env.get('reproducibility_class') or '?'}")
+    print(f"  config:  {fp[:16] if fp else '?'}")
+    print(f"  platform:{' ' if platform else ' ?'}{json.dumps(platform, sort_keys=True) if platform else ''}")
+    print("")
+    print("Stage timings (ms):")
+    timings = report.get("stage_timings") or {}
+    if timings:
+        for stage, duration in timings.items():
+            print(f"  {stage:<24} {duration:g}")
+    else:
+        print("  none")
+    print("")
+    print("Gate outcomes:")
+    gates = report.get("gate_outcomes") or {}
+    if gates:
+        for gate, count in gates.items():
+            print(f"  {gate:<24} {count}")
+    else:
+        print("  none")
+    print("")
+    if args.verify:
+        if report.get("chain_ok"):
+            print("\033[1mCHAIN OK\033[0m")
+        else:
+            print(f"\033[1mCHAIN BROKEN at seq {report.get('chain_broken_seq')}\033[0m")
+    else:
+        print("CHAIN NOT VERIFIED")
+    return 0
+
+
 def _cmd_status(args) -> int:
     from . import views
     d = views.status()
@@ -342,6 +389,30 @@ def _cmd_principles(args) -> int:
     return 0
 
 
+def _cmd_share(args) -> int:
+    from . import commons
+    out = commons.export_kill_records(args.out, anonymize=args.anonymize)
+    print(
+        f"exported={out['exported']} skipped_non_kill={out['skipped_non_kill']} "
+        f"invalid={out['invalid']} out={out['out']}"
+    )
+    return 0
+
+
+def _cmd_commons_pull(args) -> int:
+    from . import commons
+    out = commons.commons_pull_dir(args.dir)
+    print(
+        f"ingested={out['ingested']} duplicate={out['duplicate']} "
+        f"invalid={out['invalid']} merkle_mismatch={out['merkle_mismatch']}"
+    )
+    if out.get("invalid_files"):
+        print("invalid_files=" + ",".join(out["invalid_files"]))
+    if out.get("mismatch_files"):
+        print("merkle_mismatch_files=" + ",".join(out["mismatch_files"]))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="penrose",
                                  description="Falsification-first research pipeline.")
@@ -372,6 +443,15 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--top", type=int, default=15, help="maximum recurring failure clusters to show")
     p.add_argument("--source", help="filter to one source_id")
     p.set_defaults(fn=_cmd_triage)
+
+    p = sub.add_parser("audit", help="summarize and verify a per-run audit log")
+    p.add_argument("run_id", nargs="?", help="run id; default = most recent audit log")
+    p.add_argument("--json", action="store_true", help="print a stable machine-readable report")
+    p.add_argument("--verify", dest="verify", action="store_true", default=True,
+                   help="verify the hash chain (default)")
+    p.add_argument("--no-verify", dest="verify", action="store_false",
+                   help="skip hash-chain verification")
+    p.set_defaults(fn=_cmd_audit)
 
     sub.add_parser("data-requests", help="open F7b data blockers").set_defaults(fn=_cmd_data_requests)
     sub.add_parser("status", help="pipeline status").set_defaults(fn=_cmd_status)
@@ -409,6 +489,17 @@ def main(argv: list[str] | None = None) -> int:
     p = sub.add_parser("distill", help="alias for principles")
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=_cmd_principles)
+
+    p = sub.add_parser("share", help="export local kill decisions as commons kill-records")
+    p.add_argument("--out", default="commons_out", help="directory for *.killrecord.json files")
+    p.add_argument("--min-verdict", default="kill", choices=["kill"],
+                   help="minimum verdict to export; only kill is allowed")
+    p.add_argument("--anonymize", action="store_true", help="omit contributor_id from exported records")
+    p.set_defaults(fn=_cmd_share)
+
+    p = sub.add_parser("commons-pull", help="ingest commons kill-records as advisory concepts")
+    p.add_argument("dir", help="directory containing *.killrecord.json files")
+    p.set_defaults(fn=_cmd_commons_pull)
 
     args = ap.parse_args(argv)
     # CLI error boundary: expected runtime problems (missing API key, missing run/file)

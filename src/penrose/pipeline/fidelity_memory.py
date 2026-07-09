@@ -26,6 +26,7 @@ CLAIM_TYPES = frozenset({
     "cross_sectional_sort",
     "event_study",
     "forecast_skill",
+    "formulaic_signal",
 })
 DEFAULT_CLAIM_TYPE = "trading_strategy"
 
@@ -284,6 +285,22 @@ _STRUCTURAL_PATTERNS = [
     r"\bshould\b",
 ]
 
+_FORMULAIC_SIGNAL_PATTERNS = [
+    r"\bsignal\s*(?:formula|dsl)?\s*[:=]\s*[^.;\n]+",
+    r"\btrade_series\s*[:=]\s*[a-zA-Z][a-zA-Z0-9_.]*",
+    r"\bposition_map\s*[:=]\s*(?:sign|zscore_clip)\b",
+]
+
+
+def _has_formulaic_signal_signature(text: str) -> bool:
+    # This intentionally lives below the structural deterministic signatures: it should
+    # catch explicit formula/trade-series declarations, not steal paper event-study,
+    # forecast-skill, spanning, sort, or predictive-regression claims.
+    return bool(
+        re.search(r"\btrade_series\s*[:=]\s*[a-zA-Z][a-zA-Z0-9_.]*", text)
+        and re.search(r"\bsignal\s*(?:formula|dsl)?\s*[:=]\s*[^.;\n]+", text)
+    )
+
 _PREREGISTERED_SINGLE_STAT_PATTERNS = [
     r"\b(?:exactly\s+)?one\s+pre[- ]?registered\s+statistic\b",
     r"\bsingle\s+pre[- ]?registered\s+statistic\b",
@@ -482,6 +499,9 @@ def classify_claim_type(claim, source=None) -> str:
     # claims that merely mention those words without being strategy-framed.
     if _has_structural_predictive_regression_signature(claim_text):
         return "predictive_regression"
+
+    if _has_formulaic_signal_signature(claim_text):
+        return "formulaic_signal"
 
     # Checked FIRST and independently of the descriptive/trading tally, but only for
     # explicit provided-series declarations. Ambiguous pooled/cohort/one-sample prose is

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from collections import Counter, defaultdict
 
 from . import config
+from .audit import verify_events
 
 
 def _read_jsonl(path: Path) -> list[dict]:
@@ -135,3 +137,76 @@ def triage(top: int = 15, source: str | None = None) -> dict:
     report = triage_report(rows, top=int(top), source=source)
     report["input"] = loaded_from
     return report
+
+
+def _latest_audit_path() -> Path | None:
+    audit_dir = Path(config.AUDIT)
+    try:
+        files = [p for p in audit_dir.glob("*.jsonl") if p.is_file()]
+    except OSError:
+        return None
+    if not files:
+        return None
+    # deterministic under an mtime tie: break ties by filename so `penrose audit`
+    # never picks an arbitrary run when two logs share a wall-clock second.
+    return max(files, key=lambda p: (p.stat().st_mtime, p.name))
+
+
+def audit_summary(run_id=None, *, verify: bool = True) -> dict:
+    """Read-only summary of a per-run audit log.
+
+    Returns chain verification status, reproduction envelope, stage timings,
+    gate outcome counts, and a simple stage drop-off count. Missing/corrupt
+    files fail gracefully into a structured empty/error object.
+    """
+    if run_id is None:
+        path = _latest_audit_path()
+        if path is None:
+            return {"status": "empty", "message": "No audit logs found yet."}
+        run_id = path.stem
+    else:
+        path = Path(config.AUDIT) / f"{run_id}.jsonl"
+    rows = _read_jsonl(path)
+    if not rows:
+        return {"status": "empty", "run_id": str(run_id), "message": f"No audit events found at {path}."}
+
+    if verify:
+        chain_ok, broken_seq = verify_events(rows)
+    else:
+        chain_ok, broken_seq = None, None
+
+    # A non-dict row (tampered/truncated/foreign line) must never crash the summary — it is
+    # already reflected as a broken chain above. Aggregate only over well-formed dict rows.
+    malformed = sum(1 for row in rows if not isinstance(row, dict))
+    dict_rows = [row for row in rows if isinstance(row, dict)]
+
+    timings = defaultdict(float)
+    gate_counts = Counter()
+    drop_off = Counter()
+    for row in dict_rows:
+        stage = str(row.get("stage") or "unknown")
+        if row.get("duration_ms") is not None:
+            try:
+                timings[stage] += float(row.get("duration_ms") or 0)
+            except (TypeError, ValueError):
+                pass
+        if row.get("event") == "gate_outcome":
+            detail = row.get("detail") if isinstance(row.get("detail"), dict) else {}
+            gate_counts[str(detail.get("gate") or stage)] += 1
+        if row.get("event") == "exit":
+            drop_off[stage] += 1
+
+    envelope = dict_rows[0].get("detail") if dict_rows and dict_rows[0].get("event") == "reproduction_envelope" else {}
+    return {
+        "status": "ok",
+        "run_id": str(run_id),
+        "path": str(path),
+        "n_events": len(rows),
+        "malformed_rows": malformed,
+        "chain_ok": chain_ok,
+        "chain_broken_seq": broken_seq,
+        "envelope": envelope if isinstance(envelope, dict) else {},
+        "stage_timings": dict(sorted(timings.items())),
+        "gate_outcomes": dict(sorted(gate_counts.items())),
+        "drop_off": dict(sorted(drop_off.items())),
+    }

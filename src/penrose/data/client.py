@@ -268,6 +268,46 @@ def fetch_bundle(start: str = WINDOW[0], end: str = WINDOW[1]) -> DataBundle:
     return bundle
 
 
+def resolve_missing_series(bundle: DataBundle, name: str, *, spec=None):
+    """Catalog-MISS handler: resolve `name` from a real source, ARCHIVE it, register it in
+    the catalog, and fold the freshly-archived series into `bundle`. Returns the loaded
+    `Series` on success, else None.
+
+    OPT-IN + surgical: if `config.AUTO_SOURCE["enabled"]` is False (the default), or the
+    series can't be sourced, this behaves EXACTLY as today — it returns None and the caller
+    keeps its honest `needs_data`. Fail-open: never raises.
+
+    This is the automatic loop the manual `fetch_*.py` scripts previously covered by hand:
+    on a miss -> resolve -> fetch via an existing adapter -> archive -> continue.
+    """
+    if bundle is None or not name:
+        return None
+    existing = bundle.get(name)
+    if isinstance(existing, Series):
+        return existing                    # already present — nothing to source
+    from .. import config
+    auto = getattr(config, "AUTO_SOURCE", None) or {}
+    if not auto.get("enabled"):
+        return None                        # disabled -> unchanged (needs_data preserved)
+    try:
+        from . import auto_source
+        res = auto_source.resolve_and_archive(name, spec=spec, data_dir=config.DATA_DIR)
+    except Exception:  # noqa: BLE001 — auto-source must never break a run
+        return None
+    if not res:
+        return None
+    s = res.get("series")
+    if s is None or len(s) == 0:
+        return None
+    if getattr(s.index, "tz", None) is None:
+        s.index = s.index.tz_localize("UTC")
+    prov = res.get("provenance") or "auto_source"
+    ser = Series(name, s, prov, res.get("unit", ""),
+                 note=f"auto_source:{'cache' if res.get('cached') else 'fetch'}:{prov}")
+    bundle.series[name] = ser
+    return ser
+
+
 def _add_vendor_series(bundle: DataBundle) -> None:
     """Fold every ENABLED data-vendor adapter's configured series into the bundle.
     BYO + fail-open: no key / no package / broken vendor -> the series is simply

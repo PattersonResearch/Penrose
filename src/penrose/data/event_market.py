@@ -23,6 +23,17 @@ EVENT_MARKET_COLUMNS = [
     "underlying",
 ]
 
+WEATHER_TAIL_COLUMNS = [
+    "ticker",
+    "city",
+    "close_date",
+    "p_close",
+    "outcome",
+    "volume",
+    "open_interest",
+    "is_tail",
+]
+
 
 @dataclass
 class EventMarketPanel:
@@ -48,7 +59,7 @@ class EventMarketPanel:
         if len(self.data) == 0 and len(self.data.columns) == 0:
             df = pd.DataFrame(columns=EVENT_MARKET_COLUMNS)
         else:
-            df = self.data.copy()
+            df = coerce_event_market_frame(self.data)
 
         missing = [c for c in EVENT_MARKET_COLUMNS if c not in df.columns]
         if missing:
@@ -122,3 +133,46 @@ def _utc_datetime_series(values: pd.Series, name: str) -> pd.Series:
         else:
             out.append(ts.tz_convert("UTC"))
     return pd.Series(out, index=values.index, name=name, dtype="datetime64[ns, UTC]")
+
+
+def coerce_event_market_frame(data: pd.DataFrame, *, preserve_extra: tuple[str, ...] = ()) -> pd.DataFrame:
+    """Return a generic event-market frame, accepting the Kalshi weather raw shape.
+
+    The weather tail primitive consumes ticker/city/liquidity/tail flags from the
+    row ``underlying`` dict. Keeping those fields there avoids creating a second
+    event-market contract while still letting declared raw weather tables load.
+    """
+    df = data.copy()
+    if all(c in df.columns for c in EVENT_MARKET_COLUMNS):
+        if preserve_extra:
+            keep = EVENT_MARKET_COLUMNS + [c for c in preserve_extra if c in df.columns]
+            return df.loc[:, keep].copy()
+        return df
+    if not all(c in df.columns for c in WEATHER_TAIL_COLUMNS):
+        return df
+
+    out = pd.DataFrame(index=df.index)
+    out["event_id"] = df["ticker"].astype(str)
+    out["decision_time"] = df["close_date"]
+    out["close_time"] = df["close_date"]
+    out["strike_low"] = df["strike_low"] if "strike_low" in df.columns else 0.0
+    out["strike_high"] = df["strike_high"] if "strike_high" in df.columns else 1.0
+    out["entry_price"] = df["p_close"]
+    out["outcome"] = df["outcome"]
+
+    def _underlying(row) -> dict:
+        return {
+            "ticker": row["ticker"],
+            "city": row["city"],
+            "close_date": row["close_date"],
+            "p_close": row["p_close"],
+            "volume": row["volume"],
+            "open_interest": row["open_interest"],
+            "is_tail": row["is_tail"],
+        }
+
+    out["underlying"] = df.apply(_underlying, axis=1)
+    for col in preserve_extra:
+        if col in df.columns:
+            out[col] = df[col]
+    return out

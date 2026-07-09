@@ -687,11 +687,10 @@ The Chen–Zimmermann script evaluates 212 monthly long-short anomaly return ser
 
 | Deflation scope | Surviving `watch` or stronger |
 |---|---:|
-| anomaly evaluated alone | 102/212, approximately 48% |
+| anomaly evaluated alone | 28/212, approximately 13% |
 | all anomalies in one family | 6/212, approximately 3% |
-| category proxy | 8/212, approximately 4% |
 
-The roughly sixteen-fold range is a systems result about trial-family policy: an evaluator cannot report “survival” without disclosing the search denominator. Treating all 212 anomalies as one historical search is intentionally conservative and may over-penalize authors who did not observe the full zoo; evaluating each alone ignores field-level selection. Penrose currently records one selected scope per run. A standards-conforming report should show scope sensitivity.
+The roughly five-fold range is a systems result about trial-family policy: an evaluator cannot report “survival” without disclosing the search denominator. Treating all 212 anomalies as one historical search is intentionally conservative and may over-penalize authors who did not observe the full zoo; evaluating each alone ignores field-level selection. Penrose currently records one selected scope per run. A standards-conforming report should show scope sensitivity.
 
 ### 13.7 Post-publication decay
 

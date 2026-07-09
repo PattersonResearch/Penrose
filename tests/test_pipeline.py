@@ -109,7 +109,7 @@ def test_cost_sensitivity_breakeven():
     n = 240
     idx = pd.date_range("2024-01-01", periods=n, freq="D")
     signed = pd.Series(np.where(np.arange(n) % 2 == 0, 1.0, -1.0), index=idx)
-    gross = pd.Series(0.0018 + rng.normal(0, 0.0007, n), index=idx)
+    gross = pd.Series(0.0018 + rng.normal(0, 0.006, n), index=idx)  # realistic Sharpe (~4-5), keeps edge > cost
     payoff = signed * gross
     turn = signed.diff().abs().fillna(signed.abs())
     cost = 0.0005

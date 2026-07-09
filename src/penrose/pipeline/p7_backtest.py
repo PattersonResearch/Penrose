@@ -37,6 +37,9 @@ LEDGER = config.ROOT / "backtest_ledger.tsv"
 HOLDOUT_LOCK = config.HOLDOUT_DIR / "burned"
 IS_FRAC, OOS_FRAC = 0.50, 0.30                 # holdout = final 0.20
 DECLARED_GRID_SIZE_CAP = 10000
+# No real pre-registered search declares more trials than this; a larger per-cohort denominator is a
+# corrupt/poisoned ledger row and is clamped so it cannot annihilate every DSR (integrity defense).
+_MAX_COHORT_DENOMINATOR = 1_000_000
 
 
 def declared_param_grid(spec) -> dict | None:
@@ -191,6 +194,11 @@ def _trial_stats(family: str | None = None, strategy: str | None = None,
             cohorts["search_cohort_id"] = cohorts["search_cohort_id"].astype(str)
             cohorts["search_denominator"] = pd.to_numeric(
                 cohorts["search_denominator"], errors="coerce").fillna(0)
+            # Defensive sanity cap: a single cohort claiming an absurd trial count (a poisoned/corrupt
+            # ledger row, e.g. 1e12) must not silently annihilate every DSR. No real pre-registered search
+            # declares more than this many trials; clamp per-cohort so contamination can't inflate deflation
+            # (defense-in-depth beyond the family filter above, which only protects when `family` is passed).
+            cohorts["search_denominator"] = cohorts["search_denominator"].clip(upper=_MAX_COHORT_DENOMINATOR)
             registered = max(
                 registered,
                 int(cohorts.groupby("search_cohort_id")["search_denominator"].max().sum()),
@@ -543,6 +551,26 @@ def run_backtest(name: str, net_per_trade: pd.Series, positions: pd.Series,
     out["ann_ret"] = round(ann_ret, 4)
     out["capacity_usd"] = H._capacity_usd(pos_df, ann_ret, bars_per_year,
                                           config.IMPACT_COEF_BPS_PER_1M)
+    # Implausibility gate (config.IMPLAUSIBILITY): a real tradeable edge does not have a Sharpe of ~18. An
+    # implausibly high |annualized Sharpe| — or a degenerate near-zero-vol series that produces one — signals
+    # a broken TEST (degenerate reconstruction, look-ahead/leak, or a modeling artifact), not a discovery.
+    # Flagged here; p8 routes it to needs_review (never a survivor).
+    _imp_cfg = getattr(config, "IMPLAUSIBILITY", {}) or {}
+    _ceiling = float(_imp_cfg.get("max_annualized_sharpe", 6.0))
+    # IMP-1: key STRICTLY off the OOS Sharpe — never full_sharpe (it includes the locked holdout window; see
+    # the line-"never a gate" contract) and never is_sharpe (an implausibly high IS with a dead OOS is an
+    # overfit that must KILL on OOS death, not be masked as needs_review). IMP-2: require a FINITE value, so a
+    # NaN OOS Sharpe falls through to the OOS-based degenerate check rather than silently passing.
+    _oos_sharpe = out.get("oos_sharpe")
+    _plaus_sharpe = _oos_sharpe if (_oos_sharpe is not None and math.isfinite(_oos_sharpe)) else None
+    _imp_triggered, _imp_reason = False, None
+    if _plaus_sharpe is not None and abs(_plaus_sharpe) > _ceiling:
+        _imp_triggered, _imp_reason = True, "implausible_sharpe"
+    elif (sd is not None and mean is not None and mean != 0
+          and abs(sd) < float(_imp_cfg.get("degenerate_std_ratio", 0.02)) * abs(mean)):
+        _imp_triggered, _imp_reason = True, "degenerate_series"
+    out["implausible"] = {"triggered": bool(_imp_triggered), "reason": _imp_reason,
+                          "sharpe": _plaus_sharpe, "ceiling": _ceiling}
     out["cost_sensitivity"] = _cost_sensitivity(
         net, positions, bars_per_year, cost_frac, n_trials, sr_var,
         payoff=payoff, position_signed=position_signed)

@@ -39,6 +39,7 @@ from penrose.pipeline import factor_spanning     # noqa: E402
 from penrose.pipeline import cross_sectional_sort  # noqa: E402
 from penrose.pipeline import event_study         # noqa: E402
 from penrose.pipeline import forecast_skill      # noqa: E402
+from penrose.pipeline import formulaic_signal    # noqa: E402
 from penrose.data.contract import DataBundle, Series  # noqa: E402
 from penrose.data.event_market import EventMarketPanel  # noqa: E402
 from penrose.pipeline.event_market_backtest import run_event_market_backtest  # noqa: E402
@@ -92,6 +93,10 @@ def _verdict(result):
         declared_grid_size=P7.declared_grid_size(spec))
     if claim_type:
         bt["claim_type"] = claim_type
+    if isinstance(result, dict):
+        for key in ("event_market", "cost_provenance", "capacity_provenance"):
+            if key in result:
+                bt[key] = result[key]
     dec = stages.p8_verdict(_claim(), bt, {}, synthetic=False)
     if spec and module is not None and dec.verdict in ("watch", "research-supported"):
         bt["parameter_fragility"] = R.parameter_fragility(
@@ -114,7 +119,7 @@ def build_overfit(rng):
 def build_robust(rng):
     """Persistent, uniform edge across time AND regimes. Must SURVIVE (watch)."""
     n = 220
-    v = rng.normal(0.012, 0.008, n)
+    v = rng.normal(0.0035, 0.008, n)   # realistic daily edge -> plausible annualized Sharpe (~3-4)
     return pd.Series(v, index=_idx(n))
 
 
@@ -123,9 +128,9 @@ def build_regime_fragile(rng):
     to pass 3-fold + OOS (reach a survivor verdict), then the regime lens must KILL it."""
     n = 240
     idx = _idx(n)
-    v = rng.normal(0.002, 0.004, n)          # weekdays: barely positive
+    v = rng.normal(0.002, 0.007, n)          # weekdays: barely positive (more noise -> ceiling headroom)
     wknd = idx.dayofweek >= 5
-    v[wknd] = rng.normal(0.060, 0.010, int(wknd.sum()))  # weekends: big edge
+    v[wknd] = rng.normal(0.048, 0.010, int(wknd.sum()))  # weekends: big edge (headroom below ceiling)
     return pd.Series(v, index=idx)
 
 
@@ -211,7 +216,7 @@ def build_event_market_losing(rng):
     negative — so this must reach `kill`, unlike the no-edge case which takes no trades."""
     del rng
     return run_event_market_backtest(
-        _event_market_panel(260, entry_offset=0.17),  # entry ~0.70, above the true ~0.53 value
+        _event_market_panel(260, entry_offset=0.10),  # entry ~0.63, above the true ~0.53 value (milder, plausible loss)
         _overpriced_model,
         min_ev=0.05, max_price=0.90, kelly_fraction=0.75, size_cap=1.0,
     )
@@ -270,6 +275,114 @@ def build_event_market_param_fragile(rng):
     """Edge trades only at the declared threshold; higher thresholds produce no positive OOS edge."""
     del rng
     return _event_market_param_module({"min_ev": [0.05, 0.25, 0.30, 0.35]})
+
+
+def _weather_tail_table(
+    n_days: int,
+    *,
+    p_close: float,
+    realized_freq: float,
+    volume: float,
+    open_interest,
+    cities: list[str] | None = None,
+) -> pd.DataFrame:
+    cities = cities or ["NYC", "BOS", "CHI", "DAL", "DEN", "LAX", "MIA", "SEA", "ATL", "PHL", "PHX", "DCA"]
+    period = 200
+    threshold = int(round(realized_freq * period))
+    rows = []
+    for day in range(n_days):
+        close = pd.Timestamp("2023-01-01", tz="UTC") + pd.Timedelta(days=day)
+        for j, city in enumerate(cities):
+            oi = open_interest(day, j, city) if callable(open_interest) else open_interest
+            outcome = 1 if ((day * 17 + j * 29) % period) < threshold else 0
+            rows.append({
+                "ticker": f"KXWEATHER-{city}-{day:04d}",
+                "city": city,
+                "close_date": close.isoformat(),
+                "p_close": p_close,
+                "outcome": outcome,
+                "volume": volume,
+                "open_interest": oi,
+                "is_tail": True,
+                "underlying_time": close.isoformat(),
+            })
+    return pd.DataFrame(rows)
+
+
+def _weather_tail_result(
+    table: pd.DataFrame,
+    *,
+    capacity_frac: float = 0.10,
+    max_pair_gross: float = 0.20,
+    portfolio_notional: float = 1000.0,
+) -> dict:
+    digest = hashlib.sha256(pd.util.hash_pandas_object(table, index=True).to_numpy().tobytes()).hexdigest()[:12]
+    tmp = Path(tempfile.gettempdir()) / f"penrose_eval_weather_tail_{digest}.csv"
+    table.to_csv(tmp, index=False)
+    spec = {
+        "module_id": "eval_kalshi_weather_tail_fade",
+        "strategy_class": "kalshi_weather_tail_fade",
+        "claim_type": "event_market_strategy",
+        "primitive": "kalshi_weather_tail_fade",
+        "event_market": {"path": str(tmp), "name": "eval_weather_tail"},
+        "entry": {
+            "fee_coeff": 0.07,
+            "capacity_frac": capacity_frac,
+            "max_pair_gross": max_pair_gross,
+            "high_corr_pair": ["NYC", "BOS"],
+            "portfolio_notional": portfolio_notional,
+        },
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "kalshi_weather_tail_fade"
+    module = event_market.build_module(spec, claim)
+    out = module.run(None, claim, 0.0)
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "event_market_strategy"
+    return out
+
+
+def build_weather_tail_fade_real(rng):
+    """EXP-2 planted REAL: tail brackets are overpriced; capacity-constrained Sharpe stays plausible."""
+    del rng
+    return _weather_tail_result(
+        _weather_tail_table(420, p_close=0.025, realized_freq=0.015, volume=100.0, open_interest=100.0)
+    )
+
+
+def build_weather_tail_fade_null(rng):
+    """EXP-2 planted NULL: prices match realized frequencies; measured fees erase the edge."""
+    del rng
+    return _weather_tail_result(
+        _weather_tail_table(420, p_close=0.025, realized_freq=0.025, volume=100.0, open_interest=100.0)
+    )
+
+
+def build_weather_tail_fade_capacity_teeth(rng):
+    """EXP-2 capacity teeth: same edge, but near-zero OI leaves too few executable daily bars."""
+    del rng
+    def oi(day, _j, _city):
+        return 100.0 if day < 40 else 0.0
+    return _weather_tail_result(
+        _weather_tail_table(420, p_close=0.025, realized_freq=0.015, volume=100.0, open_interest=oi)
+    )
+
+
+def build_weather_tail_fade_provided_series_refusal(rng):
+    """EXP-2 provided-series refusal: strong supplied returns stay provenance-capped."""
+    net = pd.Series(rng.normal(0.0035, 0.008, 240), index=_idx(240), name="hold_no_pnl_net")
+    return {
+        "net": net,
+        "positions": pd.Series(1.0, index=net.index),
+        "bars_per_year": 252.0,
+        "_claim_type": "provided_series_statistic",
+        "_spec": {
+            "claim_type": "provided_series_statistic",
+            "inputs": ["hold_no_pnl_net"],
+            "module_id": "eval_weather_tail_provided_series",
+        },
+    }
 
 
 def _predictive_regression_result(x: pd.Series, y: pd.Series, *, horizon: int = 5) -> dict:
@@ -391,7 +504,7 @@ def build_factor_spanning_real(rng):
     b1 = rng.normal(0.0, 0.01, n)
     b2 = rng.normal(0.0, 0.01, n)
     eps = rng.normal(0.0, 0.002, n)
-    candidate = 0.0009 + 0.3 * b1 + 0.2 * b2 + eps
+    candidate = 0.00045 + 0.3 * b1 + 0.2 * b2 + eps   # plausible-magnitude alpha (annualized Sharpe ~4)
     return _factor_spanning_result(
         pd.Series(candidate, index=idx),
         pd.Series(b1, index=idx),
@@ -467,7 +580,7 @@ def _cross_sectional_panels(rng, *, kind: str) -> tuple[pd.DataFrame, pd.DataFra
     returns = pd.DataFrame(rng.normal(0.0, 0.012, (n_months, n_names)), index=dates, columns=names)
     if kind == "real":
         for i in range(n_months - 1):
-            returns.iloc[i + 1] += 0.020 * characteristic.iloc[i].to_numpy()
+            returns.iloc[i + 1] += 0.0024 * characteristic.iloc[i].to_numpy()  # plausible spread (headroom)
     elif kind == "is_only":
         cut = int((n_months - 1) * P7.IS_FRAC)
         for i in range(cut):
@@ -476,7 +589,7 @@ def _cross_sectional_panels(rng, *, kind: str) -> tuple[pd.DataFrame, pd.DataFra
         raise ValueError(kind)
     # Survivorship fixture: a delisted name is retained while alive, then NaN after delisting.
     characteristic.iloc[:120, 0] = 5.0
-    returns.iloc[1:120, 0] += 0.02 if kind == "real" else 0.0
+    returns.iloc[1:120, 0] += 0.003 if kind == "real" else 0.0
     returns.iloc[120:, 0] = np.nan
     characteristic.iloc[120:, 0] = np.nan
     return returns, characteristic
@@ -550,7 +663,7 @@ def _event_study_fixture(rng, *, kind: str) -> tuple[pd.Series, pd.DatetimeIndex
     returns = rng.normal(0.0, 0.006, n_days)
     if kind == "real":
         for pos in event_offsets:
-            returns[pos:pos + 3] += 0.016
+            returns[pos:pos + 3] += 0.004   # plausible per-event CAR
     elif kind == "is_only":
         cut = int(n_events * P7.IS_FRAC)
         for pos in event_offsets[:cut]:
@@ -624,7 +737,7 @@ def build_forecast_skill_null(rng):
 def build_forecast_skill_real(rng):
     """Model forecast is genuinely closer to Y than the random-walk benchmark."""
     y = _forecast_target(rng, 1800)
-    f = y + rng.normal(0.0, 0.15, len(y))
+    f = y + rng.normal(0.0, 0.85, len(y))   # only modestly better than the RW benchmark (plausible skill)
     return _forecast_skill_result(pd.Series(f, index=y.index), y)
 
 
@@ -637,6 +750,88 @@ def build_forecast_skill_is_only(rng):
     cut = int(len(y) * P7.IS_FRAC)
     f.iloc[:cut] = y.iloc[:cut] + rng.normal(0.0, 0.12, cut)
     return _forecast_skill_result(f, y)
+
+
+def _price_from_returns(ret: np.ndarray, idx: pd.DatetimeIndex) -> pd.Series:
+    return pd.Series(100.0 * np.cumprod(1.0 + ret), index=idx)
+
+
+def _formulaic_signal_result(trade_price: pd.Series, signal: pd.Series, *,
+                             signal_formula: str = "price(signal)") -> dict:
+    inputs = sorted(formulaic_signal.referenced_names(signal_formula) | {"trade"})
+    spec = {
+        "module_id": "eval_formulaic_signal",
+        "strategy_class": "formulaic_signal",
+        "claim_type": "formulaic_signal",
+        "inputs": inputs,
+        "trade_series": "trade",
+        "signal": signal_formula,
+        "position_map": "sign",
+        "param_grid": {"window": [1]},
+    }
+    claim = _claim()
+    claim.applicable_strategy_class = "formulaic_signal"
+    module = formulaic_signal.build_module(spec, claim)
+    bundle = DataBundle(series={
+        "trade": Series("trade", trade_price, "planted-eval", "price"),
+        "signal": Series("signal", signal, "planted-eval", "signal"),
+    })
+    out = module.run(bundle, claim, 0.0)
+    if not out.get("ok"):
+        raise RuntimeError(out.get("reason"))
+    out["_module"] = module
+    out["_spec"] = spec
+    out["_claim_type"] = "formulaic_signal"
+    return out
+
+
+def build_formulaic_signal_null(rng):
+    """Formulaic signal independent of the next trade return: must kill, not certify."""
+    n = 8000
+    idx = _idx(n)
+    signal = rng.choice([-1.0, 1.0], size=n)
+    ret = rng.normal(0.0, 0.008, n)
+    return _formulaic_signal_result(
+        _price_from_returns(ret, idx),
+        pd.Series(signal, index=idx),
+    )
+
+
+def build_formulaic_signal_real(rng):
+    """Mild predictive signal with plausible annualized Sharpe: must survive."""
+    n = 8000
+    idx = _idx(n)
+    signal = rng.choice([-1.0, 1.0], size=n)
+    ret = rng.normal(0.0, 0.008, n)
+    ret[1:] += 0.0012 * signal[:-1]
+    return _formulaic_signal_result(
+        _price_from_returns(ret, idx),
+        pd.Series(signal, index=idx),
+    )
+
+
+def build_formulaic_signal_is_only(rng):
+    """Signal predicts only the IS prefix and dies OOS: must kill."""
+    n = 12000
+    idx = _idx(n)
+    signal = rng.choice([-1.0, 1.0], size=n)
+    ret = rng.normal(0.0, 0.008, n)
+    cut = int(n * P7.IS_FRAC)
+    ret[1:cut] += 0.0025 * signal[:cut - 1]
+    return _formulaic_signal_result(
+        _price_from_returns(ret, idx),
+        pd.Series(signal, index=idx),
+    )
+
+
+def build_formulaic_signal_lookahead_trap(rng):
+    """Formula sees same-bar returns; executor lag must prevent same-bar scoring."""
+    n = 8000
+    idx = _idx(n)
+    ret = rng.normal(0.0, 0.008, n)
+    trade = _price_from_returns(ret, idx)
+    signal = pd.Series(rng.normal(0.0, 1.0, n), index=idx)
+    return _formulaic_signal_result(trade, signal, signal_formula="returns(trade, 1)")
 
 
 # (name, builder, expected verdict(s), expected kill_reason substring or None)
@@ -652,6 +847,11 @@ CASES = [
     ("event-market losing",       build_event_market_losing, ("kill", "underpowered"), None),
     ("event-market param-stable",  build_event_market_param_stable, ("watch", "research-supported"), None),
     ("event-market param-fragile", build_event_market_param_fragile, ("kill",), "parameter_fragile"),
+    ("EXP-2 weather REAL",         build_weather_tail_fade_real, ("watch", "research-supported"), None),
+    ("EXP-2 weather NULL",         build_weather_tail_fade_null, ("kill", "underpowered"), None),
+    ("EXP-2 capacity teeth",       build_weather_tail_fade_capacity_teeth,
+     ("underpowered", "insufficient_data"), None),
+    ("EXP-2 provided refusal",     build_weather_tail_fade_provided_series_refusal, ("watch",), None),
     ("predictive-reg null",        build_predictive_regression_null, ("kill", "underpowered", "insufficient_data"), None),
     ("predictive-reg real",        build_predictive_regression_real, ("watch", "research-supported"), None),
     ("predictive-reg IS-only",     build_predictive_regression_is_only, ("kill",), None),
@@ -667,6 +867,11 @@ CASES = [
     ("forecast-skill null",        build_forecast_skill_null, ("kill", "underpowered", "insufficient_data"), None),
     ("forecast-skill real",        build_forecast_skill_real, ("watch", "research-supported"), None),
     ("forecast-skill IS-only",     build_forecast_skill_is_only, ("kill",), None),
+    ("formulaic-signal null",      build_formulaic_signal_null, ("kill",), None),
+    ("formulaic-signal real",      build_formulaic_signal_real, ("watch", "research-supported"), None),
+    ("formulaic-signal IS-only",   build_formulaic_signal_is_only, ("kill",), None),
+    ("formulaic-signal lookahead", build_formulaic_signal_lookahead_trap,
+     ("kill", "underpowered", "insufficient_data"), None),
 ]
 
 
@@ -1510,14 +1715,16 @@ def run(bundle, claim, cost_frac):
         "statement": "candidate hypothesis", "candidate_class": "testable_now",
         "strategy_class": "edge", "inspired_by": ["cross-1"],
         "spec": {
-            "signal": "zscore(edge_series, window)",
+            "signal": "zscore(edge_series, 20)",
             "series": ["edge_series"],
+            "trade_series": "edge_series",
+            "position_map": "sign",
             "params": {"window": 20},
             "param_grid": {"window": [10, 20, 60]},
             "conditioning": None,
             "entry_exit": "enter when signal > 1; exit after horizon",
             "horizon": "1d",
-        }}], _sg)
+        }}], _sg, {"series": ["edge_series"]})
     out.append(("EDGE-WP4: synthesized hypotheses are unanchored candidates with grounded lineage",
                 len(_sc) == 1 and _sc[0].source_type == "synthesized_hypothesis"
                 and _sn[0]["grounded"] and _sn[0]["admitted"]))

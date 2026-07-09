@@ -7,7 +7,7 @@ from typing import Any
 
 from .. import config
 from ..data.event_market_load import EventMarketDataUnavailable, load_event_market
-from .event_market_backtest import run_event_market_backtest
+from .event_market_backtest import run_event_market_backtest, run_weather_tail_fade_backtest
 
 
 _ALLOWED_PRICING_FAMILIES = {"normal_bracket"}
@@ -33,6 +33,40 @@ class EventMarketStrategyModule:
 
     def evaluate(self, param_override: dict | None = None) -> dict:
         panel = load_event_market(self.spec, self.spec.get("data_dir") or config.DATA_DIR)
+        if _declared_rule(self.spec) == "kalshi_weather_tail_fade":
+            entry = _entry_config(self.spec)
+            if param_override:
+                _merge_param_override({}, entry, param_override)
+            pair = entry.get("pair_cities") or entry.get("high_corr_pair") or self.spec.get("pair_cities")
+            if isinstance(pair, str):
+                pair = [p.strip() for p in pair.split(",") if p.strip()]
+            net, positions, bars_per_year, stats = run_weather_tail_fade_backtest(
+                panel,
+                fee_coeff=float(entry.get("fee_coeff", config.FEE_CURVE["kalshi"]["fee_rate"])),
+                capacity_frac=float(entry.get("capacity_frac", 0.10)),
+                max_pair_gross=(
+                    None if entry.get("max_pair_gross") is None
+                    else float(entry.get("max_pair_gross"))
+                ),
+                pair_cities=pair,
+                portfolio_notional=float(entry.get("portfolio_notional", 1000.0)),
+                min_open_interest=float(entry.get("min_open_interest", 0.0)),
+                weighting=str(entry.get("weighting", "capacity")),
+            )
+            return {
+                "net": net,
+                "positions": positions,
+                "bars_per_year": float(bars_per_year),
+                "n_trades": int(stats.get("n_trades", len(net))),
+                "event_market": {
+                    "primitive": "kalshi_weather_tail_fade",
+                    "panel": panel.name,
+                    "provenance": panel.provenance,
+                    **stats,
+                },
+                "cost_provenance": "measured",
+                "capacity_provenance": "reconstructed_from_volume_open_interest",
+            }
         pricing = _pricing_config(self.spec)
         family = str(pricing.get("family") or pricing.get("model") or "").strip()
         if family not in _ALLOWED_PRICING_FAMILIES:
@@ -88,6 +122,21 @@ def _pricing_config(spec: dict) -> dict:
     return pricing if isinstance(pricing, dict) else {"family": str(pricing)}
 
 
+def _declared_rule(spec: dict) -> str:
+    for key in ("primitive", "strategy", "rule", "strategy_rule", "strategy_family"):
+        value = spec.get(key)
+        if isinstance(value, dict):
+            value = value.get("name") or value.get("family") or value.get("rule")
+        text = str(value or "").strip().lower().replace("-", "_")
+        if text in {"kalshi_weather_tail_fade", "weather_tail_fade", "tail_fade"}:
+            return "kalshi_weather_tail_fade"
+    entry = _entry_config(spec)
+    text = str(entry.get("rule") or entry.get("primitive") or "").strip().lower().replace("-", "_")
+    if text in {"kalshi_weather_tail_fade", "weather_tail_fade", "tail_fade"}:
+        return "kalshi_weather_tail_fade"
+    return ""
+
+
 def _entry_config(spec: dict) -> dict:
     entry = spec.get("entry") or spec.get("entry_rule") or spec.get("sizing") or {}
     if not isinstance(entry, dict):
@@ -99,7 +148,10 @@ def _entry_config(spec: dict) -> dict:
     return out
 
 
-_ENTRY_PARAM_KEYS = {"min_ev", "max_price", "kelly_fraction", "size_cap", "seed"}
+_ENTRY_PARAM_KEYS = {
+    "min_ev", "max_price", "kelly_fraction", "size_cap", "seed",
+    "fee_coeff", "capacity_frac", "max_pair_gross", "portfolio_notional", "min_open_interest", "weighting",
+}
 
 
 def _merge_param_override(params: dict, entry: dict, param_override: dict) -> None:

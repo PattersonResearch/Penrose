@@ -56,6 +56,27 @@ def _record(
     )
 
 
+def _concept(
+    cid: str,
+    *,
+    family_identity: dict | None = None,
+    strategy_family: str = "hybrid",
+    data_domain: str = "crypto",
+    direction: str = "negative",
+) -> dict:
+    provenance = {"strategy_family": strategy_family, "data_domain": data_domain}
+    if family_identity is not None:
+        provenance["family_identity"] = family_identity
+    return {
+        "concept_id": cid,
+        "source_claim_id": cid,
+        "statement": "composite strategy falsification",
+        "created_at": "2026-01-01T00:00:00+00:00",
+        "evidence_direction": direction,
+        "data_provenance": provenance,
+    }
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("".join(json.dumps(row, sort_keys=True) + "\n" for row in rows))
@@ -193,3 +214,88 @@ def test_structured_family_distillation_stays_propose_only(tmp_path, monkeypatch
     assert proposals[0]["status"] == "proposed"
     assert proposals[0]["source"] == "distilled"
     assert proposals[0]["family_level"] == "exact"
+
+
+def test_corpus_build_emits_hierarchical_composite_family_principles():
+    from penrose.corpus import build
+
+    carry_trend = {
+        "components": ["trend", "carry"],
+        "method": "regime-blend",
+        "driver": None,
+    }
+    momentum_value = {
+        "components": ["value", "momentum"],
+        "method": "regime-blend",
+        "driver": None,
+    }
+    concepts = (
+        [_concept(f"ct-{i}", family_identity=carry_trend) for i in range(3)]
+        + [_concept(f"mv-{i}", family_identity=momentum_value) for i in range(2)]
+    )
+
+    graph = build(concepts, min_support=3, current_year=2026)
+    families = {
+        n["family"]: n for n in graph["nodes"]
+        if n.get("level") == "family_principle"
+    }
+
+    assert families["carry+trend|regime-blend"]["granularity"] == "specific"
+    assert families["carry+trend|regime-blend"]["support_count"] == 3
+    assert families["carry+trend"]["granularity"] == "components"
+    assert families["carry+trend"]["support_count"] == 3
+    assert families["carry"]["granularity"] == "component"
+    assert families["carry"]["support_count"] == 3
+    assert families["trend"]["granularity"] == "component"
+    assert families["trend"]["support_count"] == 3
+    assert "momentum+value|regime-blend" not in families
+    assert "momentum+value" not in families
+    assert "hybrid" not in families
+
+
+def test_corpus_family_identity_is_authoritative_and_stable_for_family_and_domain():
+    from penrose.corpus import _domain, _family, build
+
+    identity = {
+        "components": ["trend", "carry"],
+        "method": "regime-blend",
+        "driver": "vol_regime",
+    }
+    concept = _concept("ct", family_identity=identity, strategy_family="hybrid")
+
+    assert _family(concept) == "carry+trend|regime-blend|vol_regime"
+    assert _domain(concept) == "carry+trend|regime-blend|vol_regime"
+
+    graph = build([_concept(f"ct-{i}", family_identity=identity) for i in range(3)],
+                  min_support=3, current_year=2026)
+    family_nodes = [
+        n for n in graph["nodes"]
+        if n.get("level") == "family_principle"
+    ]
+    assert any(
+        n["family"] == "carry+trend|regime-blend|vol_regime"
+        and n["granularity"] == "specific"
+        for n in family_nodes
+    )
+    assert not any(n["family"] == "hybrid" for n in family_nodes)
+
+
+def test_corpus_absent_family_identity_keeps_legacy_family_behavior():
+    from penrose.corpus import _domain, _family, build
+
+    concepts = [
+        _concept(f"legacy-{i}", family_identity=None, strategy_family="hybrid")
+        for i in range(3)
+    ]
+
+    assert _family(concepts[0]) == "hybrid"
+    assert _domain(concepts[0]) == "crypto"
+
+    graph = build(concepts, min_support=3, current_year=2026)
+    family_nodes = [
+        n for n in graph["nodes"]
+        if n.get("level") == "family_principle"
+    ]
+    assert len(family_nodes) == 1
+    assert family_nodes[0]["family"] == "hybrid"
+    assert "granularity" not in family_nodes[0]
